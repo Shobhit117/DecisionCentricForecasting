@@ -1,0 +1,326 @@
+% $ biblatex auxiliary file $
+% $ biblatex bbl format version 3.3 $
+% Do not modify the above lines!
+%
+% This is an auxiliary file used by the 'biblatex' package.
+% This file may safely be deleted. It will be recreated by
+% biber as required.
+%
+\begingroup
+\makeatletter
+\@ifundefined{ver@biblatex.sty}
+  {\@latex@error
+     {Missing 'biblatex' package}
+     {The bibliography requires the 'biblatex' package.}
+      \aftergroup\endinput}
+  {}
+\endgroup
+
+
+\refsection{0}
+  \datalist[entry]{nyt/global//global/global/global}
+    \entry{koenker1978}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=713ca648cccb03223d755f3f2ff51a5c}{%
+           family={Koenker},
+           familyi={K\bibinitperiod},
+           given={Roger},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=c9f29d0eb68fa72d93bcdec3a7f8d124}{%
+           family={Bassett},
+           familyi={B\bibinitperiod},
+           given={Gilbert},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {[Wiley, Econometric Society]}%
+      }
+      \strng{namehash}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \strng{fullhash}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \strng{fullhashraw}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \strng{bibnamehash}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \strng{authorbibnamehash}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \strng{authornamehash}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \strng{authorfullhash}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \strng{authorfullhashraw}{17a6c2dbc6141333000fcbaf65eb2c10}
+      \field{sortinit}{K}
+      \field{sortinithash}{c02bf6bff1c488450c352b40f5d853ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{abstract}{A simple minimization problem yielding the ordinary sample quantiles in the location model is shown to generalize naturally to the linear model generating a new class of statistics we term "regression quantiles." The estimator which minimizes the sum of absolute residuals is an important special case. Some equivariance properties and the joint asymptotic distribution of regression quantiles are established. These results permit a natural generalization of the linear model of certain well-known robust estimators of location. Estimators are suggested, which have comparable efficiency to least squares for Gaussian linear models while substantially out-performing the least-squares estimator over a wide class of non-Gaussian error distributions.}
+      \field{issn}{00129682, 14680262}
+      \field{journaltitle}{Econometrica}
+      \field{number}{1}
+      \field{title}{Regression Quantiles}
+      \field{volume}{46}
+      \field{year}{1978}
+      \field{pages}{33\bibrangedash 50}
+      \range{pages}{18}
+      \verb{urlraw}
+      \verb http://www.jstor.org/stable/1913643
+      \endverb
+      \verb{url}
+      \verb http://www.jstor.org/stable/1913643
+      \endverb
+    \endentry
+    \entry{nelder1972}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=97a60525676f2f0735b3bace8039e9af}{%
+           family={Nelder},
+           familyi={N\bibinitperiod},
+           given={J.\bibnamedelimi A.},
+           giveni={J\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8ad2a145a372d89fe43afd0935910c82}{%
+           family={Wedderburn},
+           familyi={W\bibinitperiod},
+           given={R.\bibnamedelimi W.\bibnamedelimi M.},
+           giveni={R\bibinitperiod\bibinitdelim W\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+      }
+      \strng{namehash}{0b6d80561d42893f2f06e66779427e0b}
+      \strng{fullhash}{0b6d80561d42893f2f06e66779427e0b}
+      \strng{fullhashraw}{0b6d80561d42893f2f06e66779427e0b}
+      \strng{bibnamehash}{0b6d80561d42893f2f06e66779427e0b}
+      \strng{authorbibnamehash}{0b6d80561d42893f2f06e66779427e0b}
+      \strng{authornamehash}{0b6d80561d42893f2f06e66779427e0b}
+      \strng{authorfullhash}{0b6d80561d42893f2f06e66779427e0b}
+      \strng{authorfullhashraw}{0b6d80561d42893f2f06e66779427e0b}
+      \field{sortinit}{N}
+      \field{sortinithash}{22369a73d5f88983a108b63f07f37084}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{abstract}{Summary The technique of iterative weighted linear regression can be used to obtain maximum likelihood estimates of the parameters with observations distributed according to some exponential family and systematic effects that can be made linear by a suitable transformation. A generalization of the analysis of variance is given for these models using log-likelihoods. These generalized linear models are illustrated by examples relating to four distributions; the Normal, Binomial (probit analysis, etc.), Poisson (contingency tables) and gamma (variance components). The implications of the approach in designing statistics courses are discussed.}
+      \field{journaltitle}{Journal of the Royal Statistical Society: Series A (General)}
+      \field{number}{3}
+      \field{title}{Generalized Linear Models}
+      \field{volume}{135}
+      \field{year}{1972}
+      \field{pages}{370\bibrangedash 384}
+      \range{pages}{15}
+      \verb{doi}
+      \verb https://doi.org/10.2307/2344614
+      \endverb
+      \keyw{analysis of variance,contingency tables,exponential families,inverse polynomials,linear models,maximum likelihood,quantal response,regression,variance components,weighted least squares}
+    \endentry
+    \entry{perakis2020}{article}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=5fc631899047eb84eeaa6e01069ba04c}{%
+           family={Perakis},
+           familyi={P\bibinitperiod},
+           given={Georgia},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=5a31dcf3b8d4cae999669bf878d2a049}{%
+           family={Singhvi},
+           familyi={S\bibinitperiod},
+           given={Divya},
+           giveni={D\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=f7885c566ca58f7dbe188d3439fbaf82}{%
+           family={Spantidakis},
+           familyi={S\bibinitperiod},
+           given={Yiannis},
+           giveni={Y\bibinitperiod},
+           givenun=0}}%
+      }
+      \strng{namehash}{ef958bd6f44f68a6359fb87d20930b9c}
+      \strng{fullhash}{ef958bd6f44f68a6359fb87d20930b9c}
+      \strng{fullhashraw}{ef958bd6f44f68a6359fb87d20930b9c}
+      \strng{bibnamehash}{ef958bd6f44f68a6359fb87d20930b9c}
+      \strng{authorbibnamehash}{ef958bd6f44f68a6359fb87d20930b9c}
+      \strng{authornamehash}{ef958bd6f44f68a6359fb87d20930b9c}
+      \strng{authorfullhash}{ef958bd6f44f68a6359fb87d20930b9c}
+      \strng{authorfullhashraw}{ef958bd6f44f68a6359fb87d20930b9c}
+      \field{sortinit}{P}
+      \field{sortinithash}{ff3bcf24f47321b42cb156c2cc8a8422}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Available at SSRN 3632459}
+      \field{title}{Leveraging the newsvendor for inventory distribution at a large fashion e-retailer with depth and capacity constraints}
+      \field{year}{2020}
+    \endentry
+    \entry{rigby2005}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=7f1f45bc5d227512226984018f21da5e}{%
+           family={Rigby},
+           familyi={R\bibinitperiod},
+           given={R.\bibnamedelimi A.},
+           giveni={R\bibinitperiod\bibinitdelim A\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=b5d690789e192a69d729ee7264b6776b}{%
+           family={Stasinopoulos},
+           familyi={S\bibinitperiod},
+           given={D.\bibnamedelimi M.},
+           giveni={D\bibinitperiod\bibinitdelim M\bibinitperiod},
+           givenun=0}}%
+      }
+      \strng{namehash}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \strng{fullhash}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \strng{fullhashraw}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \strng{bibnamehash}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \strng{authorbibnamehash}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \strng{authornamehash}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \strng{authorfullhash}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \strng{authorfullhashraw}{d0f7c604f6b1f19065fa5c92dbb79e30}
+      \field{sortinit}{R}
+      \field{sortinithash}{5e1c39a9d46ffb6bebd8f801023a9486}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{abstract}{A general class of statistical models for a univariate response variable is presented which we call the generalized additive model for location, scale and shape (GAMLSS). The model assumes independent observations of the response variable y given the parameters, the explanatory variables and the values of the random effects. The distribution for the response variable in the GAMLSS can be selected from a very general family of distributions including highly skew or kurtotic continuous and discrete distributions. The systematic part of the model is expanded to allow modelling not only of the mean (or location) but also of the other parameters of the distribution of y, as parametric and/or additive nonparametric (smooth) functions of explanatory variables and/or random-effects terms. Maximum (penalized) likelihood estimation is used to fit the (non)parametric models. A Newton–Raphson or Fisher scoring algorithm is used to maximize the (penalized) likelihood. The additive terms in the model are fitted by using a backfitting algorithm. Censored data are easily incorporated into the framework. Five data sets from different fields of application are analysed to emphasize the generality of the GAMLSS class of models.}
+      \field{issn}{0035-9254}
+      \field{journaltitle}{Journal of the Royal Statistical Society Series C: Applied Statistics}
+      \field{month}{06}
+      \field{number}{3}
+      \field{title}{Generalized Additive Models for Location, Scale and Shape}
+      \field{volume}{54}
+      \field{year}{2005}
+      \field{pages}{507\bibrangedash 554}
+      \range{pages}{48}
+      \verb{doi}
+      \verb https://doi.org/10.1111/j.1467-9876.2005.00510.x
+      \endverb
+    \endentry
+    \entry{snyder2019}{inbook}{}{}
+      \list{publisher}{1}{%
+        {Wiley}%
+      }
+      \field{sortinit}{S}
+      \field{sortinithash}{b164b07b29984b41daf1e85279fbc5ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labeltitlesource}{title}
+      \field{abstract}{Summary This chapter considers inventory models in which the demand is stochastic. It focuses on periodic-review models. The chapter first considers problems with no fixed costs and then problems with nonzero fixed costs. It assumes that unmet demands are backordered. The chapter discusses the lost-sales assumption. It introduces two important concepts in stochastic inventory theory: cycle stock and safety stock. A base-stock policy is optimal for the single-period problem with no fixed costs. The chapter examines how to determine the optimal s and S for the single-period, finite horizon, and infinite-horizon cases separately. The finite-horizon model with nonzero fixed costs can be solved using a straightforward modification of the dynamic programming model for the zero-fixed-cost case. The chapter presents formal proofs for the single-period and finite-horizon cases but only states the result without proof for the infinite-horizon case.}
+      \field{booktitle}{Fundamentals of Supply Chain Theory}
+      \field{chapter}{4}
+      \field{isbn}{9781119584445}
+      \field{title}{Stochastic Inventory Models: Periodic Review}
+      \field{year}{2019}
+      \field{pages}{87\bibrangedash 154}
+      \range{pages}{68}
+      \verb{doi}
+      \verb https://doi.org/10.1002/9781119584445.ch4
+      \endverb
+      \keyw{cycle stock,dynamic programming model,finite horizon,infinite-horizon,periodic-review models,safety stock,single-period model,stochastic inventory theory}
+    \endentry
+    \entry{ulrich2021}{article}{}{}
+      \name{author}{5}{}{%
+        {{un=0,uniquepart=base,hash=1513da2c2358bfe0850c2eb5ff44b634}{%
+           family={Ulrich},
+           familyi={U\bibinitperiod},
+           given={Matthias},
+           giveni={M\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2dd3afbdfdba1171879cf6448219be8c}{%
+           family={Jahnke},
+           familyi={J\bibinitperiod},
+           given={Hermann},
+           giveni={H\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=34be512d9e230f658c3f8032621ea10f}{%
+           family={Langrock},
+           familyi={L\bibinitperiod},
+           given={Roland},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8898d9559d7773ee255b8f3992e84e88}{%
+           family={Pesch},
+           familyi={P\bibinitperiod},
+           given={Robert},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4a44de266700c7318921dd559155b177}{%
+           family={Senge},
+           familyi={S\bibinitperiod},
+           given={Robin},
+           giveni={R\bibinitperiod},
+           givenun=0}}%
+      }
+      \strng{namehash}{99ff365bb92c75d0d95ea5e1b6e084a7}
+      \strng{fullhash}{ace58bbef385a62395c4be60469a854e}
+      \strng{fullhashraw}{ace58bbef385a62395c4be60469a854e}
+      \strng{bibnamehash}{99ff365bb92c75d0d95ea5e1b6e084a7}
+      \strng{authorbibnamehash}{99ff365bb92c75d0d95ea5e1b6e084a7}
+      \strng{authornamehash}{99ff365bb92c75d0d95ea5e1b6e084a7}
+      \strng{authorfullhash}{ace58bbef385a62395c4be60469a854e}
+      \strng{authorfullhashraw}{ace58bbef385a62395c4be60469a854e}
+      \field{sortinit}{U}
+      \field{sortinithash}{6901a00e45705986ee5e7ca9fd39adca}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{abstract}{E-grocery offers customers an alternative to traditional store grocery retailing. Customers select e-grocery for convenience, making use of the home delivery at a selected time slot. In contrast to store retailing, in e-grocery in-stock information for stock keeping units (SKUs) becomes transparent to the customer before substantial shopping effort has been invested, thus reducing the personal cost of switching to another supplier. As a consequence, in-stock availability of SKUs has a particularly strong impact on the customer’s order decision, resulting in higher strategic service level targets for the e-grocery retailer. To account for these high service level targets, we propose a suitable model for accurately predicting the extreme right tail of the demand distribution, rather than providing point forecasts of its mean. Specifically, we propose the application of distributional regression methods — so-called Generalised Additive Models for Location, Scale and Shape (GAMLSS) — to arrive at the cost-minimising solution according to the newsvendor model. As benchmark models we consider various regression models as well as popular methods from machine learning. The models are evaluated in a case study, where we compare their out-of-sample predictive performance with respect to the service level provided by the e-grocery retailer analysed.}
+      \field{issn}{0377-2217}
+      \field{journaltitle}{European Journal of Operational Research}
+      \field{number}{3}
+      \field{title}{Distributional regression for demand forecasting in e-grocery}
+      \field{volume}{294}
+      \field{year}{2021}
+      \field{pages}{831\bibrangedash 842}
+      \range{pages}{12}
+      \verb{doi}
+      \verb https://doi.org/10.1016/j.ejor.2019.11.029
+      \endverb
+      \keyw{Forecasting,Inventory,E-commerce,Retailing}
+    \endentry
+    \entry{zhang2009}{article}{}{}
+      \name{author}{3}{}{%
+        {{un=0,uniquepart=base,hash=edefadf2737f4300dd8a9daa07b31f02}{%
+           family={Zhang},
+           familyi={Z\bibinitperiod},
+           given={Bin},
+           giveni={B\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=110aff15c0cb7756eedd55a7b94d120b}{%
+           family={Xu},
+           familyi={X\bibinitperiod},
+           given={Xiaoyan},
+           giveni={X\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2a289bea2f0cb7b3aa209de729b08395}{%
+           family={Hua},
+           familyi={H\bibinitperiod},
+           given={Zhongsheng},
+           giveni={Z\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Elsevier}%
+      }
+      \strng{namehash}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \strng{fullhash}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \strng{fullhashraw}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \strng{bibnamehash}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \strng{authorbibnamehash}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \strng{authornamehash}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \strng{authorfullhash}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \strng{authorfullhashraw}{25b2d2daa99bc03dd7ed46689bf454f8}
+      \field{sortinit}{Z}
+      \field{sortinithash}{96892c0b0a36bb8557c40c49813d48b3}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{International Journal of Production Economics}
+      \field{number}{1}
+      \field{title}{A binary solution method for the multi-product newsboy problem with budget constraint}
+      \field{volume}{117}
+      \field{year}{2009}
+      \field{pages}{136\bibrangedash 141}
+      \range{pages}{6}
+    \endentry
+  \enddatalist
+\endrefsection
+\endinput
+
