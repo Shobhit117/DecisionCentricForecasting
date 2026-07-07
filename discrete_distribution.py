@@ -220,8 +220,8 @@ class DiscreteDistribution:
 
         # compute sum of RVs:
         rv_sum_list = []
-        curr = rv_list[0]
-        for n in range(1, self.max + 1):
+        curr = DiscreteDistribution(np.array([1.0]), 0)
+        for n in range(0, self.max + 1):
             if n >= self.min:
                 rv_sum_list.append(curr)
             if n != self.max:

@@ -50,19 +50,7 @@ def load_glm_model_data(file_name : str) -> pd.DataFrame:
     return df
 
 class DiscreteTimeSeries:
-    def __init__(self, df : pd.DataFrame
-                     , ts_id_cols : list[str]
-                     , period_col: str
-                     , var_col : str
-                     , to_datetime : bool = False
-                     , default_value : int = 0
-                     , lags : tuple[int] = (1, 7, 14)
-                     , rolling_windows : tuple[int] = (7, 28)
-                     , num_future_targets : int = 7
-                     , num_test_days : int = 1
-                     , include_std_dev : bool = False
-                     , use_best_fit_feature : bool = False
-                     , use_one_hot_encoding : bool = True):
+    def __init__(self, df : pd.DataFrame, ts_id_cols : list[str], period_col: str, var_col : str, to_datetime : bool = False, default_value : int = 0, lags : tuple[int] = (1, 7, 14), rolling_windows : tuple[int] = (7, 28), num_future_targets : int = 7, num_test_days : int = 1, include_std_dev : bool = False, use_best_fit_feature : bool = False, use_one_hot_encoding : bool = True):
         self.ts_id_cols = ts_id_cols
         self.var_col = var_col
         self.period_col = period_col
@@ -192,10 +180,9 @@ class DiscreteTimeSeries:
             else:
                 self.categorical_feature_cols.append('best_fit')
 
-    def add_calendar_features(self, df_calendar : pd.DataFrame
-                                  , use_week_end_feature : bool = False
-                                  , use_day_of_week_features : bool = True
-                                  , day_of_week_col : str = None):
+    def add_calendar_features(self, df_calendar : pd.DataFrame, use_week_end_feature : bool = False, use_day_of_week_features : bool = True, day_of_week_col : str = None):
+        if use_week_end_feature and use_day_of_week_features:
+            raise ValueError("Only one of 'use_week_end_feature' or 'use_day_of_week_features' can be True")
         self.df = pd.merge(self.df, df_calendar, on=self.period_col, how='left')
         if use_week_end_feature:
             self._add_weekend_feature(day_of_week_col)
@@ -221,13 +208,7 @@ class DiscreteTimeSeries:
             self.df[day_of_week_col] = self.df[day_of_week_col].astype('category')
             self.categorical_feature_cols.append(day_of_week_col)
         
-    def add_feature(self, df_feature : pd.DataFrame
-                        , feature_name : str
-                        , join_on : list[str]
-                        , is_cat_feature : bool = False
-                        , default_value : Any = np.nan
-                        , lags : tuple[int] | None = None
-                        , rolling_windows : tuple[int] | None = None):
+    def add_feature(self, df_feature : pd.DataFrame, feature_name : str, join_on : list[str], is_cat_feature : bool = False, default_value : Any = np.nan, lags : tuple[int] | None = None, rolling_windows : tuple[int] | None = None):
         df_feature = df_feature.copy()
         keys = join_on + [self.period_col]
         df_feature = df_feature[keys + [feature_name]].drop_duplicates()
@@ -443,7 +424,7 @@ if __name__ == '__main__':
                               , num_test_days=7
                               , use_one_hot_encoding = True)
     
-    ts.add_calendar_features(df_calendar, use_week_end_feature=False, day_of_week_col='wday')
+    ts.add_calendar_features(df_calendar, day_of_week_col='wday')
     ts.add_feature(df_events, 'event_type', join_on=[], is_cat_feature=True, default_value='BAU')
 
     print('Features: ', ts.feature_cols)
