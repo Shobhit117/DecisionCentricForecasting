@@ -173,14 +173,18 @@ class DiscreteDistribution:
     def __matmul__(self, other : "DiscreteDistribution") -> "DiscreteDistribution":
         if self.min < 0:
             raise ValueError("Left operand (number of summands) must have non-negative support.")
+        
         if other.min < 0:
             raise ValueError("Summand distribution must have non-negative support.")
+        
         if self.bin_size != 1:
             self.split_bins()
+        
         if other.min % other.bin_size != 0:
             # other = DiscreteDistribution(other.pmf, other.min, other.bin_size, other.best_fit, other.best_fit_params)
             other = other.copy()
             other._align_bin_size()
+        
         overall_min = self.min * other.min
         overall_max = self.max * other.max
         
@@ -206,14 +210,20 @@ class DiscreteDistribution:
     def random_sum(self, rv_list: list["DiscreteDistribution"], default_distr : "DiscreteDistribution" = None) -> "DiscreteDistribution":
         if self.min < 0:
             raise ValueError("Number of summands must have non-negative support.")
+        
         if self.max > len(rv_list):
+            if default_distr is None:
+                raise ValueError(f"Number of RVs in rv_list: {len(rv_list)}. Expected: {self.max}.")
             rv_list.extend([default_distr for _ in range(self.max - len(rv_list))])
+        
         if self.bin_size != 1:
             self = DiscreteDistribution(self.pmf.copy(), self.min, self.bin_size, self.best_fit, self.best_fit_params)
             self.split_bins()
         
         bin_sizes = [rv.bin_size for rv in rv_list]
         bin_size_gcd = np.gcd.reduce(bin_sizes)
+        
+        rv_list = [rv.copy() for rv in rv_list]
         for rv in rv_list:
             rv.split_bins(rv.bin_size // bin_size_gcd) # ensure equal bin size
             rv._align_bin_size() # ensure that the min value is divisible by the bin size

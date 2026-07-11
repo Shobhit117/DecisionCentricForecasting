@@ -290,7 +290,7 @@ class DiscreteTimeSeries:
             result_df = train_df.groupby(partition_cols).apply(_train_group).reset_index()
         return result_df
     
-    def predict_glm(self, model_data : pd.DataFrame) -> pd.DataFrame:
+    def predict_glm(self, model_data : pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         test_data = self.df[self.df['is_test'] == 1].copy()
         train_groups = [col for col in model_data.columns if col not in self.target_cols]
         
@@ -323,7 +323,24 @@ class DiscreteTimeSeries:
                 test_data.loc[group_idx, f'{target}_mu'] = np.exp(z)
                 test_data.loc[group_idx, f'{target}_alpha'] = model_dict.get('alpha', coef_series.get('alpha', np.nan))
         
-        return test_data
+        wmape_df = self.compute_wmape(test_data, [f'{target}_mu' for target in self.target_cols])
+        return test_data, wmape_df
+
+    def compute_wmape(self, pred_df : pd.DataFrame, pred_columns : list[str]) -> pd.DataFrame:
+        if len(self.target_cols) != len(pred_columns):
+            raise ValueError(f"Number of pred columns ({len(pred_columns)}) does not match the number of target columns ({len(self.target_cols)}).")
+        
+        target_to_pred = dict(zip(sorted(self.target_cols), sorted(pred_columns)))
+        wmape_df = pred_df[self.ts_id_cols + [self.period_col] + self.target_cols + pred_columns]
+        tmp_cols = []
+        for col_name in self.target_cols:
+            tmp_col = np.where(pred_df[col_name].isna(), 0, pred_df[target_to_pred[col_name]])
+            tmp_cols.append(tmp_col)
+        
+        wmape_df['actual'] = wmape_df[self.target_cols].fillna(0).sum(axis=1)
+        wmape_df['pred'] = wmape_df[tmp_cols].sum(axis=1)
+        wmape_df.drop(columns=tmp_cols + self.target_cols + pred_columns, inplace=True)
+        return wmape_df
 
     def compute_lead_time_demand_metrics_glm(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False) -> pd.DataFrame:
         if glm_mu_cols is None:
@@ -388,9 +405,9 @@ class DiscreteTimeSeries:
             gdf['target_inventory'] = results
         return gdf
 
-def compute_target_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list, cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False) -> pd.DataFrame:
+def compute_target_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list, cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     if model_type == 'glm':
-        predictions = ts.predict_glm(model_data)
+        predictions, wmape_df = ts.predict_glm(model_data)
         if not return_distribution:
             if service_levels is not None:
                 predictions = pd.merge(predictions, service_levels, on=[col for col in service_levels.columns if col != 'service_level'], how='left').fillna({'service_level': 0.95})
@@ -400,7 +417,7 @@ def compute_target_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame,
         predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(lambda x: ts.compute_lead_time_demand_metrics_glm(x, lead_time[x.name], cycle_time, return_distribution=return_distribution))
     else:
         raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm'.")
-    return predictions
+    return predictions, wmape_df
 
 def compute_distribution_dict(df : pd.DataFrame, value : str = 'lead_time', keys : list[str] = None, method : str = 'actual') -> tuple[dict[Any, "DiscreteDistribution"], list[str]]:
     if keys is None:
