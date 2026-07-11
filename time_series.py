@@ -212,10 +212,11 @@ class DiscreteTimeSeries:
         df_feature = df_feature.copy()
         keys = join_on + [self.period_col]
         df_feature = df_feature[keys + [feature_name]].drop_duplicates()
-        self.df = pd.merge(self.df, df_feature, on=keys, how='left').fillna({feature_name : default_value})
+        self.df = pd.merge(self.df, df_feature, on=keys, how='left') #.fillna({feature_name : default_value})
 
         self.df.sort_values(by=self.ts_id_cols + [self.period_col], inplace=True)
         gdf = self.df.groupby(self.ts_id_cols)
+        self.df[feature_name] = gdf[feature_name].ffill().bfill().fillna(default_value)
         
         # Add lags if required:
         cols_lags = []
@@ -230,7 +231,7 @@ class DiscreteTimeSeries:
         if (rolling_windows is not None) & (not is_cat_feature):
             for window in rolling_windows:
                 col_name = f'{feature_name}$rolling_mean_{window}'
-                self.df[col_name] = gdf[feature_name].transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+                self.df[col_name] = gdf[feature_name].transform(lambda x: x.rolling(window=window, min_periods=1).mean())
                 cols_rolling.append(col_name)
 
         generated_cols = cols_lags + cols_rolling
@@ -407,30 +408,30 @@ def compute_distribution_dict(df : pd.DataFrame, value : str = 'lead_time', keys
     distr = df.groupby(keys)[value].apply(lambda x: DiscreteDistribution.from_data(x, method)).to_dict()
     return distr, keys
 
-from m5_utils import load_m5_data, generate_synthetic_lead_times
-if __name__ == '__main__':
-    df = load_m5_data()
-    df_calendar = df[['day', 'wday']].copy().drop_duplicates().sort_values(by='day')
-    df_events = df[['day', 'event_type']].copy().drop_duplicates().sort_values(by='day')
+# from m5_utils import load_m5_data, generate_synthetic_lead_times
+# if __name__ == '__main__':
+#     df = load_m5_data()
+#     df_calendar = df[['day', 'wday']].copy().drop_duplicates().sort_values(by='day')
+#     df_events = df[['day', 'event_type']].copy().drop_duplicates().sort_values(by='day')
     
-    # Compute lead time distribution:
-    store_list = sorted(df['store_id'].unique())
-    lead_time = generate_synthetic_lead_times(store_list)
-    lead_time, lead_time_keys = compute_distribution_dict(lead_time, value='lead_time')
+#     # Compute lead time distribution:
+#     store_list = sorted(df['store_id'].unique())
+#     lead_time = generate_synthetic_lead_times(store_list)
+#     lead_time, lead_time_keys = compute_distribution_dict(lead_time, value='lead_time')
 
-    ts = DiscreteTimeSeries(df, ts_id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
-                              , period_col = 'day'
-                              , var_col = 'demand'
-                              , num_test_days=7
-                              , use_one_hot_encoding = True)
+#     ts = DiscreteTimeSeries(df, ts_id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
+#                               , period_col = 'day'
+#                               , var_col = 'demand'
+#                               , num_test_days=7
+#                               , use_one_hot_encoding = True)
     
-    ts.add_calendar_features(df_calendar, day_of_week_col='wday')
-    ts.add_feature(df_events, 'event_type', join_on=[], is_cat_feature=True, default_value='BAU')
+#     ts.add_calendar_features(df_calendar, day_of_week_col='wday')
+#     ts.add_feature(df_events, 'event_type', join_on=[], is_cat_feature=True, default_value='BAU')
 
-    print('Features: ', ts.feature_cols)
+#     print('Features: ', ts.feature_cols)
 
-    model_data = ts.train_glm()
-    predictions = compute_target_inventory(ts, model_data, lead_time, lead_time_keys, cycle_time = 1)
-    # predictions = ts.predict_glm(model_data)
+#     model_data = ts.train_glm()
+#     predictions = compute_target_inventory(ts, model_data, lead_time, lead_time_keys, cycle_time = 1)
+#     # predictions = ts.predict_glm(model_data)
 
-    predictions.to_csv("predictions.csv", index=False)
+#     predictions.to_csv("predictions.csv", index=False)
