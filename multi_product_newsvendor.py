@@ -1,5 +1,8 @@
 import numpy as np
+import pandas as pd
 from discrete_distribution import DiscreteDistribution
+import logging
+logger = logging.getLogger(__name__)
 
 def solve_multi_product_newsvendor(
     demand_distributions: list[DiscreteDistribution],
@@ -7,6 +10,8 @@ def solve_multi_product_newsvendor(
     purchase_cost: list[float] | np.ndarray,
     shortage_penalty: list[float] | np.ndarray,
     available_budget: float,
+    max_iters: int = 200,
+    tol: float = 1e-4
 ) -> np.ndarray:
     num_products = len(demand_distributions)
 
@@ -50,36 +55,39 @@ def solve_multi_product_newsvendor(
             distr.quantile(alpha[i])
             for i, distr in enumerate(demand_distributions)
         ])
-
-    x0 = opt_inventory(0.0)
-
-    if np.sum(x0 * purchase_cost) <= available_budget:
-        return x0
-
+    
+    logger.info('== Solving Multi-Product Newsvendor Problem ==')
+    x = opt_inventory(0.0)
+    if np.sum(x * purchase_cost) <= available_budget:
+        return x
+    logger.info(f'Iteration 0: Budget used = {np.sum(x * purchase_cost)}')
+    
     # Find upper bound on k large enough to force low inventory.
     k_lb = 0.0
     k_ub = np.max((selling_price + shortage_penalty) / purchase_cost - 1.0)
-    k_ub = max(k_ub, 1.0)
-
-    tol = 1e-4
-    max_iters = 200
-
-    best_feasible_x = np.zeros(num_products)
-
-    for _ in range(max_iters):
+    
+    # Initiate binary search on k:
+    for i in range(max_iters):
         k_mid = 0.5 * (k_lb + k_ub)
         x = opt_inventory(k_mid)
         budget_used = np.sum(x * purchase_cost)
-
+        logger.info(f'Iteration {i}: lb = {k_lb}, ub = {k_ub}, budget used = {budget_used}')
+        
         if budget_used <= available_budget:
-            best_feasible_x = x
             k_ub = k_mid
         else:
             k_lb = k_mid
-
-        if k_ub - k_lb < tol:
+        
+        if (k_ub - k_lb < tol):
             break
+    logger.info('== done ==')
+    return x
 
-    return best_feasible_x
-
-    
+def _solve_multi_product_newsvendor(df : pd.DataFrame, total_budget : float) -> pd.DataFrame:
+    demand_distributions = df['demand_distribution'] # do not create a copy of this column
+    selling_price = df['sell_price'].to_list()
+    purchase_cost = df['purchase_cost'].to_list()
+    shortage_penalty = df['shortage_penalty'].to_list()
+    result_df = df.drop(columns=['demand_distribution'])
+    result_df['target_inventory'] = solve_multi_product_newsvendor(demand_distributions, selling_price, purchase_cost, shortage_penalty, total_budget)
+    return result_df

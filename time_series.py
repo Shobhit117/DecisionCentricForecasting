@@ -183,7 +183,7 @@ class DiscreteTimeSeries:
     def add_calendar_features(self, df_calendar : pd.DataFrame, use_week_end_feature : bool = False, use_day_of_week_features : bool = True, day_of_week_col : str = None):
         if use_week_end_feature and use_day_of_week_features:
             raise ValueError("Only one of 'use_week_end_feature' or 'use_day_of_week_features' can be True")
-        self.df = pd.merge(self.df, df_calendar, on=self.period_col, how='left')
+        self.df = pd.merge(self.df, df_calendar[[self.period_col, day_of_week_col]], on=self.period_col, how='left')
         if use_week_end_feature:
             self._add_weekend_feature(day_of_week_col)
         if use_day_of_week_features:
@@ -222,7 +222,7 @@ class DiscreteTimeSeries:
         cols_lags = []
         if lags is not None:
             for lag in lags:
-                col_name = f'{feature_name}$lag_{lag}'
+                col_name = f'{feature_name}_lag_{lag}'.replace('-', 'minus_')
                 self.df[col_name] = gdf[feature_name].shift(lag)
                 cols_lags.append(col_name)
         
@@ -230,7 +230,7 @@ class DiscreteTimeSeries:
         cols_rolling = []
         if (rolling_windows is not None) & (not is_cat_feature):
             for window in rolling_windows:
-                col_name = f'{feature_name}$rolling_mean_{window}'
+                col_name = f'{feature_name}_rolling_mean_{window}'
                 self.df[col_name] = gdf[feature_name].transform(lambda x: x.rolling(window=window, min_periods=1).mean())
                 cols_rolling.append(col_name)
 
@@ -290,7 +290,7 @@ class DiscreteTimeSeries:
             result_df = train_df.groupby(partition_cols).apply(_train_group).reset_index()
         return result_df
     
-    def predict_glm(self, model_data : pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def predict_glm(self, model_data : pd.DataFrame) -> pd.DataFrame:
         test_data = self.df[self.df['is_test'] == 1].copy()
         train_groups = [col for col in model_data.columns if col not in self.target_cols]
         
@@ -323,26 +323,33 @@ class DiscreteTimeSeries:
                 test_data.loc[group_idx, f'{target}_mu'] = np.exp(z)
                 test_data.loc[group_idx, f'{target}_alpha'] = model_dict.get('alpha', coef_series.get('alpha', np.nan))
         
-        wmape_df = self.compute_wmape(test_data, [f'{target}_mu' for target in self.target_cols])
-        return test_data, wmape_df
+        self._compute_pred_metrics(test_data, [f'{target}_mu' for target in self.target_cols])
+        return test_data
 
-    def compute_wmape(self, pred_df : pd.DataFrame, pred_columns : list[str]) -> pd.DataFrame:
+    def _compute_pred_metrics(self, pred_df : pd.DataFrame, pred_columns : list[str]):
         if len(self.target_cols) != len(pred_columns):
             raise ValueError(f"Number of pred columns ({len(pred_columns)}) does not match the number of target columns ({len(self.target_cols)}).")
         
         target_to_pred = dict(zip(sorted(self.target_cols), sorted(pred_columns)))
-        wmape_df = pred_df[self.ts_id_cols + [self.period_col] + self.target_cols + pred_columns]
         tmp_cols = []
         for col_name in self.target_cols:
-            tmp_col = np.where(pred_df[col_name].isna(), 0, pred_df[target_to_pred[col_name]])
+            tmp_col = f'tmp_{col_name}'
+            pred_df[tmp_col] = np.where(pred_df[col_name].isna(), 0, pred_df[target_to_pred[col_name]])
             tmp_cols.append(tmp_col)
         
-        wmape_df['actual'] = wmape_df[self.target_cols].fillna(0).sum(axis=1)
-        wmape_df['pred'] = wmape_df[tmp_cols].sum(axis=1)
-        wmape_df.drop(columns=tmp_cols + self.target_cols + pred_columns, inplace=True)
-        return wmape_df
+        pred_df['actual'] = pred_df[self.target_cols].fillna(0).sum(axis=1)
+        pred_df['pred'] = pred_df[tmp_cols].sum(axis=1)
+        pred_df.drop(columns=tmp_cols, inplace=True)
+        pred_df['under_diff'] = np.maximum(pred_df['actual'] - pred_df['pred'], 0)
+        pred_df['over_diff'] = np.maximum(pred_df['pred'] - pred_df['actual'], 0)
+        pred_df['abs_diff'] = pred_df['under_diff'] + pred_df['over_diff']
 
-    def compute_lead_time_demand_metrics_glm(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False) -> pd.DataFrame:
+    def compute_lead_time_demand_metrics_glm(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False, pred_first_day : bool = True) -> pd.DataFrame:
+        if pred_first_day:
+            first_day = gdf[self.period_col].min()
+            gdf = gdf[gdf[self.period_col] == first_day].copy()
+        else:
+            gdf = gdf.copy()
         if glm_mu_cols is None:
             glm_mu_cols = [f"{col_name}_mu" for col_name in self.target_cols]
         if glm_alpha_cols is None:
@@ -355,9 +362,10 @@ class DiscreteTimeSeries:
         if cycle_time < 0:
             raise ValueError("'cycle_time' must be non-negative.")
         
-        service_levels_arr = gdf['service_level'].to_numpy(dtype=float)
-        if not return_distribution and np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
-            raise ValueError("'service_levels' values must be between 0 and 1.")
+        if not return_distribution:
+            service_levels_arr = gdf['service_level'].to_numpy(dtype=float)
+            if np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
+                raise ValueError("'service_levels' values must be between 0 and 1.")
 
         param_cols = ['best_fit', 'distr_param_0', 'distr_param_1', 'distr_param_2']
         required_cols = glm_mu_cols + glm_alpha_cols + param_cols
@@ -398,16 +406,15 @@ class DiscreteTimeSeries:
             else:
                 results.append(demand_during_lead_time.quantile(service_levels_arr[row_num]).item())
 
-        gdf = gdf.copy()
         if return_distribution:
             gdf['demand_distribution'] = results
         else:
             gdf['target_inventory'] = results
         return gdf
 
-def compute_target_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list, cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+def compute_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list[str], cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     if model_type == 'glm':
-        predictions, wmape_df = ts.predict_glm(model_data)
+        predictions = ts.predict_glm(model_data)
         if not return_distribution:
             if service_levels is not None:
                 predictions = pd.merge(predictions, service_levels, on=[col for col in service_levels.columns if col != 'service_level'], how='left').fillna({'service_level': 0.95})
@@ -417,38 +424,10 @@ def compute_target_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame,
         predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(lambda x: ts.compute_lead_time_demand_metrics_glm(x, lead_time[x.name], cycle_time, return_distribution=return_distribution))
     else:
         raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm'.")
-    return predictions, wmape_df
+    return predictions
 
 def compute_distribution_dict(df : pd.DataFrame, value : str = 'lead_time', keys : list[str] = None, method : str = 'actual') -> tuple[dict[Any, "DiscreteDistribution"], list[str]]:
     if keys is None:
         keys = [col for col in df.columns if col != value]
     distr = df.groupby(keys)[value].apply(lambda x: DiscreteDistribution.from_data(x, method)).to_dict()
     return distr, keys
-
-# from m5_utils import load_m5_data, generate_synthetic_lead_times
-# if __name__ == '__main__':
-#     df = load_m5_data()
-#     df_calendar = df[['day', 'wday']].copy().drop_duplicates().sort_values(by='day')
-#     df_events = df[['day', 'event_type']].copy().drop_duplicates().sort_values(by='day')
-    
-#     # Compute lead time distribution:
-#     store_list = sorted(df['store_id'].unique())
-#     lead_time = generate_synthetic_lead_times(store_list)
-#     lead_time, lead_time_keys = compute_distribution_dict(lead_time, value='lead_time')
-
-#     ts = DiscreteTimeSeries(df, ts_id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
-#                               , period_col = 'day'
-#                               , var_col = 'demand'
-#                               , num_test_days=7
-#                               , use_one_hot_encoding = True)
-    
-#     ts.add_calendar_features(df_calendar, day_of_week_col='wday')
-#     ts.add_feature(df_events, 'event_type', join_on=[], is_cat_feature=True, default_value='BAU')
-
-#     print('Features: ', ts.feature_cols)
-
-#     model_data = ts.train_glm()
-#     predictions = compute_target_inventory(ts, model_data, lead_time, lead_time_keys, cycle_time = 1)
-#     # predictions = ts.predict_glm(model_data)
-
-#     predictions.to_csv("predictions.csv", index=False)
