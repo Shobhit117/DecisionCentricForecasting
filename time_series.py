@@ -323,10 +323,10 @@ class DiscreteTimeSeries:
                 test_data.loc[group_idx, f'{target}_mu'] = np.exp(z)
                 test_data.loc[group_idx, f'{target}_alpha'] = model_dict.get('alpha', coef_series.get('alpha', np.nan))
         
-        self._compute_pred_metrics(test_data, [f'{target}_mu' for target in self.target_cols])
+        self._compute_forecasting_metrics(test_data, [f'{target}_mu' for target in self.target_cols])
         return test_data
 
-    def _compute_pred_metrics(self, pred_df : pd.DataFrame, pred_columns : list[str]):
+    def _compute_forecasting_metrics(self, pred_df : pd.DataFrame, pred_columns : list[str]):
         if len(self.target_cols) != len(pred_columns):
             raise ValueError(f"Number of pred columns ({len(pred_columns)}) does not match the number of target columns ({len(self.target_cols)}).")
         
@@ -344,7 +344,7 @@ class DiscreteTimeSeries:
         pred_df['over_diff'] = np.maximum(pred_df['pred'] - pred_df['actual'], 0)
         pred_df['abs_diff'] = pred_df['under_diff'] + pred_df['over_diff']
 
-    def compute_lead_time_demand_metrics_glm(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False, pred_first_day : bool = True) -> pd.DataFrame:
+    def compute_lead_time_demand(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False, pred_first_day : bool = True) -> pd.DataFrame:
         if pred_first_day:
             first_day = gdf[self.period_col].min()
             gdf = gdf[gdf[self.period_col] == first_day].copy()
@@ -412,7 +412,7 @@ class DiscreteTimeSeries:
             gdf['target_inventory'] = results
         return gdf
 
-def compute_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list[str], cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+def compute_lead_time_demand(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list[str], cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False, pred_first_day: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     if model_type == 'glm':
         predictions = ts.predict_glm(model_data)
         if not return_distribution:
@@ -421,7 +421,7 @@ def compute_inventory(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_t
             else:
                 predictions['service_level'] = 0.95
         cols = predictions.columns.to_list()
-        predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(lambda x: ts.compute_lead_time_demand_metrics_glm(x, lead_time[x.name], cycle_time, return_distribution=return_distribution))
+        predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(lambda x: ts.compute_lead_time_demand(x, lead_time[x.name], cycle_time, return_distribution=return_distribution, pred_first_day=pred_first_day))
     else:
         raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm'.")
     return predictions

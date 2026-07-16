@@ -52,7 +52,7 @@ def solve_multi_product_newsvendor(
         alpha = np.clip(alpha, 0.0, 1.0)
 
         return np.array([
-            distr.quantile(alpha[i])
+            distr.quantile(alpha[i])[0]
             for i, distr in enumerate(demand_distributions)
         ])
     
@@ -70,6 +70,7 @@ def solve_multi_product_newsvendor(
     for i in range(max_iters):
         k_mid = 0.5 * (k_lb + k_ub)
         x = opt_inventory(k_mid)
+        print(np.sum(x))
         budget_used = np.sum(x * purchase_cost)
         logger.info(f'Iteration {i}: lb = {k_lb}, ub = {k_ub}, budget used = {budget_used}')
         
@@ -81,13 +82,14 @@ def solve_multi_product_newsvendor(
         if (k_ub - k_lb < tol):
             break
     logger.info('== done ==')
+    print(np.sum(x))
     return x
 
-def _solve_multi_product_newsvendor(df : pd.DataFrame, total_budget : float) -> pd.DataFrame:
+def _solve_multi_product_newsvendor(df : pd.DataFrame, total_budget : float, out_col_name : str = 'target_inventory') -> pd.DataFrame:
     demand_distributions = df['demand_distribution'] # do not create a copy of this column
     selling_price = df['sell_price'].to_list()
     purchase_cost = df['purchase_cost'].to_list()
     shortage_penalty = df['shortage_penalty'].to_list()
     result_df = df.drop(columns=['demand_distribution'])
-    result_df['target_inventory'] = solve_multi_product_newsvendor(demand_distributions, selling_price, purchase_cost, shortage_penalty, total_budget)
+    result_df[out_col_name] = solve_multi_product_newsvendor(demand_distributions, selling_price, purchase_cost, shortage_penalty, total_budget)
     return result_df
