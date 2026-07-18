@@ -2,3 +2,4 @@ model_data.csv
 predictions.csv
 data
 backup
+__pycache__

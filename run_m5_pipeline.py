@@ -50,8 +50,9 @@ def main(synthetic_data_dir, m5_data_dir, out_dir, budget_per_store):
     prices_df = pd.read_parquet(m5_data_dir / 'price.parquet')
     prices_df['sell_price'] = np.log1p(prices_df['sell_price'])
     
-    metrics = {'wmape_store': [], 'wmape_store_cat': []}
-    
+    wmape_store = []
+    wmape_store_cat = []
+
     lead_time_df = pd.read_parquet(synthetic_data_dir / 'lead_time.parquet')
     lead_time_distr, lead_time_keys = compute_distribution_dict(lead_time_df, value='lead_time', keys=['store_id'])
     del lead_time_df; gc.collect()
@@ -68,7 +69,7 @@ def main(synthetic_data_dir, m5_data_dir, out_dir, budget_per_store):
             continue
         sales_df = pd.read_parquet(item)
         store_name = re.search(r"sales_data_([^.]+)\.parquet", item.name).group(1)
-        sales_df = sales_df[sales_df['cat_id']=='FOODS']
+        # sales_df = sales_df[sales_df['cat_id']=='FOODS']
         print(f"Training Forecasting Model for store: {store_name}")
         ts = DiscreteTimeSeries(sales_df, ts_id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id'], period_col = 'day', var_col = 'demand', num_future_targets = 7, num_test_days=28)
         del sales_df; gc.collect()
@@ -81,7 +82,7 @@ def main(synthetic_data_dir, m5_data_dir, out_dir, budget_per_store):
         model_data = ts.train_glm(train_groups=['store_id', 'cat_id'])
         model_data.to_csv(out_dir / f'model_data_{store_name}.csv', index=False)
 
-        predictions = compute_lead_time_demand(ts, model_data, lead_time_distr, lead_time_keys, cycle_time=1, service_levels=None, model_type='glm', return_distribution=True)
+        predictions = compute_lead_time_demand(ts, model_data, lead_time_distr, lead_time_keys, cycle_time=1, service_levels=None, model_type='glm', return_distribution=True, pred_first_day=False)
         del ts; gc.collect()
         
         # Solve newsvendor model:
@@ -96,17 +97,17 @@ def main(synthetic_data_dir, m5_data_dir, out_dir, budget_per_store):
         predictions.to_csv(out_dir / f'predictions_{store_name}.csv', index=False)
 
         # Compute Forecasting Metrics:
-        wmape_store_cat = predictions.groupby(['store_id', 'cat_id'], as_index=False)[['pred', 'actual', 'under_diff', 'over_diff', 'abs_diff']].sum()
-        wmape_store = wmape_store_cat.groupby('store_id', as_index=False)[['pred', 'actual', 'under_diff', 'over_diff', 'abs_diff']].sum()
-        _compute_wmape(wmape_store_cat)
-        _compute_wmape(wmape_store)
-        metrics['wmape_store_cat'].append(wmape_store_cat)
-        metrics['wmape_store'].append(wmape_store)
+        df_wmape_store_cat = predictions.groupby(['store_id', 'cat_id'], as_index=False)[['pred', 'actual', 'under_diff', 'over_diff', 'abs_diff']].sum()
+        df_wmape_store = wmape_store_cat.groupby('store_id', as_index=False)[['pred', 'actual', 'under_diff', 'over_diff', 'abs_diff']].sum()
+        _compute_wmape(df_wmape_store_cat)
+        _compute_wmape(df_wmape_store)
+        wmape_store_cat.append(df_wmape_store_cat)
+        wmape_store.append(df_wmape_store)
     
-    metrics['wmape_store_cat'] = pd.concat(metrics['wmape_store_cat'])
-    metrics['wmape_store'] = pd.concat(metrics['wmape_store'])
-    metrics['wmape_store'].to_csv(out_dir / 'wmape_store.csv', index=False)
-    metrics['wmape_store_cat'].to_csv(out_dir / 'wmape_store_cat.csv', index=False)
+    wmape_store_cat = pd.concat(wmape_store_cat)
+    wmape_store = pd.concat(wmape_store)
+    wmape_store.to_csv(out_dir / 'wmape_store.csv', index=False)
+    wmape_store_cat.to_csv(out_dir / 'wmape_store_cat.csv', index=False)
 
 if __name__ == '__main__':
     args = parse_args()

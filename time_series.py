@@ -344,7 +344,7 @@ class DiscreteTimeSeries:
         pred_df['over_diff'] = np.maximum(pred_df['pred'] - pred_df['actual'], 0)
         pred_df['abs_diff'] = pred_df['under_diff'] + pred_df['over_diff']
 
-    def compute_lead_time_demand(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False, pred_first_day : bool = True) -> pd.DataFrame:
+    def compute_lead_time_demand_glm(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False, pred_first_day : bool = True) -> pd.DataFrame:
         if pred_first_day:
             first_day = gdf[self.period_col].min()
             gdf = gdf[gdf[self.period_col] == first_day].copy()
@@ -421,7 +421,7 @@ def compute_lead_time_demand(ts : DiscreteTimeSeries, model_data : pd.DataFrame,
             else:
                 predictions['service_level'] = 0.95
         cols = predictions.columns.to_list()
-        predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(lambda x: ts.compute_lead_time_demand(x, lead_time[x.name], cycle_time, return_distribution=return_distribution, pred_first_day=pred_first_day))
+        predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(lambda x: ts.compute_lead_time_demand_glm(x, lead_time[x.name], cycle_time, return_distribution=return_distribution, pred_first_day=pred_first_day))
     else:
         raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm'.")
     return predictions

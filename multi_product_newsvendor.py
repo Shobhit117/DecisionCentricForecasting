@@ -59,6 +59,7 @@ def solve_multi_product_newsvendor(
     logger.info('== Solving Multi-Product Newsvendor Problem ==')
     x = opt_inventory(0.0)
     if np.sum(x * purchase_cost) <= available_budget:
+        logger.info('== done ==')
         return x
     logger.info(f'Iteration 0: Budget used = {np.sum(x * purchase_cost)}')
     
