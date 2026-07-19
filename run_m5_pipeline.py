@@ -74,7 +74,7 @@ def main(synthetic_data_dir, m5_data_dir, out_dir, budget_per_store):
         ts = DiscreteTimeSeries(sales_df, ts_id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id'], period_col = 'day', var_col = 'demand', num_future_targets = 7, num_test_days=28)
         del sales_df; gc.collect()
 
-        ts.add_calendar_features(calendar_df, day_of_week_col='wday')
+        ts.add_calendar_features(calendar_df, 'wday')
         ts.add_feature(prices_df, 'sell_price', join_on=['store_id', 'item_id'])
         ts.add_feature(calendar_df.fillna({'event_type': 'no_event'}), 'event_type', join_on=[], is_cat_feature=True, default_value='no_event')
         
@@ -98,11 +98,13 @@ def main(synthetic_data_dir, m5_data_dir, out_dir, budget_per_store):
 
         # Compute Forecasting Metrics:
         df_wmape_store_cat = predictions.groupby(['store_id', 'cat_id'], as_index=False)[['pred', 'actual', 'under_diff', 'over_diff', 'abs_diff']].sum()
-        df_wmape_store = wmape_store_cat.groupby('store_id', as_index=False)[['pred', 'actual', 'under_diff', 'over_diff', 'abs_diff']].sum()
+        df_wmape_store = df_wmape_store_cat.groupby('store_id', as_index=False)[['pred', 'actual', 'under_diff', 'over_diff', 'abs_diff']].sum()
         _compute_wmape(df_wmape_store_cat)
         _compute_wmape(df_wmape_store)
         wmape_store_cat.append(df_wmape_store_cat)
         wmape_store.append(df_wmape_store)
+        del predictions; gc.collect()
+        break
     
     wmape_store_cat = pd.concat(wmape_store_cat)
     wmape_store = pd.concat(wmape_store)

@@ -55,12 +55,15 @@ class DiscreteTimeSeries:
         self.var_col = var_col
         self.period_col = period_col
         self.df = df[ts_id_cols + [period_col, var_col]].copy()
+        for col in ts_id_cols:
+            self.df[col] = self.df[col].astype('category')
         if to_datetime:
             self.df[period_col] = pd.to_datetime(self.df[period_col])
         self.start_period = self.df[period_col].min()
         self.end_period = self.df[period_col].max()
         self.periods = sorted(self.df[period_col].unique())
         self.num_periods = len(self.periods)
+        self.df[period_col] = self.df[period_col].astype('category')
         self.feature_cols = []
         self.target_cols = []
         self.categorical_feature_cols = []
@@ -180,9 +183,11 @@ class DiscreteTimeSeries:
             else:
                 self.categorical_feature_cols.append('best_fit')
 
-    def add_calendar_features(self, df_calendar : pd.DataFrame, use_week_end_feature : bool = False, use_day_of_week_features : bool = True, day_of_week_col : str = None):
+    def add_calendar_features(self, df_calendar : pd.DataFrame, day_of_week_col : str, use_week_end_feature : bool = False, use_day_of_week_features : bool = True):
         if use_week_end_feature and use_day_of_week_features:
             raise ValueError("Only one of 'use_week_end_feature' or 'use_day_of_week_features' can be True")
+        df_calendar[self.period_col] = df_calendar[self.period_col].astype('category')
+        df_calendar[day_of_week_col] = df_calendar[day_of_week_col].astype('category')
         self.df = pd.merge(self.df, df_calendar[[self.period_col, day_of_week_col]], on=self.period_col, how='left')
         if use_week_end_feature:
             self._add_weekend_feature(day_of_week_col)
@@ -210,6 +215,9 @@ class DiscreteTimeSeries:
         
     def add_feature(self, df_feature : pd.DataFrame, feature_name : str, join_on : list[str], is_cat_feature : bool = False, default_value : Any = np.nan, lags : tuple[int] | None = None, rolling_windows : tuple[int] | None = None):
         df_feature = df_feature.copy()
+        df_feature[self.period_col] = df_feature[self.period_col].astype('category')
+        for col in join_on:
+            df_feature[col] = df_feature[col].astype('category')
         keys = join_on + [self.period_col]
         df_feature = df_feature[keys + [feature_name]].drop_duplicates()
         self.df = pd.merge(self.df, df_feature, on=keys, how='left') #.fillna({feature_name : default_value})
