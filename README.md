@@ -11,7 +11,7 @@ The project uses the **M5 Forecasting Accuracy** dataset to demonstrate a decisi
 5. Solve a budget-constrained multi-product newsvendor problem.
 6. Export forecasts, inventory decisions, and forecasting metrics.
 
-> **Project status:** Experimental / work in progress. The current implementation uses Poisson and negative-binomial generalized linear models. Lead-time and purchasing-cost inputs are synthetically generated for demonstration.
+> **Project status:** Experimental / work in progress. The forecasting layer supports Poisson and negative-binomial generalized linear models and CatBoost multi-quantile regression. Lead-time and purchasing-cost inputs are synthetically generated for demonstration.
 
 ---
 
@@ -197,6 +197,24 @@ Models are grouped by:
 - product category;
 - overdispersion status.
 
+### 1b. CatBoost Multi-Quantile Regression (`--model catboost`)
+
+An alternative, non-parametric forecasting layer (`catboost_quantile.py`, `quantile_distribution.py`):
+
+- one CatBoost model per forecast horizon, trained with the `MultiQuantile` loss (summed pinball loss), so a single model predicts the full quantile grid `0.05, 0.1, 0.2, ..., 0.9, 0.95, 0.99`;
+- a single global model per store; `item_id`, `dept_id`, `cat_id`, day of week, and event type are native categorical features; rolling standard deviations and month are added as features;
+- training rows whose target lies in the test period are excluded, and the last 28 target days before the test period are used for early stopping;
+- by default only the last 730 days of history are used (`--catboost-train-days`, `0` = all).
+
+Each predicted quantile vector is converted into a discrete daily demand distribution:
+
+1. quantile crossing is removed by sorting, and quantiles are clipped at zero;
+2. the quantile function `Q(tau)` is linearly interpolated between the predicted quantiles;
+3. the lower tail is linearly extrapolated to `tau = 0` (clipped at zero), and the upper tail is exponential, passing through the last two quantiles and truncated at `1 - 1e-4`;
+4. integer demand is `D = round(Q(U))`, i.e. `P(D <= y) = P(Q(U) < y + 0.5)`.
+
+The resulting daily distributions feed the same lead-time random sum and newsvendor optimizer as the GLMs. Pinball loss and empirical coverage per horizon and quantile are written to `quantile_metrics_catboost.csv`.
+
 ### 2. Lead-Time Demand
 
 Daily predictive distributions are combined with an empirical store-level lead-time distribution.
@@ -245,9 +263,10 @@ statsmodels
 matplotlib
 requests
 pyarrow
+catboost
 ```
 
-`pyarrow` is required by Pandas for reading and writing Parquet files.
+`pyarrow` is required by Pandas for reading and writing Parquet files. `catboost` is only needed for `--model catboost`.
 
 ---
 
@@ -377,6 +396,15 @@ To use a different budget:
 ```bash
 python run_m5_pipeline.py --budget-per-store 25000
 ```
+
+To use the CatBoost multi-quantile model instead of the GLMs:
+
+```bash
+python run_m5_pipeline.py --model catboost
+python run_m5_pipeline.py --model catboost --catboost-iterations 500 --catboost-train-days 365 --quantiles 0.05 0.1 0.25 0.5 0.75 0.9 0.95 0.99
+```
+
+CatBoost outputs are written with a `_catboost` suffix (`predictions_catboost_<STORE_ID>.csv`, `wmape_store_catboost.csv`, `wmape_store_cat_catboost.csv`, `quantile_metrics_catboost.csv`, `feature_importance_catboost_<STORE_ID>.csv`), and the trained models are saved in `catboost_models_<STORE_ID>/` (reload with `CatBoostQuantileModel.load`).
 
 Custom input and output directories can also be supplied:
 
@@ -738,8 +766,8 @@ Phase 3 — Evaluation
   □ Baseline policy comparison
 
 Phase 4 — Model expansion
-  □ CatBoost quantile regression
-  □ Quantile-to-distribution reconstruction
+  ✓ CatBoost quantile regression
+  ✓ Quantile-to-distribution reconstruction
   □ Calibration analysis
   □ GLM versus CatBoost benchmarking
 

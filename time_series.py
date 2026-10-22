@@ -2,10 +2,13 @@ import numpy as np
 import pandas as pd
 from pandas.core.groupby.generic import DataFrameGroupBy
 from discrete_distribution import compute_best_fit_distribution, DiscreteDistribution
+from quantile_distribution import DEFAULT_QUANTILES, validate_quantile_levels, quantiles_to_pmf, quantiles_to_mean, pinball_loss
 import statsmodels.formula.api as smf
-from typing import Any
+from typing import Any, TYPE_CHECKING
 import logging
 import json
+if TYPE_CHECKING:
+    from catboost_quantile import CatBoostQuantileModel
 logging.basicConfig(level=logging.INFO)
 
 def train_glm(df: pd.DataFrame, feature_cols: list[str], target_col: str, model_type: str = 'nbinom') -> tuple[dict, str]:
@@ -122,6 +125,9 @@ class DiscreteTimeSeries:
         for i in range(0, num_future_targets):
             col_name = f'target_t_plus_{i}'
             feature_df[col_name] = grouped_df[self.var_col].shift(-i)
+            if self.test_start_period is not None and i > 0:
+                target_in_test = grouped_df['is_test'].shift(-i) == 1
+                feature_df.loc[(feature_df['is_test'] == 0) & target_in_test, col_name] = np.nan
             self.target_cols.append(col_name)
         
         # Remove rows with missing features:
@@ -420,18 +426,203 @@ class DiscreteTimeSeries:
             gdf['target_inventory'] = results
         return gdf
 
-def compute_lead_time_demand(ts : DiscreteTimeSeries, model_data : pd.DataFrame, lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list[str], cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False, pred_first_day: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # ------------------------------------------------------------------
+    # CatBoost multi-quantile regression
+    # ------------------------------------------------------------------
+    def _period_positions(self, df : pd.DataFrame) -> pd.Series:
+        """Position (0-based index into self.periods) of every row's period."""
+        values = df[self.period_col]
+        if isinstance(values.dtype, pd.CategoricalDtype):
+            values = values.astype(values.cat.categories.dtype)
+        positions = np.searchsorted(np.asarray(self.periods), values.to_numpy())
+        return pd.Series(positions, index=df.index)
+
+    def _target_offset(self, target_col : str) -> int:
+        return int(target_col.rsplit('_', 1)[-1])
+
+    def train_catboost(self, quantiles : tuple[float] = DEFAULT_QUANTILES, train_groups : tuple[str] | None = None, extra_cat_cols : tuple[str] = ('item_id', 'dept_id', 'cat_id'), num_valid_days : int = 28, max_train_days : int | None = None, catboost_params : dict[str, Any] | None = None) -> "CatBoostQuantileModel":
+        """
+        Trains one CatBoost MultiQuantile model per forecast horizon (and per training group, if given).
+
+        Training rows whose target falls inside the test period are excluded (no look-ahead).
+        The last `num_valid_days` target days before the test period are used as an early-stopping
+        validation set. `max_train_days` optionally limits the training history to speed up training.
+        """
+        from catboost_quantile import CatBoostQuantileModel, train_catboost_quantile
+
+        quantiles = tuple(float(q) for q in validate_quantile_levels(quantiles))
+        partition_cols = list(train_groups) if train_groups else []
+        cat_cols = list(dict.fromkeys(list(self.categorical_feature_cols) + [c for c in extra_cat_cols if c not in partition_cols]))
+        feature_cols = [c for c in self.feature_cols if c not in cat_cols]
+        result = CatBoostQuantileModel(quantiles, list(self.target_cols), feature_cols, cat_cols, partition_cols)
+
+        test_start_pos = len(self.periods) if self.test_start_period is None else self.periods.index(self.test_start_period)
+        period_pos = self._period_positions(self.df)
+        mask = self.df['is_test'] == 0
+        if max_train_days is not None:
+            mask &= period_pos >= test_start_pos - num_valid_days - max_train_days
+        train_df = self.df[mask]
+        train_pos = period_pos[mask]
+
+        groups = train_df.groupby(partition_cols, observed=True) if partition_cols else [((), train_df)]
+        for group_values, group_df in groups:
+            key = CatBoostQuantileModel.group_key(group_values) if partition_cols else ()
+            group_pos = train_pos.loc[group_df.index]
+            for target in self.target_cols:
+                target_pos = group_pos + self._target_offset(target)
+                has_target = group_df[target].notna() & (target_pos < test_start_pos)
+                valid_mask = has_target & (target_pos >= test_start_pos - num_valid_days)
+                fit_mask = has_target & ~valid_mask
+                self.logger.info(f"training CatBoost model for group {key or '(all)'}, target {target}: {fit_mask.sum()} train rows, {valid_mask.sum()} validation rows...")
+                model = train_catboost_quantile(group_df[fit_mask], feature_cols, cat_cols, target, quantiles,
+                                                eval_df=group_df[valid_mask] if num_valid_days > 0 else None,
+                                                params=catboost_params)
+                result.models.setdefault(key, {})[target] = model
+                self.logger.info(f"model trained successfully (best iteration: {model.get_best_iteration()})")
+        return result
+
+    def predict_catboost(self, model : "CatBoostQuantileModel", tol : float = 1e-4) -> pd.DataFrame:
+        """
+        Predicts the quantile grid for every test row and horizon. Adds the columns
+        `<target>_q<level>` (non-crossing quantiles) and `<target>_mu` (mean of the
+        reconstructed discrete distribution), plus the point-forecast error columns.
+        """
+        from catboost_quantile import predict_catboost_quantile
+
+        test_data = self.df[self.df['is_test'] == 1].copy()
+        levels = np.asarray(model.quantiles)
+        preds = {target: np.full((len(test_data), len(levels)), np.nan) for target in model.target_cols}
+
+        if model.train_groups:
+            groups = test_data.groupby(model.train_groups, observed=True).indices
+        else:
+            groups = {(): np.arange(len(test_data))}
+        for group_values, idx in groups.items():
+            key = model.group_key(group_values) if model.train_groups else ()
+            group_models = model.models.get(key)
+            if group_models is None:
+                self.logger.warning(f"no CatBoost model available for group {key}; skipping {len(idx)} rows")
+                continue
+            group_df = test_data.iloc[idx]
+            for target, cb_model in group_models.items():
+                preds[target][idx] = predict_catboost_quantile(cb_model, group_df, model.feature_cols, model.cat_feature_cols)
+
+        new_cols = {}
+        for target, arr in preds.items():
+            for j, col in enumerate(model.quantile_cols(target)):
+                new_cols[col] = arr[:, j]
+            mu = np.full(len(arr), np.nan)
+            valid = ~np.isnan(arr).any(axis=1)
+            mu[valid] = quantiles_to_mean(levels, arr[valid], tol)
+            new_cols[f'{target}_mu'] = mu
+        test_data = pd.concat([test_data, pd.DataFrame(new_cols, index=test_data.index)], axis=1)
+
+        self._compute_forecasting_metrics(test_data, [f'{target}_mu' for target in self.target_cols])
+        return test_data
+
+    def evaluate_quantile_forecasts(self, pred_df : pd.DataFrame, quantiles : tuple[float], group_cols : list[str] | None = None) -> pd.DataFrame:
+        """Pinball loss and empirical coverage P(y <= q_hat) per horizon and quantile level."""
+        from catboost_quantile import quantile_col_name
+
+        group_cols = list(group_cols) if group_cols else []
+        groups = pred_df.groupby(group_cols, observed=True) if group_cols else [((), pred_df)]
+        rows = []
+        for group_values, gdf in groups:
+            group_values = group_values if isinstance(group_values, tuple) else (group_values,)
+            for target in self.target_cols:
+                mask = gdf[target].notna()
+                y = gdf.loc[mask, target].to_numpy(dtype=float)
+                if len(y) == 0:
+                    continue
+                for q in quantiles:
+                    q_hat = gdf.loc[mask, quantile_col_name(target, q)].to_numpy(dtype=float)
+                    rows.append({**dict(zip(group_cols, group_values)),
+                                 'target': target,
+                                 'quantile': q,
+                                 'n_obs': len(y),
+                                 'pinball_loss': pinball_loss(y, q_hat, q).mean(),
+                                 'coverage': np.mean(y <= q_hat)})
+        return pd.DataFrame(rows)
+
+    def compute_lead_time_demand_catboost(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, quantiles : tuple[float], return_distribution : bool = False, pred_first_day : bool = True, tol : float = 1e-4) -> pd.DataFrame:
+        """
+        Builds a discrete daily demand distribution from each horizon's predicted quantiles and
+        combines them with the (lead time + cycle time) distribution via a random sum.
+        """
+        from catboost_quantile import quantile_col_name
+
+        if pred_first_day:
+            first_day = gdf[self.period_col].min()
+            gdf = gdf[gdf[self.period_col] == first_day].copy()
+        else:
+            gdf = gdf.copy()
+        levels = validate_quantile_levels(quantiles)
+        if cycle_time < 0:
+            raise ValueError("'cycle_time' must be non-negative.")
+        horizon = len(self.target_cols)
+        if horizon == 0:
+            raise ValueError("At least one forecast horizon is required.")
+
+        if not return_distribution:
+            service_levels_arr = gdf['service_level'].to_numpy(dtype=float)
+            if np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
+                raise ValueError("'service_levels' values must be between 0 and 1.")
+
+        quantile_cols = [[quantile_col_name(target, q) for q in levels] for target in self.target_cols]
+        param_cols = ['best_fit', 'distr_param_0', 'distr_param_1', 'distr_param_2']
+        required_cols = [col for cols in quantile_cols for col in cols] + param_cols
+        missing_cols = [col for col in required_cols if col not in gdf.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns required to compute target inventory: {missing_cols}.")
+
+        lead_time_with_cycle = lead_time.copy()
+        lead_time_with_cycle.shift(cycle_time)
+        if lead_time_with_cycle.min < 0:
+            raise ValueError("Lead time plus cycle time must have non-negative support.")
+
+        num_q = len(levels)
+        q_matrix = gdf[required_cols[:horizon * num_q]].to_numpy(dtype=float).reshape(len(gdf), horizon, num_q)
+        param_values = gdf[param_cols].itertuples(index=False, name=None)
+
+        results = []
+        for row_num, (row_quantiles, params) in enumerate(zip(q_matrix, param_values)):
+            if np.any(~np.isfinite(row_quantiles)):
+                raise ValueError(f"Invalid CatBoost quantile forecast for row {row_num}: {row_quantiles}.")
+            default_demand = None
+            if lead_time_with_cycle.max > horizon:
+                best_fit_params = tuple(p for p in params[1:] if not pd.isna(p))
+                default_demand = DiscreteDistribution.from_parametric(params[0], best_fit_params)
+
+            demand = [DiscreteDistribution(*quantiles_to_pmf(levels, q_row, tol)) for q_row in row_quantiles]
+            demand_during_lead_time = lead_time_with_cycle.random_sum(demand, default_demand)
+
+            if return_distribution:
+                results.append(demand_during_lead_time)
+            else:
+                results.append(demand_during_lead_time.quantile(service_levels_arr[row_num]).item())
+
+        if return_distribution:
+            gdf['demand_distribution'] = results
+        else:
+            gdf['target_inventory'] = results
+        return gdf
+
+def compute_lead_time_demand(ts : DiscreteTimeSeries, model_data : "pd.DataFrame | CatBoostQuantileModel", lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list[str], cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False, pred_first_day: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     if model_type == 'glm':
         predictions = ts.predict_glm(model_data)
-        if not return_distribution:
-            if service_levels is not None:
-                predictions = pd.merge(predictions, service_levels, on=[col for col in service_levels.columns if col != 'service_level'], how='left').fillna({'service_level': 0.95})
-            else:
-                predictions['service_level'] = 0.95
-        cols = predictions.columns.to_list()
-        predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(lambda x: ts.compute_lead_time_demand_glm(x, lead_time[x.name], cycle_time, return_distribution=return_distribution, pred_first_day=pred_first_day))
+        ddlt_fn = lambda x: ts.compute_lead_time_demand_glm(x, lead_time[x.name], cycle_time, return_distribution=return_distribution, pred_first_day=pred_first_day)
+    elif model_type == 'catboost':
+        predictions = ts.predict_catboost(model_data)
+        ddlt_fn = lambda x: ts.compute_lead_time_demand_catboost(x, lead_time[x.name], cycle_time, model_data.quantiles, return_distribution=return_distribution, pred_first_day=pred_first_day)
     else:
-        raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm'.")
+        raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm', 'catboost'.")
+    if not return_distribution:
+        if service_levels is not None:
+            predictions = pd.merge(predictions, service_levels, on=[col for col in service_levels.columns if col != 'service_level'], how='left').fillna({'service_level': 0.95})
+        else:
+            predictions['service_level'] = 0.95
+    cols = predictions.columns.to_list()
+    predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(ddlt_fn)
     return predictions
 
 def compute_distribution_dict(df : pd.DataFrame, value : str = 'lead_time', keys : list[str] = None, method : str = 'actual') -> tuple[dict[Any, "DiscreteDistribution"], list[str]]:

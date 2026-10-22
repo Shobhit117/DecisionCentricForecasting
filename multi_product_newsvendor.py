@@ -82,6 +82,7 @@ def solve_multi_product_newsvendor(
         
         if (k_ub - k_lb < tol):
             break
+    x = opt_inventory(k_ub)  # k_ub always satisfies the budget constraint (the last k_mid may not)
     logger.info('== done ==')
     print(np.sum(x))
     return x
