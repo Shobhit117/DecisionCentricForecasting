@@ -1,257 +1,440 @@
+import json
+import logging
+from typing import Any, TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 from pandas.core.groupby.generic import DataFrameGroupBy
-from discrete_distribution import compute_best_fit_distribution, DiscreteDistribution
-from quantile_distribution import DEFAULT_QUANTILES, validate_quantile_levels, quantiles_to_pmf, quantiles_to_mean, pinball_loss
-import statsmodels.formula.api as smf
-from typing import Any, TYPE_CHECKING
-import logging
-import json
+
+from ddlt import DDLTCalculator
+from discrete_distribution import DiscreteDistribution, compute_best_fit_distribution
+from forecasters import (
+    CatBoostQuantileForecaster,
+    GLMForecaster,
+    ProbabilisticForecaster,
+    compute_forecasting_metrics,
+    evaluate_quantile_forecasts,
+    train_single_glm,
+)
+from quantile_distribution import DEFAULT_QUANTILES
+
 if TYPE_CHECKING:
     from catboost_quantile import CatBoostQuantileModel
+
 logging.basicConfig(level=logging.INFO)
 
-def train_glm(df: pd.DataFrame, feature_cols: list[str], target_col: str, model_type: str = 'nbinom') -> tuple[dict, str]:
-    """
-    Trains a Generalized Linear Model (GLM) on the provided DataFrame.
-    """
-    train_df = df[~df[target_col].isna()]
-    if 'is_test' in train_df.columns:
-        train_df = train_df[train_df['is_test'] == 0]
-    formula = f'{target_col} ~ {" + ".join(feature_cols)}'
-    if model_type == 'nbinom': 
-        model = smf.negativebinomial(formula=formula, data=train_df)
-    elif model_type == 'poisson':
-        model = smf.poisson(formula=formula, data=train_df)
-    else:
-        raise ValueError(f"Unsupported distribution: '{model_type}'. Supported options are 'nbinom', 'poisson'.")
-    result = model.fit(maxiter=100)
-    prod_model = {"model_type": model_type
-                , "horizon": target_col
-                , "coefficients": result.params.to_dict()}
-    return prod_model, result.summary()
 
-def predict_glm(model_data: dict[str, Any], feature_dict: dict[str, Any] | pd.Series) -> tuple[float, float | None]:
+def train_glm(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    model_type: str = "nbinom",
+) -> tuple[dict, Any]:
+    """Trains a Generalized Linear Model (GLM) on the provided DataFrame."""
+    return train_single_glm(df, feature_cols, target_col, model_type)
+
+
+def predict_glm(
+    model_data: dict[str, Any],
+    feature_dict: dict[str, Any] | pd.Series,
+) -> tuple[float, float | None]:
     """
-    Computes the expected value (mu) and dispersion parameter (alpha) 
+    Computes the expected value (mu) and dispersion parameter (alpha)
     for a given feature set using trained GLM coefficients.
     """
-    coefficients = model_data['coefficients']
-    z = coefficients.get('Intercept', 0.0)
+    coefficients = model_data["coefficients"]
+    z = coefficients.get("Intercept", 0.0)
     for feature_name, coef_value in coefficients.items():
-        if feature_name != 'Intercept':
+        if feature_name != "Intercept":
             z += feature_dict.get(feature_name, 0.0) * coef_value
     mu = np.exp(z)
-    alpha = model_data.get('alpha', np.nan)
+    alpha = model_data.get("alpha", np.nan)
     return mu, alpha
 
-def load_glm_model_data(file_name : str) -> pd.DataFrame:
+
+def load_glm_model_data(file_name: str) -> pd.DataFrame:
     df = pd.read_csv(file_name)
     for col in df.columns:
-        if col.startswith('target'):
+        if col.startswith("target"):
             df[col] = df[col].apply(json.loads)
     return df
 
+
 class DiscreteTimeSeries:
-    def __init__(self, df : pd.DataFrame, ts_id_cols : list[str], period_col: str, var_col : str, to_datetime : bool = False, default_value : int = 0, lags : tuple[int] = (1, 7, 14), rolling_windows : tuple[int] = (7, 28), num_future_targets : int = 7, num_test_days : int = 1, include_std_dev : bool = False, use_best_fit_feature : bool = False, use_one_hot_encoding : bool = True):
-        self.ts_id_cols = ts_id_cols
+    """
+    Panel time-series builder and feature engineering pipeline for discrete demand.
+
+    Supports both historical backtesting (``num_test_days > 0``) and production
+    inference (``num_test_days = 0``), where future target actuals are unavailable
+    at the latest decision date(s) but future-known covariates (calendar, events,
+    scheduled prices) can still be attached across the forecast horizon.
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        ts_id_cols: list[str],
+        period_col: str,
+        var_col: str,
+        to_datetime: bool = False,
+        default_value: int = 0,
+        lags: tuple[int, ...] = (1, 7, 14),
+        rolling_windows: tuple[int, ...] = (7, 28),
+        num_future_targets: int = 7,
+        num_test_days: int = 1,
+        include_std_dev: bool = False,
+        use_best_fit_feature: bool = False,
+        use_one_hot_encoding: bool = True,
+        downsample_zeros_frac: float | None = 0.1,
+        fit_historical_distributions: bool = True,
+    ):
+        self.ts_id_cols = list(ts_id_cols)
         self.var_col = var_col
         self.period_col = period_col
-        self.df = df[ts_id_cols + [period_col, var_col]].copy()
-        for col in ts_id_cols:
-            self.df[col] = self.df[col].astype('category')
+        self.num_future_targets = num_future_targets
+        self.num_test_days = num_test_days or 0
+        self.downsample_zeros_frac = downsample_zeros_frac
+        self.df = df[self.ts_id_cols + [period_col, var_col]].copy()
+        for col in self.ts_id_cols:
+            self.df[col] = self.df[col].astype("category")
         if to_datetime:
             self.df[period_col] = pd.to_datetime(self.df[period_col])
         self.start_period = self.df[period_col].min()
         self.end_period = self.df[period_col].max()
         self.periods = sorted(self.df[period_col].unique())
         self.num_periods = len(self.periods)
-        self.df[period_col] = self.df[period_col].astype('category')
-        self.feature_cols = []
-        self.target_cols = []
-        self.categorical_feature_cols = []
+        self.df[period_col] = self.df[period_col].astype("category")
+        self.feature_cols: list[str] = []
+        self.target_cols: list[str] = []
+        self.categorical_feature_cols: list[str] = []
         self.test_start_period = None
         self.use_one_hot_encoding = use_one_hot_encoding
         self.logger = logging.getLogger(__name__)
-        
+
         # Compute all ts_id x period combinations:
-        unique_ts_id = self.df[ts_id_cols].drop_duplicates()
+        unique_ts_id = self.df[self.ts_id_cols].drop_duplicates()
         self.num_ts = len(unique_ts_id)
-        unique_ts_id_period = pd.merge(unique_ts_id, pd.DataFrame({period_col: self.periods}), how='cross')
-        self.df = pd.merge(unique_ts_id_period, self.df, on=ts_id_cols + [period_col], how='left').fillna({var_col: default_value})
+        unique_ts_id_period = pd.merge(
+            unique_ts_id, pd.DataFrame({period_col: self.periods}), how="cross"
+        )
+        self.df = pd.merge(
+            unique_ts_id_period, self.df, on=self.ts_id_cols + [period_col], how="left"
+        ).fillna({var_col: default_value})
 
-        self._add_test_flag(num_test_days)
-        grouped = self.df.groupby(self.ts_id_cols)
+        self._add_test_flag(self.num_test_days)
+        grouped = self.df.groupby(self.ts_id_cols, observed=True)
         self._add_overdispersion_flag(grouped)
-        self._fit_distributions(grouped, use_best_fit_feature, use_one_hot_encoding)
+        if fit_historical_distributions or use_best_fit_feature:
+            self._fit_distributions(grouped, use_best_fit_feature, use_one_hot_encoding)
         self._engineer_features(lags, rolling_windows, num_future_targets, include_std_dev)
-    
-    def _add_test_flag(self, num_test_days : int):
-        self.test_start_period = self.periods[-num_test_days]
-        self.df['is_test'] = np.where(self.df[self.period_col] >= self.test_start_period, 1, 0)
 
-    def _engineer_features(self, lags : tuple, rolling_windows : tuple, num_future_targets : int, include_std_dev : bool, apply_log_transformation : bool = True):
-        feature_df = self.df.copy().sort_values(by = self.ts_id_cols + [self.period_col])
-        grouped_df = feature_df.groupby(self.ts_id_cols)
+    def _add_test_flag(self, num_test_days: int):
+        if num_test_days is not None and num_test_days > 0:
+            self.test_start_period = self.periods[-num_test_days]
+            self.df["is_test"] = np.where(self.df[self.period_col] >= self.test_start_period, 1, 0)
+        else:
+            # Production mode: all observed periods are training history
+            self.test_start_period = None
+            self.df["is_test"] = 0
+
+    def get_inference_data(self, period: Any = None) -> pd.DataFrame:
+        """
+        Returns the rows to forecast on:
+        - If ``period`` is specified, returns rows for that period.
+        - In backtesting mode (``num_test_days > 0``), returns rows with ``is_test == 1``.
+        - In production mode (``num_test_days == 0``), returns rows at the latest observed
+          period (``self.end_period``) so future demand ``t, ..., t+H-1`` can be predicted.
+        """
+        if period is not None:
+            return self.df[self.df[self.period_col] == period].copy()
+        if self.test_start_period is not None:
+            return self.df[self.df["is_test"] == 1].copy()
+        return self.df[self.df[self.period_col] == self.end_period].copy()
+
+    def _engineer_features(
+        self,
+        lags: tuple[int, ...],
+        rolling_windows: tuple[int, ...],
+        num_future_targets: int,
+        include_std_dev: bool,
+        apply_log_transformation: bool = True,
+    ):
+        feature_df = self.df.copy().sort_values(by=self.ts_id_cols + [self.period_col])
+        grouped_df = feature_df.groupby(self.ts_id_cols, observed=True)
+
         # Create Lag Features:
         for lag in lags:
-            col_name = f'lag_{lag}'
-            if apply_log_transformation:
-                feature_df[col_name] = np.log1p(grouped_df[self.var_col].shift(lag))
-            else:
-                feature_df[col_name] = grouped_df[self.var_col].shift(lag)
+            col_name = f"lag_{lag}"
+            shifted_val = grouped_df[self.var_col].shift(lag)
+            feature_df[col_name] = np.log1p(shifted_val) if apply_log_transformation else shifted_val
             self.feature_cols.append(col_name)
-        
-        # Create Rolling Window Features:
+
+        # Create Rolling Window Features (vectorized Cython groupby rolling on shifted series):
+        shifted_var = grouped_df[self.var_col].shift(1)
+        group_keys = [feature_df[c] for c in self.ts_id_cols]
         for window in rolling_windows:
-            # Rolling Mean:
-            col_name = f'rolling_mean_{window}'
-            if apply_log_transformation:
-                feature_df[col_name] = np.log1p(grouped_df[self.var_col].transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean()))
-            else:
-                feature_df[col_name] = grouped_df[self.var_col].transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).mean())
+            col_name = f"rolling_mean_{window}"
+            roll_obj = shifted_var.groupby(group_keys, observed=True).rolling(window=window, min_periods=1)
+            rmean = roll_obj.mean().reset_index(level=list(range(len(self.ts_id_cols))), drop=True)
+            feature_df[col_name] = np.log1p(rmean) if apply_log_transformation else rmean
             self.feature_cols.append(col_name)
-            # Rolling Std:
+
             if include_std_dev:
-                col_name = f'rolling_std_{window}'
-                if apply_log_transformation:
-                    feature_df[col_name] = np.log1p(grouped_df[self.var_col].transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).std().fillna(0)))
-                else:
-                    feature_df[col_name] = grouped_df[self.var_col].transform(lambda x: x.shift(1).rolling(window=window, min_periods=1).std().fillna(0))
+                col_name = f"rolling_std_{window}"
+                rstd = (
+                    roll_obj.std()
+                    .reset_index(level=list(range(len(self.ts_id_cols))), drop=True)
+                    .fillna(0.0)
+                )
+                feature_df[col_name] = np.log1p(rstd) if apply_log_transformation else rstd
                 self.feature_cols.append(col_name)
-        
+
         # Future Targets:
         self.target_cols = []
         for i in range(0, num_future_targets):
-            col_name = f'target_t_plus_{i}'
+            col_name = f"target_t_plus_{i}"
             feature_df[col_name] = grouped_df[self.var_col].shift(-i)
             if self.test_start_period is not None and i > 0:
-                target_in_test = grouped_df['is_test'].shift(-i) == 1
-                feature_df.loc[(feature_df['is_test'] == 0) & target_in_test, col_name] = np.nan
+                target_in_test = grouped_df["is_test"].shift(-i) == 1
+                feature_df.loc[(feature_df["is_test"] == 0) & target_in_test, col_name] = np.nan
             self.target_cols.append(col_name)
-        
+
         # Remove rows with missing features:
         feature_df = feature_df[feature_df[self.feature_cols].isna().sum(axis=1) == 0]
-        
-        # Remove excessive rows with all 0s from the training data:
-        mask = (feature_df[self.feature_cols].sum(axis=1) == 0) \
-             & (feature_df[self.target_cols].fillna(0).sum(axis=1) == 0)
-        if self.test_start_period is not None:
-            mask = mask & (feature_df[self.period_col] < self.test_start_period)
-        zero_rows = feature_df[mask].sample(frac=0.1, random_state=42)
-        non_zero_rows = feature_df[~mask]
-        feature_df = pd.concat([zero_rows, non_zero_rows])
+
+        # Optionally downsample rows where both features and targets are all 0s in training data:
+        if self.downsample_zeros_frac is not None and 0.0 < self.downsample_zeros_frac < 1.0:
+            mask = (feature_df[self.feature_cols].sum(axis=1) == 0) & (
+                feature_df[self.target_cols].fillna(0).sum(axis=1) == 0
+            )
+            if self.test_start_period is not None:
+                mask = mask & (feature_df[self.period_col] < self.test_start_period)
+            else:
+                # In production mode, always keep the latest period intact for inference
+                mask = mask & (feature_df[self.period_col] != self.end_period)
+            zero_rows = feature_df[mask].sample(frac=self.downsample_zeros_frac, random_state=42)
+            non_zero_rows = feature_df[~mask]
+            feature_df = pd.concat([zero_rows, non_zero_rows])
         self.df = feature_df
 
-    def _create_tmp_col_for_train(self, col_name : str):
-        tmp_col = f'tmp_{col_name}'
+    def _create_tmp_col_for_train(self, col_name: str) -> str:
+        tmp_col = f"tmp_{col_name}"
         if self.test_start_period is not None:
-            self.df[tmp_col] = np.where(self.df[self.period_col] >= self.test_start_period, np.nan, self.df[self.var_col])
+            self.df[tmp_col] = np.where(
+                self.df[self.period_col] >= self.test_start_period, np.nan, self.df[self.var_col]
+            )
         else:
             self.df[tmp_col] = self.df[self.var_col].copy()
         return tmp_col
-    
-    def _add_overdispersion_flag(self, grouped : DataFrameGroupBy):
+
+    def _add_overdispersion_flag(self, grouped: DataFrameGroupBy):
         tmp_col = self._create_tmp_col_for_train(self.var_col)
-        mean = grouped[tmp_col].transform('mean')
-        var = grouped[tmp_col].transform('var')
-        self.df['overdispersion'] = (var > mean).astype(int)
+        mean = grouped[tmp_col].transform("mean")
+        var = grouped[tmp_col].transform("var")
+        self.df["overdispersion"] = (var > mean).astype(int)
         self.df.drop(columns=[tmp_col], inplace=True)
 
-    def _fit_distributions(self, grouped : DataFrameGroupBy, use_best_fit_feature : bool = False, one_hot : bool = True):
+    def _fit_distributions(
+        self,
+        grouped: DataFrameGroupBy,
+        use_best_fit_feature: bool = False,
+        one_hot: bool = True,
+    ):
         tmp_col = self._create_tmp_col_for_train(self.var_col)
         self.logger.info("fitting distributions...")
-        
+
         def distr_fit(group_df: pd.DataFrame) -> pd.Series:
             data = group_df[tmp_col].dropna().to_numpy(dtype=int)
             best_fit, best_fit_params = compute_best_fit_distribution(data)
-            # Pad parameters to a fixed length (3) for contiguous float arrays
             params = list(best_fit_params) + [np.nan] * (3 - len(best_fit_params))
             return pd.Series({
-                'best_fit': best_fit,
-                'distr_param_0': params[0],
-                'distr_param_1': params[1],
-                'distr_param_2': params[2]
+                "best_fit": best_fit,
+                "distr_param_0": params[0],
+                "distr_param_1": params[1],
+                "distr_param_2": params[2],
             })
-        # Compute parameters once per group, then merge back (much lower memory footprint)
-        distr_df = grouped[[tmp_col]].apply(distr_fit).reset_index()
-        self.df = pd.merge(self.df, distr_df, on=self.ts_id_cols, how='left')
-        self.df['best_fit'] = self.df['best_fit'].astype('category')
-        
+
+        try:
+            distr_df = grouped[[tmp_col]].apply(distr_fit, include_groups=False).reset_index()
+        except TypeError:
+            distr_df = grouped[[tmp_col]].apply(distr_fit).reset_index()
+        self.df = pd.merge(self.df, distr_df, on=self.ts_id_cols, how="left")
+        self.df["best_fit"] = self.df["best_fit"].astype("category")
+
         self.df.drop(columns=[tmp_col], inplace=True)
         self.logger.info("distributions fitting completed")
 
         if use_best_fit_feature:
             if one_hot:
-                dummies = pd.get_dummies(self.df['best_fit'], prefix='best_fit', dtype=int, drop_first=True)
+                dummies = pd.get_dummies(
+                    self.df["best_fit"], prefix="best_fit", dtype=int, drop_first=True
+                )
                 self.df = pd.concat([self.df, dummies], axis=1)
-                self.feature_cols.extend([col for col in self.df.columns if col.startswith(f'best_fit_')])
+                self.feature_cols.extend([col for col in self.df.columns if col.startswith("best_fit_")])
             else:
-                self.categorical_feature_cols.append('best_fit')
+                self.categorical_feature_cols.append("best_fit")
 
-    def add_calendar_features(self, df_calendar : pd.DataFrame, day_of_week_col : str, use_week_end_feature : bool = False, use_day_of_week_features : bool = True):
+    def add_calendar_features(
+        self,
+        df_calendar: pd.DataFrame,
+        day_of_week_col: str | None = None,
+        use_week_end_feature: bool = False,
+        use_day_of_week_features: bool = True,
+        weekend_values: set[Any] | None = None,
+        future_horizons: tuple[int, ...] | None = None,
+    ):
+        """
+        Adds calendar features (day of week or weekend indicator) to the panel.
+
+        Parameters
+        ----------
+        df_calendar : pd.DataFrame
+            Calendar table containing ``self.period_col`` and ``day_of_week_col``.
+            In production, ``df_calendar`` may extend into future periods beyond
+            ``self.end_period`` so ``future_horizons`` leads can be attached.
+        weekend_values : set, optional
+            Values in ``day_of_week_col`` that represent weekend days. Defaults to
+            ``{1, 2}`` when ``day_of_week_col`` is provided (M5 convention) or
+            ``{5, 6}`` when inferred from a datetime ``period_col``.
+        future_horizons : tuple[int, ...], optional
+            Future offsets ``(1, 2, ...)`` for which future calendar features from
+            ``df_calendar`` are attached to origin period ``t`` (works even when
+            ``t + h > self.end_period``).
+        """
         if use_week_end_feature and use_day_of_week_features:
             raise ValueError("Only one of 'use_week_end_feature' or 'use_day_of_week_features' can be True")
-        df_calendar[self.period_col] = df_calendar[self.period_col].astype('category')
-        df_calendar[day_of_week_col] = df_calendar[day_of_week_col].astype('category')
-        self.df = pd.merge(self.df, df_calendar[[self.period_col, day_of_week_col]], on=self.period_col, how='left')
+
+        if day_of_week_col is not None and future_horizons:
+            # Delegate to add_feature with negative lags so future calendar rows beyond end_period are used
+            lead_lags = tuple(-h for h in future_horizons if h > 0)
+            self.add_feature(
+                df_calendar,
+                day_of_week_col,
+                join_on=[],
+                is_cat_feature=use_day_of_week_features,
+                lags=lead_lags,
+            )
+            return
+
+        df_cal = df_calendar.copy()
+        df_cal[self.period_col] = df_cal[self.period_col].astype(self.df[self.period_col].dtype)
+        if day_of_week_col is not None:
+            df_cal[day_of_week_col] = df_cal[day_of_week_col].astype("category")
+            self.df = pd.merge(
+                self.df,
+                df_cal[[self.period_col, day_of_week_col]].drop_duplicates(),
+                on=self.period_col,
+                how="left",
+            )
         if use_week_end_feature:
-            self._add_weekend_feature(day_of_week_col)
+            self._add_weekend_feature(day_of_week_col, weekend_values=weekend_values)
         if use_day_of_week_features:
             self._add_day_of_week_features(day_of_week_col, self.use_one_hot_encoding)
-    
-    def _add_weekend_feature(self, day_of_week_col : str = None):
+
+    def _add_weekend_feature(self, day_of_week_col: str | None = None, weekend_values: set[Any] | None = None):
         if day_of_week_col is None:
-            self.df['is_weekend'] = np.where(pd.to_datetime(self.df[self.period_col]).dt.dayofweek.isin({5, 6}), 1, 0)
+            wknd = weekend_values if weekend_values is not None else {5, 6}
+            self.df["is_weekend"] = np.where(
+                pd.to_datetime(self.df[self.period_col]).dt.dayofweek.isin(wknd), 1, 0
+            )
         else:
-            # Saturdays and Sundays are marked as 1 and 2, respectively in the M5 data set:
-            self.df['is_weekend'] = np.where(self.df[day_of_week_col].isin({1, 2}), 1, 0)
-        self.feature_cols.append('is_weekend')
-    
-    def _add_day_of_week_features(self, day_of_week_col : str, one_hot : bool = True):
+            # Default {1, 2} preserves M5 Saturday/Sunday convention when not overridden:
+            wknd = weekend_values if weekend_values is not None else {1, 2}
+            self.df["is_weekend"] = np.where(self.df[day_of_week_col].isin(wknd), 1, 0)
+        self.feature_cols.append("is_weekend")
+
+    def _add_day_of_week_features(self, day_of_week_col: str | None, one_hot: bool = True):
         if day_of_week_col is None:
-            day_of_week_col = 'wday'
-            self.df['wday'] = pd.to_datetime(self.df[self.period_col]).dt.dayofweek
+            day_of_week_col = "wday"
+            self.df["wday"] = pd.to_datetime(self.df[self.period_col]).dt.dayofweek
         if one_hot:
             self.df = pd.get_dummies(self.df, columns=[day_of_week_col], dtype=int, drop_first=True)
-            self.feature_cols.extend([col for col in self.df.columns if col.startswith(f'{day_of_week_col}_')])
+            self.feature_cols.extend(
+                [col for col in self.df.columns if col.startswith(f"{day_of_week_col}_")]
+            )
         else:
-            self.df[day_of_week_col] = self.df[day_of_week_col].astype('category')
+            self.df[day_of_week_col] = self.df[day_of_week_col].astype("category")
             self.categorical_feature_cols.append(day_of_week_col)
-        
-    def add_feature(self, df_feature : pd.DataFrame, feature_name : str, join_on : list[str], is_cat_feature : bool = False, default_value : Any = np.nan, lags : tuple[int] | None = None, rolling_windows : tuple[int] | None = None):
-        df_feature = df_feature.copy()
-        df_feature[self.period_col] = df_feature[self.period_col].astype('category')
-        for col in join_on:
-            df_feature[col] = df_feature[col].astype('category')
-        keys = join_on + [self.period_col]
-        df_feature = df_feature[keys + [feature_name]].drop_duplicates()
-        self.df = pd.merge(self.df, df_feature, on=keys, how='left') #.fillna({feature_name : default_value})
 
-        self.df.sort_values(by=self.ts_id_cols + [self.period_col], inplace=True)
-        gdf = self.df.groupby(self.ts_id_cols)
-        self.df[feature_name] = gdf[feature_name].ffill().bfill().fillna(default_value)
-        
-        # Add lags if required:
-        cols_lags = []
+    def add_feature(
+        self,
+        df_feature: pd.DataFrame,
+        feature_name: str,
+        join_on: list[str],
+        is_cat_feature: bool = False,
+        default_value: Any = np.nan,
+        lags: tuple[int, ...] | None = None,
+        rolling_windows: tuple[int, ...] | None = None,
+    ):
+        """
+        Merges an external numerical or categorical feature onto the panel, with optional
+        lags (including negative lags ``-h`` for future-known covariates at ``t + h``)
+        and rolling windows.
+
+        When ``df_feature`` contains future periods beyond ``self.end_period`` and negative
+        lags are requested, those leads are computed on ``df_feature`` before merging so
+        that the final historical periods still receive future covariate values in production.
+        """
+        df_feat = df_feature.copy()
+        keys = list(join_on) + [self.period_col]
+        df_feat = df_feat[keys + [feature_name]].drop_duplicates()
+
+        # Pre-compute negative lags (future leads) on df_feat before merging so future rows beyond
+        # self.end_period are preserved for production inference at self.end_period:
+        precomputed_lead_cols: list[str] = []
+        remaining_lags: list[int] = []
         if lags is not None:
             for lag in lags:
-                col_name = f'{feature_name}_lag_{lag}'.replace('-', 'minus_')
-                self.df[col_name] = gdf[feature_name].shift(lag)
-                cols_lags.append(col_name)
-        
-        # Add rolling means if required:
+                if lag < 0:
+                    col_name = f"{feature_name}_lag_{lag}".replace("-", "minus_")
+                    df_feat = df_feat.sort_values(by=keys)
+                    if join_on:
+                        df_feat[col_name] = df_feat.groupby(join_on, observed=True)[feature_name].shift(lag)
+                    else:
+                        df_feat[col_name] = df_feat[feature_name].shift(lag)
+                    precomputed_lead_cols.append(col_name)
+                else:
+                    remaining_lags.append(lag)
+
+        df_feat[self.period_col] = df_feat[self.period_col].astype(self.df[self.period_col].dtype)
+        for col in join_on:
+            df_feat[col] = df_feat[col].astype("category")
+
+        self.df = pd.merge(
+            self.df, df_feat[keys + [feature_name] + precomputed_lead_cols], on=keys, how="left"
+        )
+
+        self.df.sort_values(by=self.ts_id_cols + [self.period_col], inplace=True)
+        gdf = self.df.groupby(self.ts_id_cols, observed=True)
+        self.df[feature_name] = gdf[feature_name].ffill().bfill().fillna(default_value)
+        for col_name in precomputed_lead_cols:
+            self.df[col_name] = gdf[col_name].ffill().bfill().fillna(default_value)
+
+        # Positive lags on the merged panel:
+        cols_lags = list(precomputed_lead_cols)
+        for lag in remaining_lags:
+            col_name = f"{feature_name}_lag_{lag}".replace("-", "minus_")
+            self.df[col_name] = gdf[feature_name].shift(lag)
+            cols_lags.append(col_name)
+
+        # Rolling means on the merged panel:
         cols_rolling = []
-        if (rolling_windows is not None) & (not is_cat_feature):
+        if (rolling_windows is not None) and (not is_cat_feature):
+            group_keys = [self.df[c] for c in self.ts_id_cols]
             for window in rolling_windows:
-                col_name = f'{feature_name}_rolling_mean_{window}'
-                self.df[col_name] = gdf[feature_name].transform(lambda x: x.rolling(window=window, min_periods=1).mean())
+                col_name = f"{feature_name}_rolling_mean_{window}"
+                roll_obj = self.df[feature_name].groupby(group_keys, observed=True).rolling(
+                    window=window, min_periods=1
+                )
+                self.df[col_name] = roll_obj.mean().reset_index(
+                    level=list(range(len(self.ts_id_cols))), drop=True
+                )
                 cols_rolling.append(col_name)
 
         generated_cols = cols_lags + cols_rolling
         for col in generated_cols:
-            self.df[col] = gdf[col].ffill().bfill()
-        
+            self.df[col] = gdf[col].ffill().bfill().fillna(default_value)
+
         feature_list = [feature_name] + generated_cols
         if is_cat_feature and self.use_one_hot_encoding:
             original_cols = self.df.columns.copy()
@@ -260,176 +443,15 @@ class DiscreteTimeSeries:
             self.feature_cols.extend(new_cols)
         elif is_cat_feature and not self.use_one_hot_encoding:
             for f in feature_list:
-                self.df[f] = self.df[f].astype('category')
+                self.df[f] = self.df[f].astype("category")
                 self.categorical_feature_cols.append(f)
         else:
             self.feature_cols.extend(feature_list)
 
-    def train_glm(self, train_groups : tuple[str] = None) -> pd.DataFrame:
-        partition_cols = list(train_groups) if train_groups is not None else []
-        if 'overdispersion' not in partition_cols:
-            partition_cols.append('overdispersion')
-
-        if self.test_start_period is not None:
-            train_df = self.df[self.df['is_test'] == 0]
-        else:
-            train_df = self.df
-        
-        def _train_group(group_df: pd.DataFrame) -> pd.Series:
-            group_name = getattr(group_df, 'name', 'unknown')
-            # Extract overdispersion from the group name instead of the dataframe
-            if isinstance(group_name, tuple):
-                idx = partition_cols.index('overdispersion')
-                is_overdispersed = group_name[idx]
-            else:
-                is_overdispersed = group_name
-                
-            model_type = 'nbinom' if is_overdispersed == 1 else 'poisson'
-            
-            group_result = {}
-            for target in self.target_cols:
-                self.logger.info(f"training model for group ({group_name}), target {target}...")
-                model_data, summary = train_glm(group_df, self.feature_cols, target, model_type)
-                group_result[target] = model_data
-                self.logger.info(summary)
-                self.logger.info("model trained successfully")
-            
-            return pd.Series(group_result)
-
-        try:
-            # Opt into future behavior to silence the warning (pandas >= 2.2.0)
-            result_df = train_df.groupby(partition_cols).apply(_train_group, include_groups=False).reset_index()
-        except TypeError:
-            # Graceful fallback for older pandas versions
-            result_df = train_df.groupby(partition_cols).apply(_train_group).reset_index()
-        return result_df
-    
-    def predict_glm(self, model_data : pd.DataFrame) -> pd.DataFrame:
-        test_data = self.df[self.df['is_test'] == 1].copy()
-        train_groups = [col for col in model_data.columns if col not in self.target_cols]
-        
-        # Initialize prediction columns
-        for target in self.target_cols:
-            test_data[f'{target}_mu'] = np.nan
-            test_data[f'{target}_alpha'] = np.nan
-
-        # Convert model_data to a lookup dictionary for O(1) model retrieval
-        model_dict_map = model_data.set_index(train_groups).to_dict(orient='index')
-        for group_keys, group_df in test_data.groupby(train_groups):
-            if len(group_keys) == 1:
-                group_keys = group_keys[0]
-            if group_keys not in model_dict_map:
-                continue
-            row_models = model_dict_map[group_keys]
-            group_idx = group_df.index
-            # Prepare feature matrix and add Intercept
-            X = group_df[self.feature_cols].copy()
-            X['Intercept'] = 1.0
-            for target in self.target_cols:
-                model_dict = row_models.get(target)
-                if not isinstance(model_dict, dict) or 'coefficients' not in model_dict:
-                    continue
-                coef_series = pd.Series(model_dict['coefficients'])
-                # Align feature matrix with coefficients and safely evaluate dot product
-                X_aligned = X.reindex(columns=coef_series.index).fillna(0.0)
-                z = X_aligned.dot(coef_series)
-                # Fetch target predictions
-                test_data.loc[group_idx, f'{target}_mu'] = np.exp(z)
-                test_data.loc[group_idx, f'{target}_alpha'] = model_dict.get('alpha', coef_series.get('alpha', np.nan))
-        
-        self._compute_forecasting_metrics(test_data, [f'{target}_mu' for target in self.target_cols])
-        return test_data
-
-    def _compute_forecasting_metrics(self, pred_df : pd.DataFrame, pred_columns : list[str]):
-        if len(self.target_cols) != len(pred_columns):
-            raise ValueError(f"Number of pred columns ({len(pred_columns)}) does not match the number of target columns ({len(self.target_cols)}).")
-        
-        target_to_pred = dict(zip(sorted(self.target_cols), sorted(pred_columns)))
-        tmp_cols = []
-        for col_name in self.target_cols:
-            tmp_col = f'tmp_{col_name}'
-            pred_df[tmp_col] = np.where(pred_df[col_name].isna(), 0, pred_df[target_to_pred[col_name]])
-            tmp_cols.append(tmp_col)
-        
-        pred_df['actual'] = pred_df[self.target_cols].fillna(0).sum(axis=1)
-        pred_df['pred'] = pred_df[tmp_cols].sum(axis=1)
-        pred_df.drop(columns=tmp_cols, inplace=True)
-        pred_df['under_diff'] = np.maximum(pred_df['actual'] - pred_df['pred'], 0)
-        pred_df['over_diff'] = np.maximum(pred_df['pred'] - pred_df['actual'], 0)
-        pred_df['abs_diff'] = pred_df['under_diff'] + pred_df['over_diff']
-
-    def compute_lead_time_demand_glm(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, glm_mu_cols : list[str] = None, glm_alpha_cols : list[str] = None, return_distribution: bool = False, pred_first_day : bool = True) -> pd.DataFrame:
-        if pred_first_day:
-            first_day = gdf[self.period_col].min()
-            gdf = gdf[gdf[self.period_col] == first_day].copy()
-        else:
-            gdf = gdf.copy()
-        if glm_mu_cols is None:
-            glm_mu_cols = [f"{col_name}_mu" for col_name in self.target_cols]
-        if glm_alpha_cols is None:
-            glm_alpha_cols = [f"{col_name}_alpha" for col_name in self.target_cols]
-        horizon = len(glm_mu_cols)
-        if horizon != len(glm_alpha_cols):
-            raise ValueError("Number of 'mu' and 'alpha' columns do not match.")
-        if horizon == 0:
-            raise ValueError("At least one GLM forecast horizon is required.")
-        if cycle_time < 0:
-            raise ValueError("'cycle_time' must be non-negative.")
-        
-        if not return_distribution:
-            service_levels_arr = gdf['service_level'].to_numpy(dtype=float)
-            if np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
-                raise ValueError("'service_levels' values must be between 0 and 1.")
-
-        param_cols = ['best_fit', 'distr_param_0', 'distr_param_1', 'distr_param_2']
-        required_cols = glm_mu_cols + glm_alpha_cols + param_cols
-        missing_cols = [col for col in required_cols if col not in gdf.columns]
-        if missing_cols:
-            raise ValueError(f"Missing columns required to compute target inventory: {missing_cols}.")
-        
-        lead_time_with_cycle = lead_time.copy()
-        lead_time_with_cycle.shift(cycle_time)
-        if lead_time_with_cycle.min < 0:
-            raise ValueError("Lead time plus cycle time must have non-negative support.")
-        
-        results = []
-        for row_num, data_tuple in enumerate(gdf[required_cols].itertuples(index=False, name=None)):
-            mu = data_tuple[:horizon]
-            alpha = data_tuple[horizon:(2*horizon)]
-            best_fit = data_tuple[2*horizon]
-            best_fit_params = tuple(p for p in data_tuple[(2*horizon + 1):] if not pd.isna(p))
-
-            default_demand = None
-            if lead_time_with_cycle.max > horizon:
-                default_demand = DiscreteDistribution.from_parametric(best_fit, best_fit_params)
-
-            demand = []
-            for (curr_mu, curr_alpha) in zip(mu, alpha):
-                if pd.isna(curr_mu) or curr_mu < 0:
-                    raise ValueError(f"Invalid GLM mean for row {row_num}: {curr_mu}.")
-                if pd.isna(curr_alpha) or curr_alpha <= 0:
-                    demand.append(DiscreteDistribution.from_parametric('poisson', (float(curr_mu), 0)))
-                else:
-                    n = 1 / curr_alpha
-                    p = 1 / (1 + curr_mu * curr_alpha)
-                    demand.append(DiscreteDistribution.from_parametric('nbinom', (n, p, 0)))
-            demand_during_lead_time = lead_time_with_cycle.random_sum(demand, default_demand)
-            
-            if return_distribution:
-                results.append(demand_during_lead_time)
-            else:
-                results.append(demand_during_lead_time.quantile(service_levels_arr[row_num]).item())
-
-        if return_distribution:
-            gdf['demand_distribution'] = results
-        else:
-            gdf['target_inventory'] = results
-        return gdf
-
     # ------------------------------------------------------------------
-    # CatBoost multi-quantile regression
+    # Delegation methods to GLMForecaster, CatBoostQuantileForecaster, and DDLTCalculator
     # ------------------------------------------------------------------
-    def _period_positions(self, df : pd.DataFrame) -> pd.Series:
+    def _period_positions(self, df: pd.DataFrame) -> pd.Series:
         """Position (0-based index into self.periods) of every row's period."""
         values = df[self.period_col]
         if isinstance(values.dtype, pd.CategoricalDtype):
@@ -437,196 +459,143 @@ class DiscreteTimeSeries:
         positions = np.searchsorted(np.asarray(self.periods), values.to_numpy())
         return pd.Series(positions, index=df.index)
 
-    def _target_offset(self, target_col : str) -> int:
-        return int(target_col.rsplit('_', 1)[-1])
+    def _target_offset(self, target_col: str) -> int:
+        return int(target_col.rsplit("_", 1)[-1])
 
-    def train_catboost(self, quantiles : tuple[float] = DEFAULT_QUANTILES, train_groups : tuple[str] | None = None, extra_cat_cols : tuple[str] = ('item_id', 'dept_id', 'cat_id'), num_valid_days : int = 28, max_train_days : int | None = None, catboost_params : dict[str, Any] | None = None) -> "CatBoostQuantileModel":
-        """
-        Trains one CatBoost MultiQuantile model per forecast horizon (and per training group, if given).
+    def train_glm(self, train_groups: tuple[str, ...] | list[str] | None = None) -> pd.DataFrame:
+        return GLMForecaster(train_groups=train_groups).fit(self)
 
-        Training rows whose target falls inside the test period are excluded (no look-ahead).
-        The last `num_valid_days` target days before the test period are used as an early-stopping
-        validation set. `max_train_days` optionally limits the training history to speed up training.
-        """
-        from catboost_quantile import CatBoostQuantileModel, train_catboost_quantile
+    def predict_glm(self, model_data: pd.DataFrame) -> pd.DataFrame:
+        return GLMForecaster().predict(self, model_data=model_data)
 
-        quantiles = tuple(float(q) for q in validate_quantile_levels(quantiles))
-        partition_cols = list(train_groups) if train_groups else []
-        cat_cols = list(dict.fromkeys(list(self.categorical_feature_cols) + [c for c in extra_cat_cols if c not in partition_cols]))
-        feature_cols = [c for c in self.feature_cols if c not in cat_cols]
-        result = CatBoostQuantileModel(quantiles, list(self.target_cols), feature_cols, cat_cols, partition_cols)
+    def _compute_forecasting_metrics(self, pred_df: pd.DataFrame, pred_columns: list[str]):
+        compute_forecasting_metrics(pred_df, self.target_cols, pred_columns)
 
-        test_start_pos = len(self.periods) if self.test_start_period is None else self.periods.index(self.test_start_period)
-        period_pos = self._period_positions(self.df)
-        mask = self.df['is_test'] == 0
-        if max_train_days is not None:
-            mask &= period_pos >= test_start_pos - num_valid_days - max_train_days
-        train_df = self.df[mask]
-        train_pos = period_pos[mask]
+    def compute_lead_time_demand_glm(
+        self,
+        gdf: pd.DataFrame,
+        lead_time: DiscreteDistribution,
+        cycle_time: int,
+        glm_mu_cols: list[str] | None = None,
+        glm_alpha_cols: list[str] | None = None,
+        return_distribution: bool = False,
+        pred_first_day: bool = True,
+    ) -> pd.DataFrame:
+        return DDLTCalculator(lead_time, cycle_time).from_glm_group(
+            gdf,
+            lead_time,
+            self.target_cols,
+            glm_mu_cols=glm_mu_cols,
+            glm_alpha_cols=glm_alpha_cols,
+            return_distribution=return_distribution,
+            pred_first_day=pred_first_day,
+            period_col=self.period_col,
+        )
 
-        groups = train_df.groupby(partition_cols, observed=True) if partition_cols else [((), train_df)]
-        for group_values, group_df in groups:
-            key = CatBoostQuantileModel.group_key(group_values) if partition_cols else ()
-            group_pos = train_pos.loc[group_df.index]
-            for target in self.target_cols:
-                target_pos = group_pos + self._target_offset(target)
-                has_target = group_df[target].notna() & (target_pos < test_start_pos)
-                valid_mask = has_target & (target_pos >= test_start_pos - num_valid_days)
-                fit_mask = has_target & ~valid_mask
-                self.logger.info(f"training CatBoost model for group {key or '(all)'}, target {target}: {fit_mask.sum()} train rows, {valid_mask.sum()} validation rows...")
-                model = train_catboost_quantile(group_df[fit_mask], feature_cols, cat_cols, target, quantiles,
-                                                eval_df=group_df[valid_mask] if num_valid_days > 0 else None,
-                                                params=catboost_params)
-                result.models.setdefault(key, {})[target] = model
-                self.logger.info(f"model trained successfully (best iteration: {model.get_best_iteration()})")
-        return result
+    def train_catboost(
+        self,
+        quantiles: tuple[float, ...] = DEFAULT_QUANTILES,
+        train_groups: tuple[str, ...] | None = None,
+        extra_cat_cols: tuple[str, ...] = ("item_id", "dept_id", "cat_id"),
+        num_valid_days: int = 28,
+        max_train_days: int | None = None,
+        catboost_params: dict[str, Any] | None = None,
+    ) -> "CatBoostQuantileModel":
+        forecaster = CatBoostQuantileForecaster(
+            quantiles=quantiles,
+            train_groups=train_groups,
+            extra_cat_cols=extra_cat_cols,
+            num_valid_days=num_valid_days,
+            max_train_days=max_train_days,
+            catboost_params=catboost_params,
+        )
+        return forecaster.fit(self)
 
-    def predict_catboost(self, model : "CatBoostQuantileModel", tol : float = 1e-4) -> pd.DataFrame:
-        """
-        Predicts the quantile grid for every test row and horizon. Adds the columns
-        `<target>_q<level>` (non-crossing quantiles) and `<target>_mu` (mean of the
-        reconstructed discrete distribution), plus the point-forecast error columns.
-        """
-        from catboost_quantile import predict_catboost_quantile
+    def predict_catboost(self, model: "CatBoostQuantileModel", tol: float = 1e-4) -> pd.DataFrame:
+        return CatBoostQuantileForecaster(quantiles=model.quantiles, tol=tol).predict(self, model=model)
 
-        test_data = self.df[self.df['is_test'] == 1].copy()
-        levels = np.asarray(model.quantiles)
-        preds = {target: np.full((len(test_data), len(levels)), np.nan) for target in model.target_cols}
+    def evaluate_quantile_forecasts(
+        self,
+        pred_df: pd.DataFrame,
+        quantiles: tuple[float, ...],
+        group_cols: list[str] | None = None,
+    ) -> pd.DataFrame:
+        return evaluate_quantile_forecasts(pred_df, self.target_cols, quantiles, group_cols)
 
-        if model.train_groups:
-            groups = test_data.groupby(model.train_groups, observed=True).indices
-        else:
-            groups = {(): np.arange(len(test_data))}
-        for group_values, idx in groups.items():
-            key = model.group_key(group_values) if model.train_groups else ()
-            group_models = model.models.get(key)
-            if group_models is None:
-                self.logger.warning(f"no CatBoost model available for group {key}; skipping {len(idx)} rows")
-                continue
-            group_df = test_data.iloc[idx]
-            for target, cb_model in group_models.items():
-                preds[target][idx] = predict_catboost_quantile(cb_model, group_df, model.feature_cols, model.cat_feature_cols)
+    def compute_lead_time_demand_catboost(
+        self,
+        gdf: pd.DataFrame,
+        lead_time: DiscreteDistribution,
+        cycle_time: int,
+        quantiles: tuple[float, ...],
+        return_distribution: bool = False,
+        pred_first_day: bool = True,
+        tol: float = 1e-4,
+    ) -> pd.DataFrame:
+        return DDLTCalculator(lead_time, cycle_time, tol=tol).from_quantiles_group(
+            gdf,
+            lead_time,
+            self.target_cols,
+            quantiles=quantiles,
+            return_distribution=return_distribution,
+            pred_first_day=pred_first_day,
+            period_col=self.period_col,
+        )
 
-        new_cols = {}
-        for target, arr in preds.items():
-            for j, col in enumerate(model.quantile_cols(target)):
-                new_cols[col] = arr[:, j]
-            mu = np.full(len(arr), np.nan)
-            valid = ~np.isnan(arr).any(axis=1)
-            mu[valid] = quantiles_to_mean(levels, arr[valid], tol)
-            new_cols[f'{target}_mu'] = mu
-        test_data = pd.concat([test_data, pd.DataFrame(new_cols, index=test_data.index)], axis=1)
 
-        self._compute_forecasting_metrics(test_data, [f'{target}_mu' for target in self.target_cols])
-        return test_data
+def compute_lead_time_demand(
+    ts: DiscreteTimeSeries,
+    model_data: "pd.DataFrame | CatBoostQuantileModel | ProbabilisticForecaster",
+    lead_time: dict[Any, DiscreteDistribution] | DiscreteDistribution,
+    lead_time_keys: list[str] | None,
+    cycle_time: int,
+    service_levels: pd.DataFrame | None = None,
+    model_type: str = "glm",
+    return_distribution: bool = False,
+    pred_first_day: bool = True,
+) -> pd.DataFrame:
+    if isinstance(model_data, ProbabilisticForecaster):
+        return model_data.compute_ddlt(
+            ts,
+            lead_time=lead_time,
+            lead_time_keys=lead_time_keys,
+            cycle_time=cycle_time,
+            service_levels=service_levels,
+            return_distribution=return_distribution,
+            pred_first_day=pred_first_day,
+        )
+    if model_type == "glm":
+        return GLMForecaster().compute_ddlt(
+            ts,
+            lead_time=lead_time,
+            lead_time_keys=lead_time_keys,
+            cycle_time=cycle_time,
+            service_levels=service_levels,
+            return_distribution=return_distribution,
+            pred_first_day=pred_first_day,
+            model_data=model_data,
+        )
+    if model_type == "catboost":
+        return CatBoostQuantileForecaster(quantiles=model_data.quantiles).compute_ddlt(
+            ts,
+            lead_time=lead_time,
+            lead_time_keys=lead_time_keys,
+            cycle_time=cycle_time,
+            service_levels=service_levels,
+            return_distribution=return_distribution,
+            pred_first_day=pred_first_day,
+            model=model_data,
+        )
+    raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm', 'catboost'.")
 
-    def evaluate_quantile_forecasts(self, pred_df : pd.DataFrame, quantiles : tuple[float], group_cols : list[str] | None = None) -> pd.DataFrame:
-        """Pinball loss and empirical coverage P(y <= q_hat) per horizon and quantile level."""
-        from catboost_quantile import quantile_col_name
 
-        group_cols = list(group_cols) if group_cols else []
-        groups = pred_df.groupby(group_cols, observed=True) if group_cols else [((), pred_df)]
-        rows = []
-        for group_values, gdf in groups:
-            group_values = group_values if isinstance(group_values, tuple) else (group_values,)
-            for target in self.target_cols:
-                mask = gdf[target].notna()
-                y = gdf.loc[mask, target].to_numpy(dtype=float)
-                if len(y) == 0:
-                    continue
-                for q in quantiles:
-                    q_hat = gdf.loc[mask, quantile_col_name(target, q)].to_numpy(dtype=float)
-                    rows.append({**dict(zip(group_cols, group_values)),
-                                 'target': target,
-                                 'quantile': q,
-                                 'n_obs': len(y),
-                                 'pinball_loss': pinball_loss(y, q_hat, q).mean(),
-                                 'coverage': np.mean(y <= q_hat)})
-        return pd.DataFrame(rows)
-
-    def compute_lead_time_demand_catboost(self, gdf : pd.DataFrame, lead_time : DiscreteDistribution, cycle_time : int, quantiles : tuple[float], return_distribution : bool = False, pred_first_day : bool = True, tol : float = 1e-4) -> pd.DataFrame:
-        """
-        Builds a discrete daily demand distribution from each horizon's predicted quantiles and
-        combines them with the (lead time + cycle time) distribution via a random sum.
-        """
-        from catboost_quantile import quantile_col_name
-
-        if pred_first_day:
-            first_day = gdf[self.period_col].min()
-            gdf = gdf[gdf[self.period_col] == first_day].copy()
-        else:
-            gdf = gdf.copy()
-        levels = validate_quantile_levels(quantiles)
-        if cycle_time < 0:
-            raise ValueError("'cycle_time' must be non-negative.")
-        horizon = len(self.target_cols)
-        if horizon == 0:
-            raise ValueError("At least one forecast horizon is required.")
-
-        if not return_distribution:
-            service_levels_arr = gdf['service_level'].to_numpy(dtype=float)
-            if np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
-                raise ValueError("'service_levels' values must be between 0 and 1.")
-
-        quantile_cols = [[quantile_col_name(target, q) for q in levels] for target in self.target_cols]
-        param_cols = ['best_fit', 'distr_param_0', 'distr_param_1', 'distr_param_2']
-        required_cols = [col for cols in quantile_cols for col in cols] + param_cols
-        missing_cols = [col for col in required_cols if col not in gdf.columns]
-        if missing_cols:
-            raise ValueError(f"Missing columns required to compute target inventory: {missing_cols}.")
-
-        lead_time_with_cycle = lead_time.copy()
-        lead_time_with_cycle.shift(cycle_time)
-        if lead_time_with_cycle.min < 0:
-            raise ValueError("Lead time plus cycle time must have non-negative support.")
-
-        num_q = len(levels)
-        q_matrix = gdf[required_cols[:horizon * num_q]].to_numpy(dtype=float).reshape(len(gdf), horizon, num_q)
-        param_values = gdf[param_cols].itertuples(index=False, name=None)
-
-        results = []
-        for row_num, (row_quantiles, params) in enumerate(zip(q_matrix, param_values)):
-            if np.any(~np.isfinite(row_quantiles)):
-                raise ValueError(f"Invalid CatBoost quantile forecast for row {row_num}: {row_quantiles}.")
-            default_demand = None
-            if lead_time_with_cycle.max > horizon:
-                best_fit_params = tuple(p for p in params[1:] if not pd.isna(p))
-                default_demand = DiscreteDistribution.from_parametric(params[0], best_fit_params)
-
-            demand = [DiscreteDistribution(*quantiles_to_pmf(levels, q_row, tol)) for q_row in row_quantiles]
-            demand_during_lead_time = lead_time_with_cycle.random_sum(demand, default_demand)
-
-            if return_distribution:
-                results.append(demand_during_lead_time)
-            else:
-                results.append(demand_during_lead_time.quantile(service_levels_arr[row_num]).item())
-
-        if return_distribution:
-            gdf['demand_distribution'] = results
-        else:
-            gdf['target_inventory'] = results
-        return gdf
-
-def compute_lead_time_demand(ts : DiscreteTimeSeries, model_data : "pd.DataFrame | CatBoostQuantileModel", lead_time : dict[Any, DiscreteDistribution], lead_time_keys : list[str], cycle_time : int, service_levels : pd.DataFrame | None = None, model_type : str = 'glm', return_distribution: bool = False, pred_first_day: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if model_type == 'glm':
-        predictions = ts.predict_glm(model_data)
-        ddlt_fn = lambda x: ts.compute_lead_time_demand_glm(x, lead_time[x.name], cycle_time, return_distribution=return_distribution, pred_first_day=pred_first_day)
-    elif model_type == 'catboost':
-        predictions = ts.predict_catboost(model_data)
-        ddlt_fn = lambda x: ts.compute_lead_time_demand_catboost(x, lead_time[x.name], cycle_time, model_data.quantiles, return_distribution=return_distribution, pred_first_day=pred_first_day)
-    else:
-        raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm', 'catboost'.")
-    if not return_distribution:
-        if service_levels is not None:
-            predictions = pd.merge(predictions, service_levels, on=[col for col in service_levels.columns if col != 'service_level'], how='left').fillna({'service_level': 0.95})
-        else:
-            predictions['service_level'] = 0.95
-    cols = predictions.columns.to_list()
-    predictions = predictions.groupby(lead_time_keys, as_index=False)[cols].apply(ddlt_fn)
-    return predictions
-
-def compute_distribution_dict(df : pd.DataFrame, value : str = 'lead_time', keys : list[str] = None, method : str = 'actual') -> tuple[dict[Any, "DiscreteDistribution"], list[str]]:
+def compute_distribution_dict(
+    df: pd.DataFrame,
+    value: str = "lead_time",
+    keys: list[str] | None = None,
+    method: str = "actual",
+) -> tuple[dict[Any, DiscreteDistribution], list[str]]:
     if keys is None:
         keys = [col for col in df.columns if col != value]
-    distr = df.groupby(keys)[value].apply(lambda x: DiscreteDistribution.from_data(x, method)).to_dict()
+    distr = df.groupby(keys, observed=True)[value].apply(lambda x: DiscreteDistribution.from_data(x, method)).to_dict()
     return distr, keys

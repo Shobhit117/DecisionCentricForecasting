@@ -3,6 +3,7 @@ from scipy import stats
 import probability_utils as prob
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+from numba.typed import List as NumbaList
 
 SUPPORTED_DISTRS = {'nbinom': stats.nbinom,
                     'binom': stats.binom,
@@ -34,13 +35,13 @@ def compute_best_fit_distribution(data : np.ndarray) -> tuple[str, tuple[float]]
 
 class DiscreteDistribution:
     def __init__(self, pmf: np.ndarray, min_value: int, bin_size: int = 1, distr_name: str = None, distr_params: tuple = None):
-        self.pmf = pmf / np.sum(pmf)
-        self.min = min_value
+        self.pmf = np.ascontiguousarray(pmf / np.sum(pmf), dtype=np.float64)
+        self.min = int(min_value)
         if (distr_name is not None) and (distr_name not in SUPPORTED_DISTRS.keys()):
             raise ValueError(f"Distribution {distr_name} is not supported. Available distributions are: {list(SUPPORTED_DISTRS.keys())}.")
         self.best_fit = distr_name
         self.best_fit_params = distr_params
-        self.bin_size = bin_size
+        self.bin_size = int(bin_size)
     
     def copy(self):
         return DiscreteDistribution(self.pmf.copy(), self.min, self.bin_size, self.best_fit, self.best_fit_params)
@@ -98,7 +99,7 @@ class DiscreteDistribution:
         padded_pmf = self.pmf
         if pad_size > 0:
             padded_pmf = np.pad(self.pmf, (0, pad_size), mode='constant')
-        self.pmf = padded_pmf.reshape(-1, level).sum(axis=1)
+        self.pmf = np.ascontiguousarray(padded_pmf.reshape(-1, level).sum(axis=1), dtype=np.float64)
         self.bin_size *= level
     
     def split_bins(self, level : int = None):
@@ -110,29 +111,27 @@ class DiscreteDistribution:
             raise ValueError(f"Failed to split_bins pmf by {level} levels. The bin size must be divisible by the number of levels to split_bins.")
 
         if self.best_fit is None or self.best_fit_params is None:
-            self.pmf = np.repeat(self.pmf / level, level)
+            self.pmf = np.ascontiguousarray(np.repeat(self.pmf / level, level), dtype=np.float64)
             self.bin_size //= level
         else:
             self.pmf = SUPPORTED_DISTRS[self.best_fit].pmf(np.arange(self.min, self.max+1), *self.best_fit_params)
-            self.pmf /= np.sum(self.pmf)
+            self.pmf = np.ascontiguousarray(self.pmf / np.sum(self.pmf), dtype=np.float64)
             new_bin_size = self.bin_size // level
             self.bin_size = 1
             self.merge_bins(new_bin_size)
     
     def quantile(self, q: list | np.ndarray | float) -> np.ndarray:
-        q_arr = np.atleast_1d(q)
+        from ddlt import _pmf_quantiles_numba
+
+        q_arr = np.atleast_1d(np.asarray(q, dtype=np.float64))
         if np.any((q_arr < 0) | (q_arr > 1)):
             raise ValueError("Quantiles must be between 0 and 1.")
-        # searchsorted with side='left' gives the first index where cdf >= q
-        indices = np.searchsorted(self.cdf, q_arr, side='left')
-        # Protect against minor floating point errors (e.g., if cdf[-1] is 0.9999999999)
-        indices = np.clip(indices, 0, len(self.pmf) - 1)
-        return self.min + indices * self.bin_size
+        return _pmf_quantiles_numba(self.pmf, self.min, self.bin_size, q_arr)
 
     def __add__(self, other : "DiscreteDistribution") -> "DiscreteDistribution":
+        from ddlt import _convolve_1d_numba
+
         if self.bin_size != other.bin_size:
-            # self = DiscreteDistribution(self.pmf.copy(), self.min, self.bin_size, self.best_fit, self.best_fit_params)
-            # other = DiscreteDistribution(other.pmf.copy(), other.min, other.bin_size, other.best_fit, other.best_fit_params)
             self = self.copy()
             other = other.copy()
             new_bin_size = int(np.gcd(self.bin_size, other.bin_size))
@@ -141,7 +140,7 @@ class DiscreteDistribution:
         else:
             new_bin_size = self.bin_size
         new_min = self.min + other.min
-        new_pmf = np.convolve(self.pmf, other.pmf)
+        new_pmf = _convolve_1d_numba(self.pmf, other.pmf)
         new_pmf /= np.sum(new_pmf)
         return DiscreteDistribution(new_pmf, new_min, new_bin_size)
 
@@ -153,18 +152,18 @@ class DiscreteDistribution:
         new_min = original_bin_size * (self.min // original_bin_size)
         shift = self.min - new_min
         self.min -= int(shift)
-        self.pmf = np.pad(self.pmf, (shift, 0), mode='constant')
+        self.pmf = np.ascontiguousarray(np.pad(self.pmf, (shift, 0), mode='constant'), dtype=np.float64)
         self.merge_bins(original_bin_size)
     
     def _trim_pmf(self, tol : float = 0.0):
         i = len(self.pmf) - 1
         while self.pmf[i] <= tol:
             i -= 1
-        self.pmf = self.pmf[:(i+1)]
+        self.pmf = np.ascontiguousarray(self.pmf[:(i+1)], dtype=np.float64)
         self.pmf /= np.sum(self.pmf)
 
     def shift(self, by : int):
-        self.min += by
+        self.min += int(by)
         if (self.best_fit is not None) and (self.best_fit_params is not None):
             params = list(self.best_fit_params)
             params[-1] += by # shift the location parameter
@@ -181,7 +180,6 @@ class DiscreteDistribution:
             self.split_bins()
         
         if other.min % other.bin_size != 0:
-            # other = DiscreteDistribution(other.pmf, other.min, other.bin_size, other.best_fit, other.best_fit_params)
             other = other.copy()
             other._align_bin_size()
         
@@ -208,52 +206,47 @@ class DiscreteDistribution:
         return sum_distr
 
     def random_sum(self, rv_list: list["DiscreteDistribution"], default_distr : "DiscreteDistribution" = None) -> "DiscreteDistribution":
+        from ddlt import _random_sum_aligned_numba
+
         if self.min < 0:
             raise ValueError("Number of summands must have non-negative support.")
         
         if self.max > len(rv_list):
             if default_distr is None:
                 raise ValueError(f"Number of RVs in rv_list: {len(rv_list)}. Expected: {self.max}.")
-            rv_list.extend([default_distr for _ in range(self.max - len(rv_list))])
+            rv_list = list(rv_list) + [default_distr] * (self.max - len(rv_list))
+        else:
+            rv_list = list(rv_list[:self.max])
         
         if self.bin_size != 1:
-            self = DiscreteDistribution(self.pmf.copy(), self.min, self.bin_size, self.best_fit, self.best_fit_params)
+            self = self.copy()
             self.split_bins()
-        
-        bin_sizes = [rv.bin_size for rv in rv_list]
-        bin_size_gcd = np.gcd.reduce(bin_sizes)
-        
-        rv_list = [rv.copy() for rv in rv_list]
-        for rv in rv_list:
-            rv.split_bins(rv.bin_size // bin_size_gcd) # ensure equal bin size
-            rv._align_bin_size() # ensure that the min value is divisible by the bin size
 
-        # compute sum of RVs:
-        rv_sum_list = []
-        curr = DiscreteDistribution(np.array([1.0]), 0)
-        for n in range(0, self.max + 1):
-            if n >= self.min:
-                rv_sum_list.append(curr)
-            if n != self.max:
-                curr = curr + rv_list[n]
-        
-        # compute overall min and max values:
-        overall_min = np.inf
-        overall_max = -np.inf
-        for rv in rv_sum_list:
-            overall_min = min(overall_min, rv.min)
-            overall_max = max(overall_max, rv.max)
-        
-        # compute the distribution of the random sum:
-        bin_size = rv_sum_list[0].bin_size
-        height = len(self.pmf)
-        width = int(np.ceil((1 + overall_max - overall_min) / bin_size))
-        mat = np.zeros((height, width))
-        for n, rv in enumerate(rv_sum_list):
-            start = (rv.min - overall_min) // bin_size
-            end = start + len(rv.pmf)
-            mat[n, start:end] = rv.pmf
-        pmf = self.pmf @ mat
+        if self.max == 0:
+            return DiscreteDistribution(np.array([1.0]), 0, 1)
+
+        # Fast path when all summands already have bin_size == 1 (no copy/alignment needed):
+        all_unit_bins = all(rv.bin_size == 1 for rv in rv_list)
+        if all_unit_bins:
+            bin_size = 1
+            aligned_rvs = rv_list
+        else:
+            bin_sizes = [rv.bin_size for rv in rv_list]
+            bin_size = int(np.gcd.reduce(bin_sizes))
+            aligned_rvs = []
+            for rv in rv_list:
+                rv_copy = rv.copy()
+                rv_copy.split_bins(rv_copy.bin_size // bin_size)
+                rv_copy._align_bin_size()
+                aligned_rvs.append(rv_copy)
+
+        rv_pmfs = NumbaList()
+        rv_mins = np.empty(len(aligned_rvs), dtype=np.int64)
+        for idx, rv in enumerate(aligned_rvs):
+            rv_pmfs.append(rv.pmf)
+            rv_mins[idx] = rv.min
+
+        pmf, overall_min = _random_sum_aligned_numba(self.pmf, self.min, rv_pmfs, rv_mins, bin_size)
         return DiscreteDistribution(pmf, overall_min, bin_size)
 
     def plot(self, label : str = None
@@ -271,24 +264,3 @@ class DiscreteDistribution:
             plt.xlabel(xlabel)
         if ylabel is not None:
             plt.ylabel(ylabel)
-
-# N = DiscreteDistribution(
-#     pmf=np.array([0.5, 0.5]),
-#     min_value=1
-# )
-
-# # support = {3, 5}
-# D = DiscreteDistribution(
-#     pmf=np.array([0.7, 0.3]),
-#     min_value=3,
-#     bin_size=2
-# )
-
-# S = N @ D
-
-# # print(S.min)
-# # print(S.bin_size)
-# print(S.pmf)
-# # print(N.random_sum([D.copy(), D.copy(), D.copy(), D.copy(), D.copy()]).pmf)
-# S.plot()
-# plt.show()
