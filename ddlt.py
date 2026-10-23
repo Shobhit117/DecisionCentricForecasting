@@ -11,6 +11,8 @@ Provides:
 """
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -19,6 +21,8 @@ from numba import njit, prange
 from numba.typed import List as NumbaList
 
 from discrete_distribution import DiscreteDistribution
+
+logger = logging.getLogger(__name__)
 
 _LEFT_LIMIT_EPS = 1e-9
 
@@ -340,6 +344,7 @@ class DDLTCalculator:
         from catboost_quantile import quantile_col_name
         from quantile_distribution import validate_quantile_levels
 
+        t0 = time.perf_counter()
         if pred_first_day:
             first_day = gdf[period_col].min()
             gdf = gdf[gdf[period_col] == first_day].copy()
@@ -370,6 +375,15 @@ class DDLTCalculator:
             missing_param = [c for c in param_cols if c not in gdf.columns]
             if missing_param:
                 raise ValueError(f"Missing columns required to compute target inventory: {missing_param}.")
+
+        logger.info(
+            "Computing Numba DDLT from quantiles for %d rows (horizon=%d, quantiles=%d, L+R support=[%d, %d])...",
+            len(gdf),
+            horizon,
+            len(levels),
+            lt_with_cycle.min,
+            lt_with_cycle.max,
+        )
 
         num_q = len(levels)
         q_matrix = np.ascontiguousarray(
@@ -404,6 +418,7 @@ class DDLTCalculator:
             gdf["demand_distribution"] = results
         else:
             gdf["target_inventory"] = results
+        logger.info("DDLT from quantiles completed for %d rows in %.2fs", len(gdf), time.perf_counter() - t0)
         return gdf
 
     def from_glm_group(
@@ -418,6 +433,7 @@ class DDLTCalculator:
         period_col: str = "day",
     ) -> pd.DataFrame:
         """Computes DDLT from GLM ``(mu, alpha)`` columns for one lead-time group."""
+        t0 = time.perf_counter()
         if pred_first_day:
             first_day = gdf[period_col].min()
             gdf = gdf[gdf[period_col] == first_day].copy()
@@ -446,6 +462,14 @@ class DDLTCalculator:
         missing_cols = [col for col in required_cols if col not in gdf.columns]
         if missing_cols:
             raise ValueError(f"Missing columns required to compute target inventory: {missing_cols}.")
+
+        logger.info(
+            "Computing DDLT from GLM parameters for %d rows (horizon=%d, L+R support=[%d, %d])...",
+            len(gdf),
+            horizon,
+            lt_with_cycle.min,
+            lt_with_cycle.max,
+        )
 
         mu_arr = gdf[glm_mu_cols].to_numpy(dtype=float)
         alpha_arr = gdf[glm_alpha_cols].to_numpy(dtype=float)
@@ -481,5 +505,5 @@ class DDLTCalculator:
             gdf["demand_distribution"] = results
         else:
             gdf["target_inventory"] = results
+        logger.info("DDLT from GLM completed for %d rows in %.2fs", len(gdf), time.perf_counter() - t0)
         return gdf
-

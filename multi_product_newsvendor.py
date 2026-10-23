@@ -1,9 +1,10 @@
+import logging
+import time
 import numpy as np
 import pandas as pd
 from numba.typed import List as NumbaList
 from discrete_distribution import DiscreteDistribution
 from ddlt import _batch_pmf_quantiles_numba
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +60,16 @@ def solve_multi_product_newsvendor(
         alpha = np.clip((base_num - purchase_cost * (1.0 + k)) / denom, 0.0, 1.0)
         return _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alpha)
 
-    logger.info('== Solving Multi-Product Newsvendor Problem ==')
     x = opt_inventory(0.0)
-    if np.sum(x * purchase_cost) <= available_budget:
-        logger.info('== done ==')
+    unconstrained_spend = float(np.sum(x * purchase_cost))
+    if unconstrained_spend <= available_budget:
+        logger.debug(
+            "Unconstrained newsvendor solution satisfies budget (spend=%.2f <= %.2f)",
+            unconstrained_spend,
+            available_budget,
+        )
         return x
-    logger.info(f'Iteration 0: Budget used = {np.sum(x * purchase_cost)}')
+    logger.debug("Iteration 0 (unconstrained): budget used = %.2f > %.2f", unconstrained_spend, available_budget)
 
     # Find upper bound on k large enough to force low inventory.
     k_lb = 0.0
@@ -75,7 +80,7 @@ def solve_multi_product_newsvendor(
         k_mid = 0.5 * (k_lb + k_ub)
         x = opt_inventory(k_mid)
         budget_used = float(np.sum(x * purchase_cost))
-        logger.info(f'Iteration {i}: lb = {k_lb}, ub = {k_ub}, budget used = {budget_used}')
+        logger.debug("Iteration %d: lb = %.6f, ub = %.6f, budget used = %.2f", i, k_lb, k_ub, budget_used)
 
         if budget_used <= available_budget:
             k_ub = k_mid
@@ -85,7 +90,6 @@ def solve_multi_product_newsvendor(
         if (k_ub - k_lb < tol):
             break
     x = opt_inventory(k_ub)  # k_ub always satisfies the budget constraint (the last k_mid may not)
-    logger.info('== done ==')
     return x
 
 
@@ -102,12 +106,21 @@ def _solve_multi_product_newsvendor(
     newsvendor problem with ``total_budget`` is solved for each group (Option A:
     one budget per store per decision day).
     """
+    t0 = time.perf_counter()
     if group_cols is not None:
         valid_group_cols = [c for c in group_cols if c in df.columns]
         if valid_group_cols and df[valid_group_cols].drop_duplicates().shape[0] > 1:
+            groups = list(df.groupby(valid_group_cols, observed=True).groups.items())
+            logger.info(
+                "Solving %d independent multi-product newsvendor problems (grouped by %s, budget=%.2f each)...",
+                len(groups),
+                valid_group_cols,
+                total_budget,
+            )
             result_df = df.drop(columns=['demand_distribution']).copy()
             result_df[out_col_name] = 0
-            for _, idx in df.groupby(valid_group_cols, observed=True).groups.items():
+            spends = []
+            for group_key, idx in groups:
                 sub = df.loc[idx]
                 inv = solve_multi_product_newsvendor(
                     sub['demand_distribution'],
@@ -117,14 +130,37 @@ def _solve_multi_product_newsvendor(
                     total_budget,
                 )
                 result_df.loc[idx, out_col_name] = inv
+                spends.append(float(np.sum(inv * sub['purchase_cost'].to_numpy())))
+            logger.info(
+                "Completed %d newsvendor problems in %.2fs (budget used min=%.2f, mean=%.2f, max=%.2f / %.2f)",
+                len(groups),
+                time.perf_counter() - t0,
+                min(spends),
+                float(np.mean(spends)),
+                max(spends),
+                total_budget,
+            )
             return result_df
 
+    logger.info(
+        "Solving multi-product newsvendor problem for %d products (budget=%.2f)...",
+        len(df),
+        total_budget,
+    )
     demand_distributions = df['demand_distribution']  # do not create a copy of this column
     selling_price = df['sell_price'].to_numpy()
     purchase_cost = df['purchase_cost'].to_numpy()
     shortage_penalty = df['shortage_penalty'].to_numpy()
     result_df = df.drop(columns=['demand_distribution']).copy()
-    result_df[out_col_name] = solve_multi_product_newsvendor(
+    inv = solve_multi_product_newsvendor(
         demand_distributions, selling_price, purchase_cost, shortage_penalty, total_budget
+    )
+    result_df[out_col_name] = inv
+    logger.info(
+        "Completed newsvendor problem in %.2fs (budget used=%.2f / %.2f, total units=%d)",
+        time.perf_counter() - t0,
+        float(np.sum(inv * purchase_cost)),
+        total_budget,
+        int(np.sum(inv)),
     )
     return result_df

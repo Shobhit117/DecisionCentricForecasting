@@ -6,9 +6,8 @@ evaluation, and DDLT propagation.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-import json
 import logging
-from pathlib import Path
+import time
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
@@ -172,11 +171,19 @@ class GLMForecaster(ProbabilisticForecaster):
         self.model_data: pd.DataFrame | None = None
 
     def fit(self, ts: "DiscreteTimeSeries") -> pd.DataFrame:
+        t0 = time.perf_counter()
         partition_cols = list(self.train_groups)
         if "overdispersion" not in partition_cols:
             partition_cols.append("overdispersion")
 
         train_df = ts.df[ts.df["is_test"] == 0] if ts.test_start_period is not None else ts.df
+        n_groups = train_df[partition_cols].drop_duplicates().shape[0]
+        logger.info(
+            "Starting GLM training across %d group(s) and %d horizon(s) (%d training rows)...",
+            n_groups,
+            len(ts.target_cols),
+            len(train_df),
+        )
 
         def _train_group(group_df: pd.DataFrame) -> pd.Series:
             group_name = getattr(group_df, "name", "unknown")
@@ -188,12 +195,27 @@ class GLMForecaster(ProbabilisticForecaster):
 
             model_type = "nbinom" if is_overdispersed == 1 else "poisson"
             group_result = {}
-            for target in ts.target_cols:
-                logger.info(f"training model for group ({group_name}), target {target}...")
+            n_horizons = len(ts.target_cols)
+            for h_idx, target in enumerate(ts.target_cols, start=1):
+                h_t0 = time.perf_counter()
+                logger.info(
+                    "Training %s GLM for group %s, horizon [%d/%d] (%s)...",
+                    model_type,
+                    group_name,
+                    h_idx,
+                    n_horizons,
+                    target,
+                )
                 model_dict, summary = train_single_glm(group_df, ts.feature_cols, target, model_type)
                 group_result[target] = model_dict
-                logger.info(summary)
-                logger.info("model trained successfully")
+                logger.debug("%s", summary)
+                logger.info(
+                    "Completed %s GLM for group %s, %s in %.2fs",
+                    model_type,
+                    group_name,
+                    target,
+                    time.perf_counter() - h_t0,
+                )
             return pd.Series(group_result)
 
         try:
@@ -201,6 +223,7 @@ class GLMForecaster(ProbabilisticForecaster):
         except TypeError:
             result_df = train_df.groupby(partition_cols, observed=True).apply(_train_group).reset_index()
         self.model_data = result_df
+        logger.info("Finished GLM training in %.2fs", time.perf_counter() - t0)
         return result_df
 
     def predict(
@@ -209,12 +232,14 @@ class GLMForecaster(ProbabilisticForecaster):
         df: pd.DataFrame | None = None,
         model_data: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        t0 = time.perf_counter()
         model_df = model_data if model_data is not None else self.model_data
         if model_df is None:
             raise ValueError("GLMForecaster has not been fitted yet.")
 
         test_data = df.copy() if df is not None else ts.get_inference_data()
         train_groups = [col for col in model_df.columns if col not in ts.target_cols]
+        logger.info("Generating GLM predictions for %d rows across %d horizons...", len(test_data), len(ts.target_cols))
 
         for target in ts.target_cols:
             test_data[f"{target}_mu"] = np.nan
@@ -225,6 +250,7 @@ class GLMForecaster(ProbabilisticForecaster):
             if isinstance(group_keys, tuple) and len(group_keys) == 1:
                 group_keys = group_keys[0]
             if group_keys not in model_dict_map:
+                logger.warning("No trained GLM found for group %s; skipping %d rows", group_keys, len(group_df))
                 continue
             row_models = model_dict_map[group_keys]
             group_idx = group_df.index
@@ -243,6 +269,7 @@ class GLMForecaster(ProbabilisticForecaster):
                 )
 
         compute_forecasting_metrics(test_data, ts.target_cols, [f"{target}_mu" for target in ts.target_cols])
+        logger.info("GLM predictions completed in %.2fs", time.perf_counter() - t0)
         return test_data
 
     def compute_ddlt(
@@ -303,6 +330,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
     def fit(self, ts: "DiscreteTimeSeries") -> "CatBoostQuantileModel":
         from catboost_quantile import CatBoostQuantileModel, train_catboost_quantile
 
+        t0 = time.perf_counter()
         partition_cols = list(self.train_groups)
         available_extra_cats = [
             c for c in self.extra_cat_cols if c in ts.df.columns and c not in partition_cols
@@ -321,18 +349,34 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         train_df = ts.df[mask]
         train_pos = period_pos[mask]
 
-        groups = train_df.groupby(partition_cols, observed=True) if partition_cols else [((), train_df)]
+        groups = list(train_df.groupby(partition_cols, observed=True)) if partition_cols else [((), train_df)]
+        logger.info(
+            "Starting CatBoost MultiQuantile training (%d quantiles, %d group(s), %d horizon(s), %d num features, %d cat features)...",
+            len(self.quantiles),
+            len(groups),
+            len(ts.target_cols),
+            len(feature_cols),
+            len(cat_cols),
+        )
+
+        n_horizons = len(ts.target_cols)
         for group_values, group_df in groups:
             key = CatBoostQuantileModel.group_key(group_values) if partition_cols else ()
             group_pos = train_pos.loc[group_df.index]
-            for target in ts.target_cols:
+            for h_idx, target in enumerate(ts.target_cols, start=1):
+                h_t0 = time.perf_counter()
                 target_pos = group_pos + ts._target_offset(target)
                 has_target = group_df[target].notna() & (target_pos < test_start_pos)
                 valid_mask = has_target & (target_pos >= test_start_pos - self.num_valid_days)
                 fit_mask = has_target & ~valid_mask
                 logger.info(
-                    f"training CatBoost model for group {key or '(all)'}, target {target}: "
-                    f"{fit_mask.sum()} train rows, {valid_mask.sum()} validation rows..."
+                    "Training CatBoost model for group %s, horizon [%d/%d] (%s): %d train rows, %d validation rows...",
+                    key or "(all)",
+                    h_idx,
+                    n_horizons,
+                    target,
+                    int(fit_mask.sum()),
+                    int(valid_mask.sum()),
                 )
                 cb_model = train_catboost_quantile(
                     group_df[fit_mask],
@@ -344,8 +388,15 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
                     params=self.catboost_params,
                 )
                 result.models.setdefault(key, {})[target] = cb_model
-                logger.info(f"model trained successfully (best iteration: {cb_model.get_best_iteration()})")
+                logger.info(
+                    "Completed CatBoost model for group %s, %s in %.2fs (best iteration: %s)",
+                    key or "(all)",
+                    target,
+                    time.perf_counter() - h_t0,
+                    cb_model.get_best_iteration(),
+                )
         self.model = result
+        logger.info("Finished all CatBoost horizon models in %.2fs", time.perf_counter() - t0)
         return result
 
     def predict(
@@ -356,12 +407,19 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
     ) -> pd.DataFrame:
         from catboost_quantile import predict_catboost_quantile
 
+        t0 = time.perf_counter()
         cb_container = model if model is not None else self.model
         if cb_container is None:
             raise ValueError("CatBoostQuantileForecaster has not been fitted yet.")
 
         test_data = df.copy() if df is not None else ts.get_inference_data()
         levels = np.asarray(cb_container.quantiles, dtype=np.float64)
+        logger.info(
+            "Generating CatBoost quantile predictions for %d rows across %d horizons (%d quantiles)...",
+            len(test_data),
+            len(cb_container.target_cols),
+            len(levels),
+        )
         preds = {target: np.full((len(test_data), len(levels)), np.nan) for target in cb_container.target_cols}
 
         if cb_container.train_groups:
@@ -373,7 +431,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
             key = cb_container.group_key(group_values) if cb_container.train_groups else ()
             group_models = cb_container.models.get(key)
             if group_models is None:
-                logger.warning(f"no CatBoost model available for group {key}; skipping {len(idx)} rows")
+                logger.warning("No CatBoost model available for group %s; skipping %d rows", key, len(idx))
                 continue
             group_df = test_data.iloc[idx]
             for target, cb_model in group_models.items():
@@ -393,6 +451,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         test_data = pd.concat([test_data, pd.DataFrame(new_cols, index=test_data.index)], axis=1)
 
         compute_forecasting_metrics(test_data, ts.target_cols, [f"{target}_mu" for target in ts.target_cols])
+        logger.info("CatBoost predictions and distribution means completed in %.2fs", time.perf_counter() - t0)
         return test_data
 
     def compute_ddlt(
@@ -455,4 +514,3 @@ def _apply_ddlt_across_groups(
     return predictions.groupby(lead_time_keys, as_index=False, observed=True)[cols].apply(
         lambda x: group_fn(x, lead_time[x.name])
     )
-

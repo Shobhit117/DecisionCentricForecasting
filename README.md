@@ -2,16 +2,16 @@
 
 An end-to-end framework for converting probabilistic demand forecasts into inventory decisions.
 
-The project uses the **M5 Forecasting Accuracy** dataset to demonstrate a decision-centric pipeline:
+The project uses the **M5 Forecasting Accuracy** dataset (and supports general retail panel datasets) to demonstrate a decision-centric pipeline:
 
 1. Download and preprocess retail sales data.
-2. Engineer time-series, calendar, event, and price features.
-3. Train count-based probabilistic forecasting models.
-4. Construct demand-during-lead-time distributions.
-5. Solve a budget-constrained multi-product newsvendor problem.
-6. Export forecasts, inventory decisions, and forecasting metrics.
+2. Engineer time-series, calendar, event, and price features (including future-known covariates).
+3. Train probabilistic forecasting models (**Poisson / Negative-Binomial GLMs** or **CatBoost Multi-Quantile Regression**).
+4. Reconstruct discrete daily demand distributions and propagate uncertainty through stochastic lead times using **Numba-accelerated** discrete convolution and mixture algebra.
+5. Solve a budget-constrained multi-product newsvendor problem per decision day.
+6. Export forecasts, inventory decisions, and point/probabilistic forecasting metrics.
 
-> **Project status:** Experimental / work in progress. The forecasting layer supports Poisson and negative-binomial generalized linear models and CatBoost multi-quantile regression. Lead-time and purchasing-cost inputs are synthetically generated for demonstration.
+> **Project status:** Active development. The forecasting layer supports grouped Poisson/negative-binomial GLMs and CatBoost multi-quantile regression with non-parametric discrete distribution reconstruction. Lead-time and purchasing-cost inputs are synthetically generated for the M5 demonstration.
 
 ---
 
@@ -22,15 +22,17 @@ Many forecasting projects stop after producing point forecasts or reporting an a
 This project connects forecasting and optimization:
 
 ```text
-Historical demand
-      ↓
-Probabilistic demand forecast
-      ↓
-Demand during lead time
-      ↓
-Economic loss model
-      ↓
-Budget-constrained inventory decision
+Historical demand + Future covariates
+                  ↓
+    Probabilistic demand forecast
+   (GLM count model or CatBoost quantiles)
+                  ↓
+      Daily discrete distributions
+                  ↓
+  Demand during lead time + review period
+       (Numba random-sum mixture)
+                  ↓
+  Budget-constrained multi-product newsvendor
 ```
 
 The goal is not merely to predict future demand, but to use uncertainty estimates to make an operational decision.
@@ -39,36 +41,40 @@ The goal is not merely to predict future demand, but to use uncertainty estimate
 
 ## Features
 
-- Automatic download and checksum verification of the M5 dataset
-- Memory-conscious preprocessing with Polars
-- Store-level Parquet partitioning
+- Automatic download and MD5 checksum verification of the M5 dataset
+- Memory-conscious preprocessing with Polars and store-level Parquet partitioning
 - Synthetic lead-time, purchase-cost, and shortage-penalty generation
-- Reusable discrete time-series feature engineering
-- Lag and rolling-window demand features
-- Calendar, event, and selling-price features
-- Poisson and negative-binomial regression
-- Automatic model-family selection using an overdispersion flag
-- Multi-horizon probabilistic forecasts
-- Empirical and parametric discrete distributions
-- Demand-during-lead-time convolution
-- Random sums of non-identically distributed demand variables
-- Budget-constrained multi-product newsvendor optimization
-- Store-level and category-level WMAPE reporting
+- Reusable discrete time-series panel builder (`DiscreteTimeSeries`) supporting both **backtesting** (`num_test_days > 0`) and **production inference** (`num_test_days = 0`)
+- Lag, rolling-mean, and rolling-volatility demand features without train/test target leakage
+- Calendar, event, and selling-price features, including **future-known covariates** (negative lags / leads for scheduled promotions, holidays, and prices beyond the last observed sales date)
+- Composable forecaster abstractions (`ProbabilisticForecaster`, `GLMForecaster`, `CatBoostQuantileForecaster`)
+- Grouped Poisson and negative-binomial regression with automatic overdispersion detection
+- CatBoost `MultiQuantile` regression predicting a full grid of quantiles simultaneously
+- Non-parametric quantile-to-discrete-PMF reconstruction with monotone rearrangement, linear interpolation, and exponential upper-tail extrapolation
+- **Numba-accelerated** 1D convolution, random sums, quantile reconstruction, and $O(1)$-auxiliary-memory quantile lookup (`ddlt.py`)
+- Per-day budget-constrained multi-product newsvendor optimization via Lagrangian binary search
+- Store-level and category-level WMAPE, pinball loss, and empirical quantile coverage reporting
+- Unit test suite (`pytest`)
 
 ---
 
 ## Repository Structure
 
-The code expects the following module names:
-
 ```text
 .
 ├── process_m5_dataset.py
 ├── run_m5_pipeline.py
-├── probability_utils.py
-├── discrete_distribution.py
 ├── time_series.py
+├── forecasters.py
+├── catboost_quantile.py
+├── quantile_distribution.py
+├── ddlt.py
+├── discrete_distribution.py
+├── probability_utils.py
 ├── multi_product_newsvendor.py
+├── logging_utils.py
+├── tests/
+│   └── test_quantile_distribution.py
 ├── data/
 │   ├── m5-forecasting-accuracy/
 │   │   ├── calendar.csv
@@ -83,9 +89,15 @@ The code expects the following module names:
 │   │   └── newsvendor.parquet
 │   └── output/
 │       ├── model_data_<STORE_ID>.csv
+│       ├── catboost_models_<STORE_ID>/
+│       ├── feature_importance_catboost_<STORE_ID>.csv
 │       ├── predictions_<STORE_ID>.csv
+│       ├── predictions_catboost_<STORE_ID>.csv
+│       ├── quantile_metrics_catboost.csv
 │       ├── wmape_store.csv
-│       └── wmape_store_cat.csv
+│       ├── wmape_store_cat.csv
+│       ├── wmape_store_catboost.csv
+│       └── wmape_store_cat_catboost.csv
 └── README.md
 ```
 
@@ -95,156 +107,119 @@ The code expects the following module names:
 
 Handles data acquisition and preprocessing:
 
-- downloads the M5 archive from Zenodo;
-- verifies the archive using an MD5 checksum;
-- extracts the raw files;
-- reshapes daily demand from wide to long format;
+- downloads the M5 archive from Zenodo and verifies its MD5 checksum;
+- extracts the raw CSV files;
+- reshapes daily demand from wide to long format using Polars;
 - joins calendar data with weekly selling prices;
 - generates synthetic lead-time and newsvendor inputs;
-- saves calendar and price tables as Parquet;
-- partitions sales data by store.
+- saves calendar, price, and store-partitioned sales tables as Parquet.
 
 #### `time_series.py`
 
-Contains the forecasting framework:
+Contains the panel time-series and feature-engineering pipeline (`DiscreteTimeSeries`):
 
-- constructs complete time-series panels;
-- creates train/test splits;
-- generates lag and rolling-window features;
-- adds external numerical and categorical features;
-- fits candidate historical demand distributions;
-- trains grouped Poisson or negative-binomial models;
-- generates multi-horizon forecasts;
-- converts daily forecasts into lead-time demand distributions;
-- computes point-forecast error components.
+- constructs complete `ts_id × period` panels;
+- creates leak-free train/test splits (or full-history panels when `num_test_days=0` in production);
+- generates lag, rolling-mean, and rolling-standard-deviation features;
+- adds calendar features (configurable weekend indicators or day-of-week encodings) and external features with historical lags, **future leads** (`lags=(-1, -2, ...)`), and rolling windows;
+- optionally fits candidate historical demand distributions when lead time plus review cycle exceeds the forecast horizon;
+- provides convenience delegation methods for training, prediction, evaluation, and DDLT calculation.
+
+#### `forecasters.py`
+
+Defines clean, composable forecaster abstractions:
+
+- `ProbabilisticForecaster`: abstract base class defining `.fit()`, `.predict()`, and `.compute_ddlt()`;
+- `GLMForecaster`: fits grouped Poisson / negative-binomial GLMs across forecast horizons and predicts horizon means/dispersions;
+- `CatBoostQuantileForecaster`: fits multi-horizon CatBoost `MultiQuantile` models, predicts non-crossing quantile grids and distribution means, and propagates quantiles to DDLT distributions;
+- standalone evaluation utilities (`compute_forecasting_metrics`, `evaluate_quantile_forecasts`).
+
+#### `catboost_quantile.py`
+
+Wraps CatBoost multi-quantile training, inference, and model persistence:
+
+- builds `MultiQuantile:alpha=...` loss definitions;
+- handles native categorical features and temporal validation splits for early stopping;
+- provides `CatBoostQuantileModel` for saving/loading `.cbm` model bundles and extracting feature importances.
+
+#### `quantile_distribution.py`
+
+Converts predicted quantile vectors into discrete probability distributions over non-negative integer demand:
+
+- removes quantile crossing via monotone rearrangement and clips at zero;
+- interpolates linearly between predicted quantile knots;
+- extrapolates the lower tail linearly to $\tau = 0$ and the upper tail exponentially through the last two knots up to $1 - \text{tol}$;
+- discretizes via $P(D \le y) = P(Q(U) < y + 0.5)$ using Numba-compiled kernels.
+
+#### `ddlt.py`
+
+Implements **Numba-accelerated** distribution algebra and the model-agnostic `DDLTCalculator`:
+
+- `_convolve_1d_numba` and `_random_sum_aligned_numba`: compiled 1D convolution and random-sum mixture kernels that accumulate directly into a 1D output vector without intermediate 2D matrix allocations;
+- `_quantiles_to_pmf_numba` and `_quantiles_to_mean_batch_numba`: parallel JIT kernels for reconstructing PMFs and expectations from quantile matrices;
+- `_pmf_quantile_scalar_numba` and `_batch_pmf_quantiles_numba`: $O(1)$-auxiliary-memory quantile lookup directly on PMFs without allocating or caching CDF arrays;
+- `DDLTCalculator`: converts either multi-horizon quantile grids or GLM $(\mu, \alpha)$ parameters into lead-time demand distributions or service-level inventory targets.
 
 #### `discrete_distribution.py`
 
-Implements discrete probability distributions and operations:
+Implements the `DiscreteDistribution` class and operations:
 
-- creation from empirical observations;
-- creation from supported parametric families;
-- probability mass functions and cumulative distributions;
-- quantiles;
-- shifting;
-- convolution;
-- bin merging and splitting;
-- identically distributed random sums;
-- non-identically distributed random sums.
-
-The currently supported parametric families are:
-
-- negative binomial;
-- binomial;
-- Poisson;
-- geometric;
-- discrete uniform.
-
-#### `probability_utils.py`
-
-Provides utility functions for:
-
-- method-of-moments distribution fitting;
-- discrete PMF fit evaluation;
-- plotting observed and fitted distributions.
+- creation from empirical observations (`from_data`) or parametric families (`from_parametric`: negative binomial, binomial, Poisson, geometric, discrete uniform);
+- probability mass functions, cumulative distributions, and Numba-accelerated quantiles;
+- shifting, bin merging, and bin splitting;
+- convolution (`+`), identically distributed random sums (`@`), and non-identically distributed random sums (`random_sum`).
 
 #### `multi_product_newsvendor.py`
 
-Solves a multi-product newsvendor problem under a shared purchasing budget.
+Solves the multi-product newsvendor problem under a shared purchasing budget:
 
-For a fixed Lagrange multiplier, each product receives an adjusted critical fractile. A binary search finds a multiplier that satisfies the total budget constraint.
+- for a fixed Lagrange multiplier $k \ge 0$, each product receives an adjusted critical fractile $\alpha_i(k)$ evaluated via `_batch_pmf_quantiles_numba`;
+- a binary search finds the optimal multiplier $k^*$ satisfying the budget constraint;
+- supports `group_cols` (e.g., `['store_id', 'day']`) to solve an independent budget-constrained problem on each decision day.
 
 #### `run_m5_pipeline.py`
 
-Runs the complete forecasting and inventory pipeline one store at a time:
+Runs the complete forecasting and inventory pipeline one store at a time, supporting both `--model glm` and `--model catboost`.
 
-- loads processed inputs;
-- constructs forecasting features;
-- trains grouped GLMs;
-- creates lead-time demand distributions;
-- solves the inventory optimization problem;
-- writes model data, predictions, inventory targets, and WMAPE summaries.
+#### `logging_utils.py`
+
+Configures structured, timestamped logging (`%(asctime)s | %(levelname)-8s | %(name)s | %(message)s`) to stdout and optionally to a `.log` file via `setup_logging(log_file=..., level=...)`.
 
 ---
 
 ## Methodology
 
-### 1. Probabilistic Demand Forecasting
+### 1a. Count-Regression GLMs (`--model glm`)
 
-The current forecasting layer uses count-regression models.
+For each training group (`store_id`, `cat_id`, `overdispersion`) and forecast horizon $h \in \{0, \dots, 6\}$:
 
-For each training group and forecast horizon:
-
-- a **Poisson model** is used when historical variance does not exceed the mean;
-- a **negative-binomial model** is used when the series is overdispersed.
-
-The default forecasting horizon is seven days.
-
-The default demand features are:
-
-- lag 1;
-- lag 7;
-- lag 14;
-- rolling mean over 7 days;
-- rolling mean over 28 days;
-- day-of-week indicators;
-- event type;
-- selling price.
-
-Models are grouped by:
-
-- store;
-- product category;
-- overdispersion status.
+- a **Poisson GLM** is used when historical variance does not exceed the mean;
+- a **Negative-Binomial GLM** is used when the series is overdispersed.
 
 ### 1b. CatBoost Multi-Quantile Regression (`--model catboost`)
 
-An alternative, non-parametric forecasting layer (`catboost_quantile.py`, `quantile_distribution.py`):
+For each forecast horizon $h \in \{0, \dots, 6\}$:
 
-- one CatBoost model per forecast horizon, trained with the `MultiQuantile` loss (summed pinball loss), so a single model predicts the full quantile grid `0.05, 0.1, 0.2, ..., 0.9, 0.95, 0.99`;
-- a single global model per store; `item_id`, `dept_id`, `cat_id`, day of week, and event type are native categorical features; rolling standard deviations and month are added as features;
-- training rows whose target lies in the test period are excluded, and the last 28 target days before the test period are used for early stopping;
-- by default only the last 730 days of history are used (`--catboost-train-days`, `0` = all).
+- a single store-level CatBoost model is trained with the `MultiQuantile` loss (summed pinball loss across all quantile levels $\tau \in \{0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99\}$);
+- `item_id`, `dept_id`, `cat_id`, `wday`, and `event_type` are passed as native categorical features alongside lag, rolling mean, rolling standard deviation, month, and log selling price features;
+- training rows whose future target $t + h$ falls in the test window are masked out (preventing look-ahead leakage), and the last 28 target days prior to the test window are used for early stopping;
+- each predicted quantile vector is converted into a non-negative integer `DiscreteDistribution` via `quantile_distribution.py`.
 
-Each predicted quantile vector is converted into a discrete daily demand distribution:
+### 2. Demand During Lead Time + Review Period (DDLT)
 
-1. quantile crossing is removed by sorting, and quantiles are clipped at zero;
-2. the quantile function `Q(tau)` is linearly interpolated between the predicted quantiles;
-3. the lower tail is linearly extrapolated to `tau = 0` (clipped at zero), and the upper tail is exponential, passing through the last two quantiles and truncated at `1 - 1e-4`;
-4. integer demand is `D = round(Q(U))`, i.e. `P(D <= y) = P(Q(U) < y + 0.5)`.
+Daily predictive distributions $D_{t}, D_{t+1}, \dots$ are combined with an empirical store-level lead-time distribution $L$ shifted by the review cycle time $R$:
 
-The resulting daily distributions feed the same lead-time random sum and newsvendor optimizer as the GLMs. Pinball loss and empirical coverage per horizon and quantile are written to `quantile_metrics_catboost.csv`.
+$$D_{t}^{L+R} = \sum_{j=0}^{L+R-1} D_{t+j}$$
 
-### 2. Lead-Time Demand
+Because $D_{t+j}$ are non-identically distributed across the forecast horizon and $L$ is stochastic, $D_{t}^{L+R}$ is a mixture of convolutions computed via `DDLTCalculator` and `DiscreteDistribution.random_sum`.
 
-Daily predictive distributions are combined with an empirical store-level lead-time distribution.
+### 3. Multi-Product Newsvendor Under a Budget Constraint
 
-When lead time is uncertain, total demand is a random sum:
+On each decision day, each product $i$ has a DDLT distribution $F_i$, selling price $p_i$, purchase cost $c_i$, and shortage penalty $b_i$. The optimizer chooses order quantities $q_i$ satisfying:
 
-```text
-D_LT = D_1 + D_2 + ... + D_L
-```
+$$\sum_{i} c_i q_i \le B, \qquad q_i(k) = F_i^{-1}\!\left(\operatorname{clip}\!\left(\frac{p_i - c_i(1 + k) + b_i}{p_i + b_i},\, 0,\, 1\right)\right)$$
 
-where `L` is a random lead time and the daily demand variables may have different distributions.
-
-The implementation supports this through `DiscreteDistribution.random_sum`.
-
-### 3. Multi-Product Newsvendor
-
-Each product has:
-
-- a demand-during-lead-time distribution;
-- selling price;
-- purchase cost;
-- shortage penalty.
-
-The optimizer selects inventory quantities while enforcing:
-
-```text
-sum(purchase_cost[i] * inventory[i]) <= available_budget
-```
-
-When the unconstrained newsvendor solution exceeds the available budget, the solver performs a binary search over the Lagrange multiplier associated with the budget constraint.
+via binary search over the shadow price $k \ge 0$.
 
 ---
 
@@ -263,23 +238,16 @@ statsmodels
 matplotlib
 requests
 pyarrow
+numba
 catboost
+pytest
 ```
-
-`pyarrow` is required by Pandas for reading and writing Parquet files. `catboost` is only needed for `--model catboost`.
 
 ---
 
 ## Installation
 
-Clone the repository:
-
-```bash
-git clone https://github.com/<your-username>/<your-repository>.git
-cd <your-repository>
-```
-
-Create a virtual environment:
+Clone the repository and create a virtual environment:
 
 ### Linux or macOS
 
@@ -299,66 +267,19 @@ Install the dependencies:
 
 ```bash
 python -m pip install --upgrade pip
-pip install numpy pandas polars scipy statsmodels matplotlib requests pyarrow
-```
-
-A `requirements.txt` file can also be created with:
-
-```text
-numpy
-pandas
-polars
-scipy
-statsmodels
-matplotlib
-requests
-pyarrow
-```
-
-Then install it using:
-
-```bash
-pip install -r requirements.txt
+pip install numpy pandas polars scipy statsmodels matplotlib requests pyarrow numba catboost pytest
 ```
 
 ---
 
 ## How to Run
 
-The pipeline has two stages:
+Run all commands from the repository root so local module imports resolve correctly.
 
-1. Download and preprocess the M5 data.
-2. Train the forecasting models and solve the newsvendor problem.
-
-Run all commands from the repository root so that local module imports resolve correctly.
-
-### Step 1: Download and Process the Dataset
+### Step 1: Download and Process the M5 Dataset
 
 ```bash
 python process_m5_dataset.py --download
-```
-
-This command:
-
-- downloads the M5 dataset if necessary;
-- verifies the downloaded archive;
-- extracts the raw CSV files;
-- generates synthetic lead-time data;
-- generates synthetic purchasing-cost and shortage-penalty data;
-- creates Parquet input files;
-- partitions the sales history by store.
-
-Default paths:
-
-```text
-Raw data:
-data/m5-forecasting-accuracy/
-
-Processed data:
-data/m5-forecasting-accuracy/partitioned_data/
-
-Synthetic data:
-data/synthetic_data/
 ```
 
 To process a dataset that has already been downloaded:
@@ -367,17 +288,7 @@ To process a dataset that has already been downloaded:
 python process_m5_dataset.py
 ```
 
-Custom paths can be supplied:
-
-```bash
-python process_m5_dataset.py \
-  --download \
-  --m5-dir data/m5-forecasting-accuracy \
-  --synthetic-dir data/synthetic_data \
-  --partitioned-dir data/m5-forecasting-accuracy/partitioned_data
-```
-
-On Windows PowerShell, the same command can be written on one line:
+Custom directories can be supplied:
 
 ```powershell
 python process_m5_dataset.py --download --m5-dir data/m5-forecasting-accuracy --synthetic-dir data/synthetic_data --partitioned-dir data/m5-forecasting-accuracy/partitioned_data
@@ -385,135 +296,93 @@ python process_m5_dataset.py --download --m5-dir data/m5-forecasting-accuracy --
 
 ### Step 2: Run Forecasting and Inventory Optimization
 
-```bash
-python run_m5_pipeline.py
-```
-
-The default inventory budget is `15000` per store.
-
-To use a different budget:
+#### Run with GLMs (default)
 
 ```bash
-python run_m5_pipeline.py --budget-per-store 25000
+python run_m5_pipeline.py --model glm --budget-per-store 15000
 ```
 
-To use the CatBoost multi-quantile model instead of the GLMs:
+#### Run with CatBoost Multi-Quantile Regression
+
+Full default configuration (1000 iterations, 730 days of training history, 12 quantiles):
 
 ```bash
 python run_m5_pipeline.py --model catboost
-python run_m5_pipeline.py --model catboost --catboost-iterations 500 --catboost-train-days 365 --quantiles 0.05 0.1 0.25 0.5 0.75 0.9 0.95 0.99
 ```
 
-CatBoost outputs are written with a `_catboost` suffix (`predictions_catboost_<STORE_ID>.csv`, `wmape_store_catboost.csv`, `wmape_store_cat_catboost.csv`, `quantile_metrics_catboost.csv`, `feature_importance_catboost_<STORE_ID>.csv`), and the trained models are saved in `catboost_models_<STORE_ID>/` (reload with `CatBoostQuantileModel.load`).
+Faster configuration for experimentation (e.g., 400 iterations, 365 days of training history):
 
-Custom input and output directories can also be supplied:
+```powershell
+python run_m5_pipeline.py --model catboost --catboost-iterations 400 --catboost-train-days 365 --budget-per-store 15000
+```
+
+Custom quantile grid, output directory, and log file:
+
+```powershell
+python run_m5_pipeline.py --model catboost --catboost-iterations 400 --catboost-train-days 365 --quantiles 0.05 0.1 0.25 0.5 0.75 0.9 0.95 0.99 --out-dir data/output --log-file logs/m5_catboost.log
+```
+
+All CLI options for `run_m5_pipeline.py`:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | `glm` | Forecasting model family (`glm` or `catboost`) |
+| `--budget-per-store` | `15000` | Purchasing budget per store per decision day |
+| `--quantiles` | `0.05 0.1 ... 0.95 0.99` | Quantile levels predicted by CatBoost |
+| `--catboost-iterations` | `1000` | Max boosting iterations per horizon |
+| `--catboost-train-days` | `730` | Rolling history window in days (`0` = full history) |
+| `--synthetic-data-dir` | `data/synthetic_data` | Directory with `lead_time.parquet` and `newsvendor.parquet` |
+| `--m5-data-dir` | `data/m5-forecasting-accuracy/partitioned_data` | Directory with partitioned M5 Parquet files |
+| `--out-dir` | `data/output` | Directory for outputs |
+| `--log-file` | `None` | Optional path to a `.log` file to save progress logs |
+| `--log-level` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+### Step 3: Run the Unit Tests
 
 ```bash
-python run_m5_pipeline.py \
-  --synthetic-data-dir data/synthetic_data \
-  --m5-data-dir data/m5-forecasting-accuracy/partitioned_data \
-  --out-dir data/output \
-  --budget-per-store 25000
+python -m pytest tests -q
 ```
-
-The pipeline processes one store partition at a time to limit peak memory usage.
 
 ---
 
 ## Outputs
 
-For each store, the pipeline writes:
+For each processed store:
 
-### Model Data
-
-```text
-data/output/model_data_<STORE_ID>.csv
-```
-
-Contains fitted model metadata and coefficients for each training group and forecast horizon.
-
-### Predictions and Inventory Decisions
-
-```text
-data/output/predictions_<STORE_ID>.csv
-```
-
-Contains fields derived during forecasting and optimization, including:
-
-- predicted demand;
-- actual demand;
-- under-forecast error;
-- over-forecast error;
-- absolute error;
-- selling price;
-- purchase cost;
-- shortage penalty;
-- target inventory.
-
-### Forecasting Metrics
-
-```text
-data/output/wmape_store.csv
-data/output/wmape_store_cat.csv
-```
-
-These files summarize:
-
-- WMAPE;
-- under-forecast WMAPE;
-- over-forecast WMAPE;
-
-at store and store-category levels.
+- **Model artifacts:**
+  - GLM: `data/output/model_data_<STORE_ID>.csv`
+  - CatBoost: `data/output/catboost_models_<STORE_ID>/` (`.cbm` binaries + `catboost_meta.json`) and `data/output/feature_importance_catboost_<STORE_ID>.csv`
+- **Predictions and inventory targets:**
+  - `data/output/predictions_<STORE_ID>.csv` (GLM) or `data/output/predictions_catboost_<STORE_ID>.csv` (CatBoost), including horizon predictions, reconstructed means (`target_t_plus_<h>_mu`), quantile columns (`target_t_plus_<h>_q<tau>`), and `target_inventory`
+- **Forecasting & calibration summaries:**
+  - `data/output/wmape_store.csv` and `data/output/wmape_store_cat.csv` (or `*_catboost.csv`)
+  - `data/output/quantile_metrics_catboost.csv` (pinball loss and empirical coverage per horizon and quantile level)
 
 ---
 
 ## Using the Components Independently
 
-### Create an Empirical Discrete Distribution
+### 1. Reconstruct a Discrete Distribution from Predicted Quantiles
 
 ```python
 import numpy as np
+from quantile_distribution import DEFAULT_QUANTILES, quantiles_to_distribution
 
-from discrete_distribution import DiscreteDistribution
+levels = np.array(DEFAULT_QUANTILES)
+pred_quantiles = np.array([0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 14.0])
 
-observations = np.array([0, 1, 1, 2, 2, 2, 3])
-distribution = DiscreteDistribution.from_data(observations)
-
-print(distribution.pmf)
-print(distribution.quantile(0.95))
+dist = quantiles_to_distribution(levels, pred_quantiles)
+print("Support min/max:", dist.min, dist.max)
+print("95th percentile:", dist.quantile(0.95)[0])
 ```
 
-### Create a Parametric Distribution
-
-```python
-from discrete_distribution import DiscreteDistribution
-
-poisson_demand = DiscreteDistribution.from_parametric(
-    "poisson",
-    params=(4.5, 0),
-)
-```
-
-### Convolve Independent Demand Distributions
-
-```python
-weekly_demand = poisson_demand
-
-for _ in range(6):
-    weekly_demand = weekly_demand + poisson_demand
-```
-
-### Compute a Random Sum
+### 2. Compute a Numba-Accelerated Random Sum (DDLT)
 
 ```python
 import numpy as np
-
 from discrete_distribution import DiscreteDistribution
 
-lead_time = DiscreteDistribution(
-    pmf=np.array([0.2, 0.5, 0.3]),
-    min_value=1,
-)
+lead_time = DiscreteDistribution(pmf=np.array([0.2, 0.5, 0.3]), min_value=1)
 
 daily_forecasts = [
     DiscreteDistribution.from_parametric("poisson", (3.0, 0)),
@@ -522,280 +391,82 @@ daily_forecasts = [
 ]
 
 lead_time_demand = lead_time.random_sum(daily_forecasts)
+print("DDLT 90th percentile:", lead_time_demand.quantile(0.90)[0])
 ```
 
-### Solve a Multi-Product Newsvendor Problem
+### 3. Production Inference (`num_test_days=0`) with Future-Known Covariates
+
+When deploying on a custom retail dataset where future sales actuals are unknown, set `num_test_days=0` and pass negative lags (`lags=(-1, -2, ...)`) to attach known future calendar/promotion/price features from a table that extends beyond the last observed sales date:
 
 ```python
-import numpy as np
+from forecasters import CatBoostQuantileForecaster
+from time_series import DiscreteTimeSeries, compute_lead_time_demand
 
-from discrete_distribution import DiscreteDistribution
-from multi_product_newsvendor import solve_multi_product_newsvendor
-
-demand_distributions = [
-    DiscreteDistribution.from_parametric("poisson", (8.0, 0)),
-    DiscreteDistribution.from_parametric("poisson", (12.0, 0)),
-]
-
-inventory = solve_multi_product_newsvendor(
-    demand_distributions=demand_distributions,
-    selling_price=np.array([10.0, 15.0]),
-    purchase_cost=np.array([6.0, 9.0]),
-    shortage_penalty=np.array([2.0, 3.0]),
-    available_budget=150.0,
-)
-
-print(inventory)
-```
-
----
-
-## Configuration
-
-Important defaults are defined near the top of `run_m5_pipeline.py`:
-
-```python
-DEFAULT_SYNTHETIC_DATA_DIR = Path("data/synthetic_data")
-DEFAULT_M5_DATA_DIR = Path(
-    "data/m5-forecasting-accuracy/partitioned_data"
-)
-DEFAULT_OUT_DIR = Path("data/output")
-DEFAULT_BUDGET_PER_STORE = 15_000.0
-```
-
-Forecasting defaults are passed when constructing `DiscreteTimeSeries`:
-
-```python
 ts = DiscreteTimeSeries(
     sales_df,
-    ts_id_cols=[
-        "id",
-        "item_id",
-        "dept_id",
-        "cat_id",
-        "store_id",
-        "state_id",
-    ],
+    ts_id_cols=["store_id", "item_id"],
     period_col="day",
     var_col="demand",
+    lags=(1, 7, 14),
+    rolling_windows=(7, 28),
     num_future_targets=7,
-    num_test_days=28,
+    num_test_days=0,                # Production mode: train on 100% of observed history
+    use_one_hot_encoding=False,
+    downsample_zeros_frac=None,
+    fit_historical_distributions=False,
+)
+
+# Attach current and future-known covariates (e.g. promo_flag at t+1, t+2) from calendar_df:
+ts.add_calendar_features(calendar_df, "wday", use_day_of_week_features=True)
+ts.add_feature(calendar_df, "promo_flag", join_on=[], lags=(-1, -2))
+
+forecaster = CatBoostQuantileForecaster(
+    quantiles=(0.1, 0.25, 0.5, 0.75, 0.9, 0.95),
+    extra_cat_cols=("item_id",),
+)
+forecaster.fit(ts)
+
+# Forecast and compute DDLT at the latest observed period (ts.end_period):
+ddlt_predictions = compute_lead_time_demand(
+    ts,
+    forecaster,
+    lead_time=lead_time_distr,
+    lead_time_keys=["store_id"],
+    cycle_time=1,
+    return_distribution=True,
+    pred_first_day=True,
 )
 ```
 
-The default class-level feature settings are:
-
-```python
-lags=(1, 7, 14)
-rolling_windows=(7, 28)
-```
-
 ---
 
-## Data Notes
-
-The project uses real M5 data for:
-
-- historical unit sales;
-- calendar attributes;
-- events;
-- selling prices.
-
-The following inputs are currently synthetic:
-
-- store-level lead-time observations;
-- product purchase costs;
-- shortage penalties.
-
-Synthetic lead times are generated separately for each store. Purchase costs are sampled as a fraction of the latest observed selling price, while shortage penalties are derived from selling prices.
-
-Therefore, the current optimization outputs should be interpreted as a **methodological demonstration**, not as validated production inventory recommendations.
-
----
-
-## Performance and Memory
-
-The M5 dataset is large after converting the daily columns into a long table.
-
-The preprocessing stage uses Polars for:
-
-- lazy CSV scanning;
-- unpivoting;
-- joining;
-- Parquet serialization.
-
-Sales data is partitioned by store, and the main pipeline processes those store files sequentially. This reduces memory usage relative to training on the complete M5 panel at once.
-
-Model fitting can still be computationally expensive because multiple GLMs are trained across:
-
-- stores;
-- categories;
-- overdispersion groups;
-- forecast horizons.
-
-For development, consider filtering the data to one store or category before running the complete dataset.
-
----
-
-## Current Limitations
-
-- Inventory decisions are not yet evaluated through a historical replenishment simulation.
-- Lead-time and cost inputs are synthetic.
-- The forecasting layer currently supports only GLM-based Poisson and negative-binomial models.
-- The negative-binomial implementation should be validated carefully for parameter serialization and reconstruction.
-- Discrete probability distributions are truncated when an infinite-support parametric distribution is converted into a finite PMF.
-- PMF convolution can become expensive for distributions with wide support.
-- The newsvendor solver assumes separable product economics with a shared budget constraint.
-- The current forecast reporting focuses on point-error metrics; probabilistic calibration metrics are not yet included.
-- Automated tests and continuous integration are not yet included.
-
----
-
-## Next Steps
-
-### 1. Add Simulation-Based Backtesting
-
-Build a historical inventory simulation that evaluates decisions rather than forecasts alone.
-
-The simulation should:
-
-- move through the test period chronologically;
-- generate forecasts using only information available at each decision date;
-- sample or replay realized lead times;
-- place replenishment orders;
-- track outstanding inventory in transit;
-- update on-hand inventory after demand realization;
-- account for lost sales or backorders;
-- calculate holding, purchasing, shortage, and wastage costs;
-- compare optimized decisions against baseline policies.
-
-Potential baseline policies:
-
-- order-up-to based on mean demand;
-- fixed service-level inventory;
-- moving-average replenishment;
-- unconstrained newsvendor;
-- deterministic forecast plus safety stock.
-
-Recommended decision metrics:
-
-- total profit;
-- total cost;
-- fill rate;
-- cycle service level;
-- stockout frequency;
-- average inventory;
-- inventory turnover;
-- wastage or excess stock;
-- budget utilization.
-
-This will make it possible to answer the most important question:
-
-> Do better probabilistic forecasts produce better inventory decisions?
-
-### 2. Add CatBoost Quantile Regression
-
-Add CatBoost as a nonlinear forecasting alternative.
-
-The implementation could:
-
-- train separate models for selected quantiles;
-- use CatBoost's quantile loss;
-- handle categorical variables natively;
-- support grouped or global models;
-- compare CatBoost with the current Poisson and negative-binomial GLMs;
-- reconstruct a discrete predictive distribution from forecast quantiles.
-
-Example quantile levels:
-
-```text
-0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95
-```
-
-Important design considerations:
-
-- prevent quantile crossing;
-- interpolate between estimated quantiles;
-- define tail behavior outside the fitted quantile range;
-- preserve non-negative integer demand;
-- evaluate both calibration and downstream inventory performance.
-
-Possible probabilistic evaluation metrics:
-
-- pinball loss;
-- weighted interval score;
-- empirical coverage;
-- interval width;
-- PIT or randomized PIT diagnostics;
-- CRPS for discrete demand.
-
-### Additional Improvements
-
-- Add unit tests for distribution algebra and newsvendor optimality.
-- Add integration tests for a small M5 subset.
-- Add a command-line option to process selected stores or categories.
-- Store model metadata in JSON or Parquet rather than CSV-encoded dictionaries.
-- Add structured logging and remove debugging prints.
-- Add probabilistic calibration reports.
-- Add experiment configuration files.
-- Add reproducible benchmark scripts.
-- Add GitHub Actions for testing and linting.
-- Add API documentation and type-checking.
-- Parallelize independent store or model-group training where memory permits.
-
----
-
-## Suggested Development Roadmap
+## Development Roadmap
 
 ```text
 Phase 1 — Forecasting foundation
-  ✓ Time-series feature engineering
+  ✓ Time-series feature engineering (leak-free train/test & production mode)
   ✓ Poisson and negative-binomial regression
   ✓ Multi-horizon prediction
   ✓ Discrete predictive distributions
 
 Phase 2 — Decision layer
-  ✓ Lead-time demand calculation
-  ✓ Multi-product newsvendor
-  ✓ Shared budget constraint
+  ✓ Numba-accelerated lead-time demand calculation
+  ✓ Multi-product newsvendor with O(1)-memory quantile lookup
+  ✓ Per-day shared budget constraint
 
-Phase 3 — Evaluation
+Phase 3 — Model expansion & Architecture
+  ✓ CatBoost multi-quantile regression
+  ✓ Non-parametric quantile-to-distribution reconstruction
+  ✓ Composable Forecaster and DDLTCalculator abstractions
+  ✓ Future-known covariate leads for production inference
+  ✓ Unit test suite
+
+Phase 4 — Evaluation & Simulation
   □ Rolling-origin forecast backtesting
-  □ Inventory simulation
-  □ Decision-based metrics
-  □ Baseline policy comparison
-
-Phase 4 — Model expansion
-  ✓ CatBoost quantile regression
-  ✓ Quantile-to-distribution reconstruction
-  □ Calibration analysis
-  □ GLM versus CatBoost benchmarking
-
-Phase 5 — Engineering
-  □ Tests
-  □ Configuration management
-  □ CI/CD
-  □ Documentation
+  □ Multi-period inventory replenishment simulation with carry-over stock
+  □ Decision-based metrics (fill rate, realized profit, holding vs. shortage cost)
+  □ GLM versus CatBoost decision benchmarking
 ```
-
----
-
-## Reproducibility
-
-Synthetic data generators use NumPy's `default_rng` with a fixed default seed of `0`.
-
-The download script verifies the M5 archive using the expected MD5 checksum before extraction. Partial downloads are written to a temporary `.part` file and renamed only after verification.
-
-For fully reproducible experiments, record:
-
-- Python version;
-- dependency versions;
-- random seed;
-- data paths;
-- store/category filters;
-- forecasting configuration;
-- budget;
-- lead-time generation parameters.
 
 ---
 
@@ -809,6 +480,4 @@ The synthetic lead-time and economic inputs are not representative of any partic
 
 ## Acknowledgements
 
-This project uses the M5 Forecasting Accuracy dataset, originally released for the M5 competition.
-
-The dataset download used by the preprocessing script is hosted on Zenodo.
+This project uses the M5 Forecasting Accuracy dataset, originally released for the M5 competition and hosted on Zenodo.

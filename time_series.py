@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
@@ -21,7 +22,7 @@ from quantile_distribution import DEFAULT_QUANTILES
 if TYPE_CHECKING:
     from catboost_quantile import CatBoostQuantileModel
 
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def train_glm(
@@ -88,6 +89,7 @@ class DiscreteTimeSeries:
         downsample_zeros_frac: float | None = 0.1,
         fit_historical_distributions: bool = True,
     ):
+        t0 = time.perf_counter()
         self.ts_id_cols = list(ts_id_cols)
         self.var_col = var_col
         self.period_col = period_col
@@ -109,11 +111,18 @@ class DiscreteTimeSeries:
         self.categorical_feature_cols: list[str] = []
         self.test_start_period = None
         self.use_one_hot_encoding = use_one_hot_encoding
-        self.logger = logging.getLogger(__name__)
+        self.logger = logger
 
         # Compute all ts_id x period combinations:
         unique_ts_id = self.df[self.ts_id_cols].drop_duplicates()
         self.num_ts = len(unique_ts_id)
+        self.logger.info(
+            "Building panel for %d series across %d periods (%s to %s)...",
+            self.num_ts,
+            self.num_periods,
+            self.start_period,
+            self.end_period,
+        )
         unique_ts_id_period = pd.merge(
             unique_ts_id, pd.DataFrame({period_col: self.periods}), how="cross"
         )
@@ -127,6 +136,14 @@ class DiscreteTimeSeries:
         if fit_historical_distributions or use_best_fit_feature:
             self._fit_distributions(grouped, use_best_fit_feature, use_one_hot_encoding)
         self._engineer_features(lags, rolling_windows, num_future_targets, include_std_dev)
+        self.logger.info(
+            "Panel ready in %.2fs: %d rows, %d numerical features, %d categorical features, %d target horizons",
+            time.perf_counter() - t0,
+            len(self.df),
+            len(self.feature_cols),
+            len(self.categorical_feature_cols),
+            len(self.target_cols),
+        )
 
     def _add_test_flag(self, num_test_days: int):
         if num_test_days is not None and num_test_days > 0:
@@ -159,6 +176,14 @@ class DiscreteTimeSeries:
         include_std_dev: bool,
         apply_log_transformation: bool = True,
     ):
+        t0 = time.perf_counter()
+        self.logger.info(
+            "Engineering time-series features (lags=%s, rolling_windows=%s, include_std_dev=%s, horizons=%d)...",
+            lags,
+            rolling_windows,
+            include_std_dev,
+            num_future_targets,
+        )
         feature_df = self.df.copy().sort_values(by=self.ts_id_cols + [self.period_col])
         grouped_df = feature_df.groupby(self.ts_id_cols, observed=True)
 
@@ -204,6 +229,7 @@ class DiscreteTimeSeries:
 
         # Optionally downsample rows where both features and targets are all 0s in training data:
         if self.downsample_zeros_frac is not None and 0.0 < self.downsample_zeros_frac < 1.0:
+            rows_before = len(feature_df)
             mask = (feature_df[self.feature_cols].sum(axis=1) == 0) & (
                 feature_df[self.target_cols].fillna(0).sum(axis=1) == 0
             )
@@ -215,6 +241,13 @@ class DiscreteTimeSeries:
             zero_rows = feature_df[mask].sample(frac=self.downsample_zeros_frac, random_state=42)
             non_zero_rows = feature_df[~mask]
             feature_df = pd.concat([zero_rows, non_zero_rows])
+            self.logger.info(
+                "Downsampled all-zero training rows (frac=%.2f): %d -> %d rows in %.2fs",
+                self.downsample_zeros_frac,
+                rows_before,
+                len(feature_df),
+                time.perf_counter() - t0,
+            )
         self.df = feature_df
 
     def _create_tmp_col_for_train(self, col_name: str) -> str:
@@ -240,8 +273,9 @@ class DiscreteTimeSeries:
         use_best_fit_feature: bool = False,
         one_hot: bool = True,
     ):
+        t0 = time.perf_counter()
         tmp_col = self._create_tmp_col_for_train(self.var_col)
-        self.logger.info("fitting distributions...")
+        self.logger.info("Fitting historical parametric distributions across %d series...", self.num_ts)
 
         def distr_fit(group_df: pd.DataFrame) -> pd.Series:
             data = group_df[tmp_col].dropna().to_numpy(dtype=int)
@@ -262,7 +296,7 @@ class DiscreteTimeSeries:
         self.df["best_fit"] = self.df["best_fit"].astype("category")
 
         self.df.drop(columns=[tmp_col], inplace=True)
-        self.logger.info("distributions fitting completed")
+        self.logger.info("Historical distribution fitting completed in %.2fs", time.perf_counter() - t0)
 
         if use_best_fit_feature:
             if one_hot:
@@ -304,8 +338,8 @@ class DiscreteTimeSeries:
         if use_week_end_feature and use_day_of_week_features:
             raise ValueError("Only one of 'use_week_end_feature' or 'use_day_of_week_features' can be True")
 
+        self.logger.info("Adding calendar features (col=%s, weekend=%s, day_of_week=%s)...", day_of_week_col, use_week_end_feature, use_day_of_week_features)
         if day_of_week_col is not None and future_horizons:
-            # Delegate to add_feature with negative lags so future calendar rows beyond end_period are used
             lead_lags = tuple(-h for h in future_horizons if h > 0)
             self.add_feature(
                 df_calendar,
@@ -375,6 +409,15 @@ class DiscreteTimeSeries:
         lags are requested, those leads are computed on ``df_feature`` before merging so
         that the final historical periods still receive future covariate values in production.
         """
+        t0 = time.perf_counter()
+        self.logger.info(
+            "Adding external feature '%s' (join_on=%s, cat=%s, lags=%s, rolling=%s)...",
+            feature_name,
+            join_on,
+            is_cat_feature,
+            lags,
+            rolling_windows,
+        )
         df_feat = df_feature.copy()
         keys = list(join_on) + [self.period_col]
         df_feat = df_feat[keys + [feature_name]].drop_duplicates()
@@ -447,6 +490,7 @@ class DiscreteTimeSeries:
                 self.categorical_feature_cols.append(f)
         else:
             self.feature_cols.extend(feature_list)
+        self.logger.info("Feature '%s' added in %.2fs", feature_name, time.perf_counter() - t0)
 
     # ------------------------------------------------------------------
     # Delegation methods to GLMForecaster, CatBoostQuantileForecaster, and DDLTCalculator
@@ -582,7 +626,7 @@ def compute_lead_time_demand(
             lead_time_keys=lead_time_keys,
             cycle_time=cycle_time,
             service_levels=service_levels,
-            return_distribution=return_distribution,
+            return_distribution=service_levels is None if return_distribution else return_distribution,
             pred_first_day=pred_first_day,
             model=model_data,
         )

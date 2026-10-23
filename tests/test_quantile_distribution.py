@@ -224,3 +224,22 @@ def test_production_mode_with_future_covariates_and_forecasters():
     )
     assert len(ddlt_df) == 2
     assert (ddlt_df["target_inventory"] >= 0).all()
+
+
+def test_setup_logging_writes_log_file(tmp_path):
+    import logging
+    from logging_utils import setup_logging
+
+    log_path = tmp_path / "pipeline_run.log"
+    setup_logging(log_file=log_path, level="INFO")
+    test_logger = logging.getLogger("test_logger")
+    test_logger.info("Progress check: step %d/%d", 1, 3)
+
+    for h in logging.getLogger().handlers:
+        h.flush()
+
+    assert log_path.exists()
+    content = log_path.read_text(encoding="utf-8")
+    assert "Progress check: step 1/3" in content
+    assert "test_logger" in content
+

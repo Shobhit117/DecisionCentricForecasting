@@ -1,15 +1,20 @@
 import argparse
-import re
 import gc
+import logging
+import re
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from forecasters import CatBoostQuantileForecaster, GLMForecaster, evaluate_quantile_forecasts
-from time_series import DiscreteTimeSeries, compute_lead_time_demand, compute_distribution_dict
+from logging_utils import setup_logging
 from multi_product_newsvendor import _solve_multi_product_newsvendor
 from quantile_distribution import DEFAULT_QUANTILES
+from time_series import DiscreteTimeSeries, compute_distribution_dict, compute_lead_time_demand
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SYNTHETIC_DATA_DIR = Path("data/synthetic_data")
 DEFAULT_M5_DATA_DIR = Path("data/m5-forecasting-accuracy/partitioned_data")
@@ -71,6 +76,18 @@ def parse_args():
         default=DEFAULT_CATBOOST_TRAIN_DAYS,
         help=f"Days of history used to train CatBoost; use 0 for the full history (default: {DEFAULT_CATBOOST_TRAIN_DAYS}).",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional path to a .log file to save pipeline logs (in addition to console output).",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging verbosity level (default: INFO).",
+    )
     return parser.parse_args()
 
 
@@ -111,10 +128,16 @@ def main(
     quantiles=DEFAULT_QUANTILES,
     catboost_iterations=DEFAULT_CATBOOST_ITERATIONS,
     catboost_train_days=DEFAULT_CATBOOST_TRAIN_DAYS,
+    log_file=None,
+    log_level="INFO",
 ):
+    setup_logging(log_file=log_file, level=log_level)
+    pipeline_t0 = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
     # GLM outputs keep their original file names; other models get a suffix.
     suffix = "" if model == "glm" else f"_{model}"
+
+    logger.info("Loading calendar, price, lead-time, and newsvendor tables...")
     calendar_df = pd.read_parquet(m5_data_dir / 'calendar.parquet')
     prices_df = pd.read_parquet(m5_data_dir / 'price.parquet')
     prices_df['sell_price'] = np.log1p(prices_df['sell_price'])
@@ -136,12 +159,19 @@ def main(
         df['under_wmape'] = np.round(100 * df['under_diff'] / df['actual'], 2)
         df['over_wmape'] = np.round(100 * df['over_diff'] / df['actual'], 2)
 
-    for item in m5_data_dir.iterdir():
-        if not item.name.startswith('sales_data'):
-            continue
+    store_files = sorted(p for p in m5_data_dir.iterdir() if p.name.startswith('sales_data'))
+    for store_idx, item in enumerate(store_files, start=1):
+        store_t0 = time.perf_counter()
         sales_df = pd.read_parquet(item)
         store_name = re.search(r"sales_data_([^.]+)\.parquet", item.name).group(1)
-        print(f"Training Forecasting Model ({model}) for store: {store_name}")
+        logger.info(
+            "=== [%d/%d] Processing store %s (model=%s, budget=%.2f/day) ===",
+            store_idx,
+            len(store_files),
+            store_name,
+            model,
+            budget_per_store,
+        )
 
         needs_fallback_distr = (lead_time_distr[store_name].max + cycle_time) > horizon
         ts = build_time_series(
@@ -149,11 +179,13 @@ def main(
         )
         del sales_df; gc.collect()
 
-        print(f"null values in price column: {ts.df['sell_price'].isna().sum()}")
+        logger.info("Null values in sell_price column: %d", int(ts.df['sell_price'].isna().sum()))
         if model == "glm":
             forecaster = GLMForecaster(train_groups=['store_id', 'cat_id'])
             model_data = forecaster.fit(ts)
-            model_data.to_csv(out_dir / f'model_data_{store_name}.csv', index=False)
+            model_path = out_dir / f'model_data_{store_name}.csv'
+            model_data.to_csv(model_path, index=False)
+            logger.info("Saved GLM model metadata to %s", model_path)
         else:
             forecaster = CatBoostQuantileForecaster(
                 quantiles=quantiles,
@@ -161,8 +193,11 @@ def main(
                 catboost_params={'iterations': catboost_iterations},
             )
             model_data = forecaster.fit(ts)
-            model_data.save(out_dir / f'catboost_models_{store_name}')
-            model_data.feature_importance().to_csv(out_dir / f'feature_importance{suffix}_{store_name}.csv', index=False)
+            models_dir = out_dir / f'catboost_models_{store_name}'
+            model_data.save(models_dir)
+            fi_path = out_dir / f'feature_importance{suffix}_{store_name}.csv'
+            model_data.feature_importance().to_csv(fi_path, index=False)
+            logger.info("Saved CatBoost models to %s and feature importances to %s", models_dir, fi_path)
 
         predictions = compute_lead_time_demand(
             ts,
@@ -184,7 +219,6 @@ def main(
         del ts; gc.collect()
 
         # Solve newsvendor model independently on each test day (Option A):
-        print(f"Solving newsvendor model for store: {store_name}")
         store_newsvendor_df = newsvendor_df
         if 'sell_price' in predictions.columns:
             store_newsvendor_df = newsvendor_df.drop(columns='sell_price')
@@ -194,7 +228,9 @@ def main(
         predictions = _solve_multi_product_newsvendor(
             predictions, budget_per_store, group_cols=['store_id', 'day']
         )
-        predictions.to_csv(out_dir / f'predictions{suffix}_{store_name}.csv', index=False)
+        pred_path = out_dir / f'predictions{suffix}_{store_name}.csv'
+        predictions.to_csv(pred_path, index=False)
+        logger.info("Saved predictions and inventory decisions to %s", pred_path)
 
         # Compute Forecasting Metrics:
         df_wmape_store_cat = predictions.groupby(['store_id', 'cat_id'], as_index=False, observed=True)[
@@ -205,6 +241,14 @@ def main(
         ].sum()
         _compute_wmape(df_wmape_store_cat)
         _compute_wmape(df_wmape_store)
+        logger.info(
+            "Store %s WMAPE=%.2f%% (under=%.2f%%, over=%.2f%%) in %.2fs",
+            store_name,
+            float(df_wmape_store['wmape'].iloc[0]),
+            float(df_wmape_store['under_wmape'].iloc[0]),
+            float(df_wmape_store['over_wmape'].iloc[0]),
+            time.perf_counter() - store_t0,
+        )
         wmape_store_cat.append(df_wmape_store_cat)
         wmape_store.append(df_wmape_store)
         del predictions; gc.collect()
@@ -216,8 +260,11 @@ def main(
     wmape_store_cat.to_csv(out_dir / f'wmape_store_cat{suffix}.csv', index=False)
     if quantile_metrics:
         quantile_metrics = pd.concat(quantile_metrics)
-        quantile_metrics.to_csv(out_dir / f'quantile_metrics{suffix}.csv', index=False)
-        print(quantile_metrics.groupby('quantile')[['pinball_loss', 'coverage']].mean())
+        qm_path = out_dir / f'quantile_metrics{suffix}.csv'
+        quantile_metrics.to_csv(qm_path, index=False)
+        summary_str = quantile_metrics.groupby('quantile')[['pinball_loss', 'coverage']].mean().to_string()
+        logger.info("Quantile evaluation summary (saved to %s):\n%s", qm_path, summary_str)
+    logger.info("Pipeline finished in %.2fs", time.perf_counter() - pipeline_t0)
 
 
 if __name__ == '__main__':
@@ -231,4 +278,6 @@ if __name__ == '__main__':
         quantiles=tuple(sorted(args.quantiles)),
         catboost_iterations=args.catboost_iterations,
         catboost_train_days=args.catboost_train_days,
+        log_file=args.log_file,
+        log_level=args.log_level,
     )
