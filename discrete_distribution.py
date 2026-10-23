@@ -129,7 +129,7 @@ class DiscreteDistribution:
         return _pmf_quantiles_numba(self.pmf, self.min, self.bin_size, q_arr)
 
     def __add__(self, other : "DiscreteDistribution") -> "DiscreteDistribution":
-        from ddlt import _convolve_1d_numba
+        from ddlt import DEFAULT_TAIL_TOL, _convolve_1d_numba, _trim_pmf_numba
 
         if self.bin_size != other.bin_size:
             self = self.copy()
@@ -142,6 +142,7 @@ class DiscreteDistribution:
         new_min = self.min + other.min
         new_pmf = _convolve_1d_numba(self.pmf, other.pmf)
         new_pmf /= np.sum(new_pmf)
+        new_pmf, new_min = _trim_pmf_numba(new_pmf, new_min, new_bin_size, DEFAULT_TAIL_TOL)
         return DiscreteDistribution(new_pmf, new_min, new_bin_size)
 
     def _align_bin_size(self):
@@ -155,12 +156,10 @@ class DiscreteDistribution:
         self.pmf = np.ascontiguousarray(np.pad(self.pmf, (shift, 0), mode='constant'), dtype=np.float64)
         self.merge_bins(original_bin_size)
     
-    def _trim_pmf(self, tol : float = 0.0):
-        i = len(self.pmf) - 1
-        while self.pmf[i] <= tol:
-            i -= 1
-        self.pmf = np.ascontiguousarray(self.pmf[:(i+1)], dtype=np.float64)
-        self.pmf /= np.sum(self.pmf)
+    def _trim_pmf(self, tol : float = 1e-9):
+        from ddlt import _trim_pmf_numba
+
+        self.pmf, self.min = _trim_pmf_numba(self.pmf, self.min, self.bin_size, tol)
 
     def shift(self, by : int):
         self.min += int(by)
@@ -205,7 +204,12 @@ class DiscreteDistribution:
         sum_distr._trim_pmf(0)
         return sum_distr
 
-    def random_sum(self, rv_list: list["DiscreteDistribution"], default_distr : "DiscreteDistribution" = None) -> "DiscreteDistribution":
+    def random_sum(
+        self,
+        rv_list: list["DiscreteDistribution"],
+        default_distr: "DiscreteDistribution" = None,
+        tail_tol: float = 1e-9,
+    ) -> "DiscreteDistribution":
         from ddlt import _random_sum_aligned_numba
 
         if self.min < 0:
@@ -246,7 +250,7 @@ class DiscreteDistribution:
             rv_pmfs.append(rv.pmf)
             rv_mins[idx] = rv.min
 
-        pmf, overall_min = _random_sum_aligned_numba(self.pmf, self.min, rv_pmfs, rv_mins, bin_size)
+        pmf, overall_min = _random_sum_aligned_numba(self.pmf, self.min, rv_pmfs, rv_mins, bin_size, tail_tol)
         return DiscreteDistribution(pmf, overall_min, bin_size)
 
     def plot(self, label : str = None

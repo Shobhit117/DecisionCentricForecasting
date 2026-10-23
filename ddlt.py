@@ -25,6 +25,7 @@ from discrete_distribution import DiscreteDistribution
 logger = logging.getLogger(__name__)
 
 _LEFT_LIMIT_EPS = 1e-9
+DEFAULT_TAIL_TOL = 1e-9
 
 
 @njit(cache=True)
@@ -39,6 +40,39 @@ def _convolve_1d_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
             for j in range(nb):
                 out[i + j] += ai * b[j]
     return out
+
+
+@njit(cache=True)
+def _trim_pmf_numba(
+    pmf: np.ndarray,
+    min_val: int,
+    bin_size: int,
+    tail_tol: float = DEFAULT_TAIL_TOL,
+) -> tuple[np.ndarray, int]:
+    """
+    Trims leading and trailing bins with probability ``<= tail_tol``, shifts
+    ``min_val`` when leading bins are removed, and renormalizes the PMF.
+    """
+    n = len(pmf)
+    if n <= 1 or tail_tol < 0.0:
+        return pmf, min_val
+
+    first = 0
+    while first < n - 1 and pmf[first] <= tail_tol:
+        first += 1
+
+    last = n - 1
+    while last > first and pmf[last] <= tail_tol:
+        last -= 1
+
+    if first == 0 and last == n - 1:
+        return pmf, min_val
+
+    trimmed = pmf[first : last + 1].copy()
+    s = np.sum(trimmed)
+    if s > 0.0:
+        trimmed /= s
+    return trimmed, min_val + first * bin_size
 
 
 @njit(cache=True)
@@ -91,65 +125,72 @@ def _random_sum_aligned_numba(
     rv_pmfs: NumbaList,
     rv_mins: np.ndarray,
     bin_size: int,
+    tail_tol: float = DEFAULT_TAIL_TOL,
 ) -> tuple[np.ndarray, int]:
     """
     Computes the PMF and minimum support value of the random sum
     ``S = X_1 + ... + X_L`` where ``L ~ (lt_pmf, lt_min, bin_size=1)`` and each ``X_j``
     already shares ``bin_size`` with ``rv_mins[j]`` divisible by ``bin_size``.
 
-    Accumulates weighted convolutions directly into a single 1D output vector instead
-    of allocating an intermediate 2D ``(height, width)`` matrix.
+    Trims negligible tails (``<= tail_tol``) after each convolution step so intermediate
+    support sizes stay compact across long lead times, and accumulates weighted
+    convolutions into a single 1D output vector without allocating a 2D matrix.
     """
     lt_max = lt_min + len(lt_pmf) - 1
+    n_terms = len(lt_pmf)
 
-    # Pass 1: determine overall_min and overall_max across n in [lt_min, lt_max]
-    cum_min = 0
-    cum_max = 0
-    overall_min = 0
-    overall_max = 0
-    initialized = False
+    saved_pmfs = NumbaList()
+    saved_mins = np.empty(n_terms, dtype=np.int64)
+    saved_weights = np.empty(n_terms, dtype=np.float64)
+    n_saved = 0
 
-    for n in range(lt_max + 1):
-        if n >= lt_min:
-            if not initialized:
-                overall_min = cum_min
-                overall_max = cum_max
-                initialized = True
-            else:
-                if cum_min < overall_min:
-                    overall_min = cum_min
-                if cum_max > overall_max:
-                    overall_max = cum_max
-        if n < lt_max:
-            r_min = int(rv_mins[n])
-            r_len = len(rv_pmfs[n])
-            cum_min += r_min
-            cum_max += r_min + bin_size * (r_len - 1)
-
-    width = (overall_max - overall_min) // bin_size + 1
-    out_pmf = np.zeros(width, dtype=np.float64)
-
-    # Pass 2: iteratively convolve and accumulate weighted PMF slices
     curr_pmf = np.ones(1, dtype=np.float64)
     curr_min = 0
+    overall_min = 0
+    overall_max = 0
 
     for n in range(lt_max + 1):
         if n >= lt_min:
             w = lt_pmf[n - lt_min]
             if w > 0.0:
-                start = (curr_min - overall_min) // bin_size
-                for k in range(len(curr_pmf)):
-                    out_pmf[start + k] += w * curr_pmf[k]
+                c_max = curr_min + bin_size * (len(curr_pmf) - 1)
+                if n_saved == 0:
+                    overall_min = curr_min
+                    overall_max = c_max
+                else:
+                    if curr_min < overall_min:
+                        overall_min = curr_min
+                    if c_max > overall_max:
+                        overall_max = c_max
+                saved_pmfs.append(curr_pmf)
+                saved_mins[n_saved] = curr_min
+                saved_weights[n_saved] = w
+                n_saved += 1
         if n < lt_max:
-            curr_pmf = _convolve_1d_numba(curr_pmf, rv_pmfs[n])
+            r_pmf, r_min = _trim_pmf_numba(rv_pmfs[n], int(rv_mins[n]), bin_size, tail_tol)
+            curr_pmf = _convolve_1d_numba(curr_pmf, r_pmf)
             s = np.sum(curr_pmf)
             if s > 0.0:
                 curr_pmf /= s
-            curr_min += int(rv_mins[n])
+            curr_min += r_min
+            curr_pmf, curr_min = _trim_pmf_numba(curr_pmf, curr_min, bin_size, tail_tol)
+
+    if n_saved == 0:
+        return np.ones(1, dtype=np.float64), 0
+
+    width = (overall_max - overall_min) // bin_size + 1
+    out_pmf = np.zeros(width, dtype=np.float64)
+    for idx in range(n_saved):
+        p = saved_pmfs[idx]
+        w = saved_weights[idx]
+        start = (saved_mins[idx] - overall_min) // bin_size
+        for k in range(len(p)):
+            out_pmf[start + k] += w * p[k]
 
     total = np.sum(out_pmf)
     if total > 0.0:
         out_pmf /= total
+    out_pmf, overall_min = _trim_pmf_numba(out_pmf, overall_min, bin_size, tail_tol)
     return out_pmf, overall_min
 
 
@@ -259,6 +300,7 @@ def _ddlt_from_quantiles_row_numba(
     default_pmf: np.ndarray,
     default_min: int,
     tol: float = 1e-4,
+    tail_tol: float = DEFAULT_TAIL_TOL,
 ) -> tuple[np.ndarray, int]:
     """
     Converts one item's multi-horizon quantile matrix ``(horizon, n_quantiles)`` into
@@ -278,7 +320,7 @@ def _ddlt_from_quantiles_row_numba(
         rv_pmfs.append(default_pmf)
         rv_mins[h] = default_min
 
-    return _random_sum_aligned_numba(lt_pmf, lt_min, rv_pmfs, rv_mins, 1)
+    return _random_sum_aligned_numba(lt_pmf, lt_min, rv_pmfs, rv_mins, 1, tail_tol)
 
 
 class DDLTCalculator:
@@ -296,6 +338,7 @@ class DDLTCalculator:
         cycle_time: int = 0,
         lead_time_keys: list[str] | None = None,
         tol: float = 1e-4,
+        tail_tol: float = DEFAULT_TAIL_TOL,
     ):
         if cycle_time < 0:
             raise ValueError("'cycle_time' must be non-negative.")
@@ -303,6 +346,7 @@ class DDLTCalculator:
         self.cycle_time = cycle_time
         self.lead_time_keys = list(lead_time_keys) if lead_time_keys else []
         self.tol = tol
+        self.tail_tol = tail_tol
 
     def _shifted_lead_time(self, lt: DiscreteDistribution) -> DiscreteDistribution:
         lt_with_cycle = lt.copy()
@@ -406,7 +450,7 @@ class DDLTCalculator:
                 default_min = 0
 
             ddlt_pmf, ddlt_min = _ddlt_from_quantiles_row_numba(
-                lt_pmf, lt_min, levels, row_quantiles, default_pmf, default_min, self.tol
+                lt_pmf, lt_min, levels, row_quantiles, default_pmf, default_min, self.tol, self.tail_tol
             )
             if return_distribution:
                 results.append(DiscreteDistribution(ddlt_pmf, ddlt_min, 1))
@@ -495,7 +539,7 @@ class DDLTCalculator:
                     p = 1.0 / (1.0 + curr_mu * curr_alpha)
                     demand.append(DiscreteDistribution.from_parametric("nbinom", (n, p, 0), tol=self.tol))
 
-            demand_during_lead_time = lt_with_cycle.random_sum(demand, default_demand)
+            demand_during_lead_time = lt_with_cycle.random_sum(demand, default_demand, tail_tol=self.tail_tol)
             if return_distribution:
                 results.append(demand_during_lead_time)
             else:
