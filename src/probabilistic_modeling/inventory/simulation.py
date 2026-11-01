@@ -26,9 +26,9 @@ import pandas as pd
 from numba import njit, prange
 from numba.typed import List as NumbaList
 
-from ddlt import _batch_pmf_quantiles_numba, _pmf_quantile_scalar_numba
-from discrete_distribution import DiscreteDistribution
-from multi_product_newsvendor import _solve_multi_product_newsvendor
+from probabilistic_modeling.ddlt import _batch_pmf_quantiles_numba, _pmf_quantile_scalar_numba
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution
+from probabilistic_modeling.inventory.newsvendor import _solve_multi_product_newsvendor
 
 logger = logging.getLogger(__name__)
 

@@ -1,25 +1,20 @@
-import os
-import sys
-
 import numpy as np
 import pandas as pd
 import pytest
 from scipy import stats
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from ddlt import DDLTCalculator, _ddlt_from_quantiles_row_numba  # noqa: E402
-from discrete_distribution import DiscreteDistribution  # noqa: E402
-from forecasters import CatBoostQuantileForecaster, GLMForecaster  # noqa: E402
-from multi_product_newsvendor import _solve_multi_product_newsvendor  # noqa: E402
-from quantile_distribution import (  # noqa: E402
+from probabilistic_modeling.ddlt import DDLTCalculator, _ddlt_from_quantiles_row_numba  # noqa: E402
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution  # noqa: E402
+from probabilistic_modeling.models.forecasters import CatBoostQuantileForecaster, GLMForecaster  # noqa: E402
+from probabilistic_modeling.inventory.newsvendor import _solve_multi_product_newsvendor  # noqa: E402
+from probabilistic_modeling.distributions.quantile import (  # noqa: E402
     DEFAULT_QUANTILES,
     distribution_mean,
     quantiles_to_distribution,
     quantiles_to_mean,
     rearrange_quantiles,
 )
-from time_series import DiscreteTimeSeries, compute_lead_time_demand  # noqa: E402
+from probabilistic_modeling.time_series import DiscreteTimeSeries, compute_lead_time_demand  # noqa: E402
 
 LEVELS = np.array(DEFAULT_QUANTILES)
 
@@ -228,7 +223,7 @@ def test_production_mode_with_future_covariates_and_forecasters():
 
 def test_setup_logging_writes_log_file(tmp_path):
     import logging
-    from logging_utils import setup_logging
+    from probabilistic_modeling.logging_utils import setup_logging
 
     log_path = tmp_path / "pipeline_run.log"
     setup_logging(log_file=log_path, level="INFO")
@@ -245,8 +240,8 @@ def test_setup_logging_writes_log_file(tmp_path):
 
 
 def test_continuous_and_discrete_predictive_distribution_interface():
-    from discrete_distribution import PredictiveDistribution
-    from quantile_distribution import ContinuousQuantileDistribution, quantile_crps
+    from probabilistic_modeling.distributions.discrete import PredictiveDistribution
+    from probabilistic_modeling.distributions.quantile import ContinuousQuantileDistribution, quantile_crps
 
     # 1. DiscreteDistribution implements PredictiveDistribution, moments, cdf_at, crps, sample
     d = DiscreteDistribution.from_parametric("poisson", (5.0, 0))
@@ -276,7 +271,7 @@ def test_continuous_and_discrete_predictive_distribution_interface():
 
 
 def test_fft_convolution_matches_direct_numba_convolution():
-    from ddlt import DEFAULT_TAIL_TOL, _direct_convolve_1d_numba, _fft_convolve_1d_numba, _trim_pmf_numba
+    from probabilistic_modeling.ddlt import DEFAULT_TAIL_TOL, _direct_convolve_1d_numba, _fft_convolve_1d_numba, _trim_pmf_numba
 
     # Create two 600-point distributions so len(a)*len(b) = 360,000 > FFT_CONVOLVE_THRESHOLD (262,144)
     p = np.linspace(1.0, 3.0, 600)
@@ -342,7 +337,7 @@ def test_reusable_forecaster_save_load_and_multi_prediction(tmp_path):
        and brand-new raw sales + covariate DataFrames (`predict_from_raw`), as well as DDLT
        with fallback distributions when L + R > horizon.
     """
-    from forecasters import evaluate_quantile_forecasts, load_forecaster
+    from probabilistic_modeling.models.forecasters import evaluate_quantile_forecasts, load_forecaster
 
     rng = np.random.default_rng(123)
     days = list(range(1, 51))
@@ -464,7 +459,7 @@ def test_reusable_forecaster_save_load_and_multi_prediction(tmp_path):
 
 def test_inventory_simulation_quantile_newsvendor_and_mc():
     """Verify multi-period inventory simulation with quantile policy, newsvendor policy, and Monte Carlo."""
-    from inventory_simulation import InventorySimulator, simulate_inventory
+    from probabilistic_modeling.inventory.simulation import InventorySimulator, simulate_inventory
 
     rng = np.random.default_rng(123)
     rows = []

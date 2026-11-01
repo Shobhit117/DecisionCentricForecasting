@@ -1,9 +1,17 @@
+"""
+Download, verify, and preprocess the M5 dataset (plus synthetic lead-time / economics inputs).
+
+Run from the repository root:
+
+    python scripts/process_m5_dataset.py --download
+"""
 from __future__ import annotations
 import argparse
 import gc
 import hashlib
 import logging
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -11,7 +19,12 @@ import numpy as np
 import polars as pl
 import requests
 
-from logging_utils import setup_logging
+try:  # allow running from a fresh clone without `pip install -e .`
+    import probabilistic_modeling  # noqa: F401
+except ImportError:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from probabilistic_modeling.logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 

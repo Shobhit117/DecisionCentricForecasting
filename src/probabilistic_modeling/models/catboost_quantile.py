@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from quantile_distribution import rearrange_quantiles, validate_quantile_levels
+from probabilistic_modeling.distributions.quantile import rearrange_quantiles, validate_quantile_levels
 
 logger = logging.getLogger(__name__)
 

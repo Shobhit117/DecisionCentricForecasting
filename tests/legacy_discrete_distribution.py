@@ -1,6 +1,6 @@
-﻿import numpy as np
+import numpy as np
 from scipy import stats
-import probability_utils as prob
+from probabilistic_modeling.distributions import probability_utils as prob
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 

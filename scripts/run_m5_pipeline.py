@@ -1,18 +1,31 @@
+"""
+End-to-end M5 example: forecast (GLM or CatBoost) -> DDLT -> inventory target -> simulation.
+
+Run from the repository root:
+
+    python scripts/run_m5_pipeline.py --model glm
+"""
 import argparse
 import gc
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from forecasters import CatBoostQuantileForecaster, GLMForecaster, evaluate_quantile_forecasts
-from inventory_simulation import resolve_target_inventory, simulate_inventory
-from logging_utils import setup_logging
-from quantile_distribution import DEFAULT_QUANTILES
-from time_series import DiscreteTimeSeries, compute_distribution_dict, compute_lead_time_demand
+try:  # allow running from a fresh clone without `pip install -e .`
+    import probabilistic_modeling  # noqa: F401
+except ImportError:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from probabilistic_modeling.models.forecasters import CatBoostQuantileForecaster, GLMForecaster, evaluate_quantile_forecasts
+from probabilistic_modeling.inventory.simulation import resolve_target_inventory, simulate_inventory
+from probabilistic_modeling.logging_utils import setup_logging
+from probabilistic_modeling.distributions.quantile import DEFAULT_QUANTILES
+from probabilistic_modeling.time_series import DiscreteTimeSeries, compute_distribution_dict, compute_lead_time_demand
 
 logger = logging.getLogger(__name__)
 

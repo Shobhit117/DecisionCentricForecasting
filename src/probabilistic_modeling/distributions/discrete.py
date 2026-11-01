@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 import numpy as np
 from scipy import signal, stats
-import probability_utils as prob
+from probabilistic_modeling.distributions import probability_utils as prob
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 from numba.typed import List as NumbaList
@@ -121,7 +121,7 @@ class DiscreteDistribution(PredictiveDistribution):
         return out
 
     def crps(self, y: float | list | np.ndarray) -> float | np.ndarray:
-        from ddlt import _pmf_crps_numba, _pmf_crps_scalar_numba
+        from probabilistic_modeling.ddlt import _pmf_crps_numba, _pmf_crps_scalar_numba
 
         if np.ndim(y) == 0:
             return float(_pmf_crps_scalar_numba(self.pmf, self.min, self.bin_size, float(y)))
@@ -200,7 +200,7 @@ class DiscreteDistribution(PredictiveDistribution):
             self.merge_bins(new_bin_size)
     
     def quantile(self, q: list | np.ndarray | float) -> np.ndarray:
-        from ddlt import _pmf_quantiles_numba
+        from probabilistic_modeling.ddlt import _pmf_quantiles_numba
 
         q_arr = np.atleast_1d(np.asarray(q, dtype=np.float64))
         if np.any((q_arr < 0) | (q_arr > 1)):
@@ -208,7 +208,7 @@ class DiscreteDistribution(PredictiveDistribution):
         return _pmf_quantiles_numba(self.pmf, self.min, self.bin_size, q_arr)
 
     def __add__(self, other : "DiscreteDistribution") -> "DiscreteDistribution":
-        from ddlt import DEFAULT_TAIL_TOL, _convolve_1d_numba, _trim_pmf_numba
+        from probabilistic_modeling.ddlt import DEFAULT_TAIL_TOL, _convolve_1d_numba, _trim_pmf_numba
 
         if self.bin_size != other.bin_size:
             self = self.copy()
@@ -236,7 +236,7 @@ class DiscreteDistribution(PredictiveDistribution):
         self.merge_bins(original_bin_size)
     
     def _trim_pmf(self, tol : float = 1e-9):
-        from ddlt import _trim_pmf_numba
+        from probabilistic_modeling.ddlt import _trim_pmf_numba
 
         self.pmf, self.min = _trim_pmf_numba(self.pmf, self.min, self.bin_size, tol)
 
@@ -289,7 +289,7 @@ class DiscreteDistribution(PredictiveDistribution):
         default_distr: "DiscreteDistribution" = None,
         tail_tol: float = 1e-9,
     ) -> "DiscreteDistribution":
-        from ddlt import _random_sum_aligned_numba
+        from probabilistic_modeling.ddlt import _random_sum_aligned_numba
 
         if self.min < 0:
             raise ValueError("Number of summands must have non-negative support.")

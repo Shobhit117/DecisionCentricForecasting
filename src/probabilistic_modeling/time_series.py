@@ -10,9 +10,9 @@ import numpy as np
 import pandas as pd
 from pandas.core.groupby.generic import DataFrameGroupBy
 
-from ddlt import DDLTCalculator
-from discrete_distribution import DiscreteDistribution, compute_best_fit_distribution
-from forecasters import (
+from probabilistic_modeling.ddlt import DDLTCalculator
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution, compute_best_fit_distribution
+from probabilistic_modeling.models.forecasters import (
     CatBoostQuantileForecaster,
     GLMForecaster,
     ProbabilisticForecaster,
@@ -20,10 +20,10 @@ from forecasters import (
     evaluate_quantile_forecasts,
     train_single_glm,
 )
-from quantile_distribution import DEFAULT_QUANTILES
+from probabilistic_modeling.distributions.quantile import DEFAULT_QUANTILES
 
 if TYPE_CHECKING:
-    from catboost_quantile import CatBoostQuantileModel
+    from probabilistic_modeling.models.catboost_quantile import CatBoostQuantileModel
 
 logger = logging.getLogger(__name__)
 

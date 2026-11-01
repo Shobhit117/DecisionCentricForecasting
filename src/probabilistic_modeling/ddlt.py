@@ -20,7 +20,7 @@ import pandas as pd
 from numba import njit, prange
 from numba.typed import List as NumbaList
 
-from discrete_distribution import DiscreteDistribution
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution
 
 logger = logging.getLogger(__name__)
 
@@ -587,8 +587,8 @@ class DDLTCalculator:
         period_col: str = "day",
     ) -> pd.DataFrame:
         """Computes DDLT from multi-horizon quantile columns for one lead-time group."""
-        from catboost_quantile import quantile_col_name
-        from quantile_distribution import validate_quantile_levels
+        from probabilistic_modeling.models.catboost_quantile import quantile_col_name
+        from probabilistic_modeling.distributions.quantile import validate_quantile_levels
 
         t0 = time.perf_counter()
         if pred_first_day:

@@ -28,8 +28,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from discrete_distribution import DiscreteDistribution, PredictiveDistribution
-from ddlt import _quantiles_to_pmf_numba, _quantiles_to_mean_batch_numba
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution, PredictiveDistribution
+from probabilistic_modeling.ddlt import _quantiles_to_pmf_numba, _quantiles_to_mean_batch_numba
 
 DEFAULT_QUANTILES: tuple[float, ...] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
 

@@ -3,8 +3,8 @@ import time
 import numpy as np
 import pandas as pd
 from numba.typed import List as NumbaList
-from discrete_distribution import DiscreteDistribution
-from ddlt import _batch_pmf_quantiles_numba
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution
+from probabilistic_modeling.ddlt import _batch_pmf_quantiles_numba
 
 logger = logging.getLogger(__name__)
 

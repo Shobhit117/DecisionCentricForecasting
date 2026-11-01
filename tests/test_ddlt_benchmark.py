@@ -15,13 +15,12 @@ import numpy as np
 import pytest
 from scipy import stats
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for legacy_discrete_distribution
 
 import legacy_discrete_distribution as legacy  # noqa: E402
-from ddlt import _ddlt_from_quantiles_row_numba, _quantiles_to_pmf_numba  # noqa: E402
-from discrete_distribution import DiscreteDistribution  # noqa: E402
-from quantile_distribution import DEFAULT_QUANTILES  # noqa: E402
+from probabilistic_modeling.ddlt import _ddlt_from_quantiles_row_numba, _quantiles_to_pmf_numba  # noqa: E402
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution  # noqa: E402
+from probabilistic_modeling.distributions.quantile import DEFAULT_QUANTILES  # noqa: E402
 
 LEVELS = np.asarray(DEFAULT_QUANTILES, dtype=np.float64)
 HORIZON = 7
@@ -202,7 +201,7 @@ def long_lead_time():
 def test_long_support_ddlt_speed(long_lead_time, warmed_up):
     from numba.typed import List as NumbaList
 
-    from ddlt import _random_sum_aligned_numba
+    from probabilistic_modeling.ddlt import _random_sum_aligned_numba
 
     rows = _long_daily_pmfs(N_LONG_ROWS)
     lt_old = legacy.DiscreteDistribution(long_lead_time.copy(), LT_MIN)
@@ -251,7 +250,7 @@ def test_big_sequence_fft_convolution_and_ddlt_speed(long_lead_time):
     legacy random_sum on very large support sequences (N = 10,000 and 25,000 bins).
     """
     from numba.typed import List as NumbaList
-    from ddlt import (
+    from probabilistic_modeling.ddlt import (
         HAS_ROCKET_FFT,
         _convolve_1d_numba,
         _direct_convolve_1d_numba,

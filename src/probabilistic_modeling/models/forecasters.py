@@ -18,9 +18,9 @@ import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
 
-from ddlt import DDLTCalculator
-from discrete_distribution import DiscreteDistribution
-from quantile_distribution import (
+from probabilistic_modeling.ddlt import DDLTCalculator
+from probabilistic_modeling.distributions.discrete import DiscreteDistribution
+from probabilistic_modeling.distributions.quantile import (
     DEFAULT_QUANTILES,
     pinball_loss,
     quantile_crps,
@@ -29,8 +29,8 @@ from quantile_distribution import (
 )
 
 if TYPE_CHECKING:
-    from catboost_quantile import CatBoostQuantileModel
-    from time_series import DiscreteTimeSeries, TimeSeriesFeatureSpec
+    from probabilistic_modeling.models.catboost_quantile import CatBoostQuantileModel
+    from probabilistic_modeling.time_series import DiscreteTimeSeries, TimeSeriesFeatureSpec
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def evaluate_quantile_forecasts(
     Computes pinball loss, empirical coverage P(y <= q_hat), and quantile-approximated
     CRPS per horizon and quantile level.
     """
-    from catboost_quantile import quantile_col_name
+    from probabilistic_modeling.models.catboost_quantile import quantile_col_name
 
     levels = tuple(float(q) for q in validate_quantile_levels(quantiles))
     group_cols = [c for c in (group_cols or []) if c in pred_df.columns]
@@ -211,7 +211,7 @@ class GLMModel:
         target_cols: list[str] | None = None,
         feature_cols: list[str] | None = None,
     ) -> "GLMModel":
-        from time_series import _parse_serialized_dict
+        from probabilistic_modeling.time_series import _parse_serialized_dict
 
         if target_cols is None:
             target_cols = [c for c in df.columns if c.startswith("target_")]
@@ -454,7 +454,7 @@ class ProbabilisticForecaster(ABC):
             self.series_metadata_.to_csv(out_dir / "series_metadata.csv", index=False)
 
     def _load_base_context(self, out_dir: Path, meta: dict[str, Any]) -> None:
-        from time_series import TimeSeriesFeatureSpec
+        from probabilistic_modeling.time_series import TimeSeriesFeatureSpec
 
         self.target_cols_ = list(meta.get("target_cols", []))
         self.feature_cols_ = list(meta.get("feature_cols", []))
@@ -788,7 +788,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         self.model: "CatBoostQuantileModel | None" = None
 
     def fit(self, ts: "DiscreteTimeSeries") -> "CatBoostQuantileModel":
-        from catboost_quantile import CatBoostQuantileModel, train_catboost_quantile
+        from probabilistic_modeling.models.catboost_quantile import CatBoostQuantileModel, train_catboost_quantile
 
         t0 = time.perf_counter()
         self._bind_training_context(ts)
@@ -892,7 +892,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         model: "CatBoostQuantileModel | None" = None,
         period: Any = None,
     ) -> pd.DataFrame:
-        from catboost_quantile import predict_catboost_quantile
+        from probabilistic_modeling.models.catboost_quantile import predict_catboost_quantile
 
         t0 = time.perf_counter()
         cb_container = model if model is not None else self.model
@@ -1013,7 +1013,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
 
     @classmethod
     def load(cls, out_dir: Path | str, prefix: str = "catboost") -> "CatBoostQuantileForecaster":
-        from catboost_quantile import CatBoostQuantileModel
+        from probabilistic_modeling.models.catboost_quantile import CatBoostQuantileModel
 
         out_path = Path(out_dir)
         meta_file = out_path / "forecaster_meta.json"
