@@ -462,3 +462,134 @@ def test_reusable_forecaster_save_load_and_multi_prediction(tmp_path):
     assert len(ddlt_cb) == 2 and (ddlt_cb["target_inventory"] >= 0).all()
 
 
+def test_inventory_simulation_quantile_newsvendor_and_mc():
+    """Verify multi-period inventory simulation with quantile policy, newsvendor policy, and Monte Carlo."""
+    from inventory_simulation import InventorySimulator, simulate_inventory
+
+    rng = np.random.default_rng(123)
+    rows = []
+    for day in range(1, 15):
+        for item_idx, (item_id, cat_id, mu, price, cost, shortage) in enumerate(
+            [
+                ("item_1", "FOODS", 4.0, 5.0, 2.0, 1.0),
+                ("item_2", "FOODS", 6.0, 8.0, 3.0, 2.0),
+                ("item_3", "HOUSEHOLD", 3.0, 12.0, 5.0, 3.0),
+            ]
+        ):
+            # DDLT distribution over ~2-3 days of demand
+            ddlt_dist = DiscreteDistribution.from_parametric("poisson", (mu * 2.5, 0))
+            actual_demand = int(rng.poisson(mu))
+            rows.append(
+                {
+                    "store_id": "CA_1",
+                    "cat_id": cat_id,
+                    "item_id": item_id,
+                    "day": day,
+                    "target_t_plus_0": actual_demand,
+                    "demand_distribution": ddlt_dist,
+                    "price": price,
+                    "cost": cost,
+                    "shortage_cost": shortage,
+                }
+            )
+    panel_df = pd.DataFrame(rows)
+    lead_time_dist = {"CA_1": DiscreteDistribution(pmf=np.array([0.3, 0.5, 0.2]), min_value=1)}
+
+    # 1. Policy = "quantile" (optional Newsvendor bypassed; uses simple DDLT quantile)
+    sim_q = simulate_inventory(
+        panel_df.drop(columns=["price", "cost", "shortage_cost"]),
+        ts_id_cols=["store_id", "item_id"],
+        period_col="day",
+        demand_col="target_t_plus_0",
+        policy="quantile",
+        service_level=0.95,
+        lead_time=lead_time_dist,
+        lead_time_keys=["store_id"],
+        group_cols=["store_id", "cat_id"],
+        n_mc_simulations=25,
+        random_state=42,
+    )
+    traj_q = sim_q.trajectory_df
+    assert len(traj_q) == len(panel_df)
+
+    # Check exact physical conservation identities on every row
+    np.testing.assert_allclose(
+        traj_q["on_hand_before_demand"],
+        traj_q["opening_inv"] + traj_q["arrivals"],
+    )
+    np.testing.assert_allclose(
+        traj_q["sold"] + traj_q["lost_sales"],
+        traj_q["demand"],
+    )
+    np.testing.assert_allclose(
+        traj_q["closing_inv"],
+        traj_q["on_hand_before_demand"] - traj_q["sold"],
+    )
+    np.testing.assert_allclose(
+        traj_q["order_placed"],
+        np.maximum(0.0, traj_q["target_inventory"] - traj_q["inventory_position"]),
+    )
+    np.testing.assert_allclose(
+        traj_q["in_transit_end"],
+        traj_q["in_transit_before_order"] + traj_q["order_placed"],
+    )
+
+    # Check multi-day carry-over per item: opening_inv[t] == closing_inv[t-1]
+    for _, grp in traj_q.sort_values("day").groupby(["store_id", "item_id"]):
+        np.testing.assert_allclose(
+            grp["opening_inv"].to_numpy()[1:],
+            grp["closing_inv"].to_numpy()[:-1],
+        )
+
+    # Check KPIs and Monte Carlo summary
+    assert 0.0 <= float(sim_q.summary_df["fill_rate"].iloc[0]) <= 1.0
+    assert 0.0 <= float(sim_q.summary_df["cycle_service_level"].iloc[0]) <= 1.0
+    assert len(sim_q.item_summary_df) == 3
+    assert sim_q.group_summary_df is not None and len(sim_q.group_summary_df) == 2
+    assert sim_q.mc_summary_df is not None and "fill_rate" in set(sim_q.mc_summary_df["metric"])
+
+    # 2. Policy = "newsvendor" with economic KPIs
+    sim_nv = simulate_inventory(
+        panel_df,
+        ts_id_cols=["store_id", "item_id"],
+        period_col="day",
+        demand_col="target_t_plus_0",
+        policy="newsvendor",
+        budget=60.0,
+        lead_time=2,
+        holding_cost_per_unit=0.10,
+        group_cols=["store_id", "cat_id"],
+        n_mc_simulations=10,
+        random_state=7,
+    )
+    assert "net_profit" in sim_nv.trajectory_df.columns
+    assert "total_profit" in sim_nv.summary_df.columns
+    assert "total_holding_cost" in sim_nv.summary_df.columns
+    assert sim_nv.mc_summary_df is not None and set(sim_nv.mc_summary_df.columns) >= {"metric", "mean", "std", "p05", "p95"}
+
+    # 3. Backlog mode (allow_backlog=True) vs Lost-Sales mode from zero initial stock
+    sim_ls_zero = InventorySimulator(
+        ts_id_cols=["store_id", "item_id"],
+        period_col="day",
+        demand_col="target_t_plus_0",
+        policy="quantile",
+        service_level=0.95,
+        lead_time=2,
+        initial_inventory=0,
+        allow_backlog=False,
+    ).run(panel_df)
+    sim_bl_zero = InventorySimulator(
+        ts_id_cols=["store_id", "item_id"],
+        period_col="day",
+        demand_col="target_t_plus_0",
+        policy="quantile",
+        service_level=0.95,
+        lead_time=2,
+        initial_inventory=0,
+        allow_backlog=True,
+    ).run(panel_df)
+    # In backlog mode, unfulfilled demand from days 1-2 is satisfied once replenishment arrives:
+    assert float(sim_bl_zero.summary_df["total_sold"].iloc[0]) > float(sim_ls_zero.summary_df["total_sold"].iloc[0])
+
+
+

@@ -72,6 +72,7 @@ The goal is not merely to predict future demand, but to use uncertainty estimate
 ├── discrete_distribution.py
 ├── probability_utils.py
 ├── multi_product_newsvendor.py
+├── inventory_simulation.py
 ├── logging_utils.py
 ├── tests/
 │   └── test_quantile_distribution.py
@@ -176,6 +177,14 @@ Solves the multi-product newsvendor problem under a shared purchasing budget:
 - for a fixed Lagrange multiplier $k \ge 0$, each product receives an adjusted critical fractile $\alpha_i(k)$ evaluated via `_batch_pmf_quantiles_numba`;
 - a binary search finds the optimal multiplier $k^*$ satisfying the budget constraint;
 - supports `group_cols` (e.g., `['store_id', 'day']`) to solve an independent budget-constrained problem on each decision day.
+
+#### `inventory_simulation.py`
+
+Runs a **Numba-accelerated** multi-period retail/supply-chain inventory replenishment simulation over the test period:
+
+- supports flexible target inventory policies (`policy="quantile"` for a pure DDLT quantile target, `policy="newsvendor"` for a multi-product newsvendor target, or `policy="precomputed"`);
+- tracks daily inventory trajectories per item (`opening_inv`, `arrivals`, `on_hand_before_demand`, `in_transit_before_order`, `inventory_position`, `target_inventory`, `order_placed`, `lead_time_drawn`, `demand`, `sold`, `lost_sales`, `closing_inv`, `in_transit_end`, and optional economic cashflows);
+- computes operational and economic KPIs (`fill_rate`, `cycle_service_level`, `stockout_frequency`, `inventory_turnover`, `total_profit`, `profit_margin_pct`) overall, per group, and per item, plus optional parallel Monte Carlo simulation (`n_mc_simulations`) over stochastic lead times.
 
 #### `run_m5_pipeline.py`
 
@@ -327,6 +336,8 @@ All CLI options for `run_m5_pipeline.py`:
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | `glm` | Forecasting model family (`glm` or `catboost`) |
+| `--target-policy` | `newsvendor` | Inventory target policy (`newsvendor` or `quantile`) |
+| `--service-level` | `0.95` | Target service level quantile when `--target-policy quantile` is used |
 | `--budget-per-store` | `15000` | Purchasing budget per store per decision day |
 | `--quantiles` | `0.05 0.1 ... 0.95 0.99` | Quantile levels predicted by CatBoost |
 | `--catboost-iterations` | `1000` | Max boosting iterations per horizon |
@@ -467,6 +478,47 @@ inf_df = loaded.transform(new_sales_df, calendar_df=updated_calendar_df, period=
 ddlt_df = loaded.compute_ddlt(inf_df, lead_time=lead_time_distr, lead_time_keys=["store_id"], cycle_time=1)
 ```
 
+### 5. Multi-Period Inventory Replenishment Simulation (`simulate_inventory`)
+
+Evaluate how daily target inventory levels perform across the test period when accounting for stochastic order lead times, in-transit pipeline stock, carry-over on-hand inventory, and realized daily demand. You can run the simulation either on a simple DDLT quantile (`policy="quantile"`) or on the multi-product Newsvendor output (`policy="newsvendor"`):
+
+```python
+from inventory_simulation import simulate_inventory
+
+# Option A: Simple DDLT quantile policy (no Newsvendor or price/cost columns required)
+sim_quantile = simulate_inventory(
+    ddlt_predictions,
+    ts_id_cols=["store_id", "item_id"],
+    period_col="day",
+    demand_col="target_t_plus_0",
+    policy="quantile",
+    service_level=0.95,
+    lead_time=lead_time_distr,
+    lead_time_keys=["store_id"],
+    group_cols=["store_id", "cat_id"],
+    n_mc_simulations=100,   # Optional parallel Monte Carlo over stochastic lead times
+)
+
+print(sim_quantile.summary_df)       # Fill rate, cycle service level, turnover, etc.
+print(sim_quantile.group_summary_df) # KPIs by store and category
+print(sim_quantile.trajectory_df.head())
+
+# Option B: Multi-product Newsvendor policy with economic KPIs
+sim_newsvendor = simulate_inventory(
+    ddlt_predictions,
+    ts_id_cols=["store_id", "item_id"],
+    period_col="day",
+    demand_col="target_t_plus_0",
+    policy="newsvendor",
+    budget=15000,
+    lead_time=lead_time_distr,
+    lead_time_keys=["store_id"],
+    holding_cost_per_unit=0.05,
+    group_cols=["store_id", "cat_id"],
+)
+print(sim_newsvendor.summary_df[["fill_rate", "cycle_service_level", "total_profit", "profit_margin_pct"]])
+```
+
 ---
 
 ## Development Roadmap
@@ -479,7 +531,7 @@ Phase 1 — Forecasting foundation
   ✓ Discrete predictive distributions
 
 Phase 2 — Decision layer
-  ✓ Numba-accelerated lead-time demand calculation
+  ✓ Numba-accelerated lead-time demand calculation (with adaptive Radix-2 FFT convolution)
   ✓ Multi-product newsvendor with O(1)-memory quantile lookup
   ✓ Per-day shared budget constraint
 
@@ -487,13 +539,14 @@ Phase 3 — Model expansion & Architecture
   ✓ CatBoost multi-quantile regression
   ✓ Non-parametric quantile-to-distribution reconstruction
   ✓ Composable Forecaster and DDLTCalculator abstractions
+  ✓ Self-contained forecaster persistence (.save() / load_forecaster / predict_from_raw)
   ✓ Future-known covariate leads for production inference
   ✓ Unit test suite
 
 Phase 4 — Evaluation & Simulation
+  ✓ Multi-period inventory replenishment simulation with carry-over & pipeline stock (inventory_simulation.py)
+  ✓ Decision-based metrics (fill rate, cycle service level, turnover, realized profit, holding vs. shortage cost)
   □ Rolling-origin forecast backtesting
-  □ Multi-period inventory replenishment simulation with carry-over stock
-  □ Decision-based metrics (fill rate, realized profit, holding vs. shortage cost)
   □ GLM versus CatBoost decision benchmarking
 ```
 

@@ -30,6 +30,7 @@ py-modules = [
     "ddlt",
     "discrete_distribution",
     "forecasters",
+    "inventory_simulation",
     "logging_utils",
     "multi_product_newsvendor",
     "probability_utils",

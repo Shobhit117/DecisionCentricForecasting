@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 
 from forecasters import CatBoostQuantileForecaster, GLMForecaster, evaluate_quantile_forecasts
+from inventory_simulation import resolve_target_inventory, simulate_inventory
 from logging_utils import setup_logging
-from multi_product_newsvendor import _solve_multi_product_newsvendor
 from quantile_distribution import DEFAULT_QUANTILES
 from time_series import DiscreteTimeSeries, compute_distribution_dict, compute_lead_time_demand
 
@@ -88,6 +88,18 @@ def parse_args():
         default="INFO",
         help="Logging verbosity level (default: INFO).",
     )
+    parser.add_argument(
+        "--target-policy",
+        choices=["newsvendor", "quantile"],
+        default="newsvendor",
+        help="Inventory target policy: 'newsvendor' (budget-constrained) or 'quantile' (simple DDLT quantile).",
+    )
+    parser.add_argument(
+        "--service-level",
+        type=float,
+        default=0.95,
+        help="Target service-level quantile in [0, 1] when --target-policy=quantile (default: 0.95).",
+    )
     return parser.parse_args()
 
 
@@ -130,6 +142,8 @@ def main(
     catboost_train_days=DEFAULT_CATBOOST_TRAIN_DAYS,
     log_file=None,
     log_level="INFO",
+    target_policy="newsvendor",
+    service_level=0.95,
 ):
     setup_logging(log_file=log_file, level=log_level)
     pipeline_t0 = time.perf_counter()
@@ -144,6 +158,8 @@ def main(
 
     wmape_store = []
     wmape_store_cat = []
+    sim_store = []
+    sim_store_cat = []
     quantile_metrics = []
 
     lead_time_df = pd.read_parquet(synthetic_data_dir / 'lead_time.parquet')
@@ -220,19 +236,38 @@ def main(
             )
         del ts; gc.collect()
 
-        # Solve newsvendor model independently on each test day (Option A):
+        # Resolve target_inventory via either budget-constrained newsvendor or simple DDLT quantile:
         store_newsvendor_df = newsvendor_df
         if 'sell_price' in predictions.columns:
             store_newsvendor_df = newsvendor_df.drop(columns='sell_price')
             predictions['sell_price'] = np.expm1(predictions['sell_price'])  # Keep original sell price
 
         predictions = predictions.merge(store_newsvendor_df, on=['store_id', 'item_id'], how='left')
-        predictions = _solve_multi_product_newsvendor(
-            predictions, budget_per_store, group_cols=['store_id', 'day']
+        predictions = resolve_target_inventory(
+            predictions,
+            policy=target_policy,
+            service_level=service_level,
+            budget=budget_per_store,
+            group_cols=['store_id', 'day'],
         )
+        if 'demand_distribution' in predictions.columns:
+            predictions = predictions.drop(columns=['demand_distribution'])
         pred_path = out_dir / f'predictions{suffix}_{store_name}.csv'
         predictions.to_csv(pred_path, index=False)
         logger.info("Saved predictions and inventory decisions to %s", pred_path)
+
+        # Run Multi-Period Inventory Simulation over the test window:
+        sim_result = simulate_inventory(
+            predictions,
+            lead_time=lead_time_distr,
+            lead_time_keys=lead_time_keys,
+            cycle_time=cycle_time,
+            policy="precomputed",
+            group_cols=['store_id', 'cat_id'],
+        )
+        sim_store.append(sim_result.summarize(group_cols=['store_id']))
+        if sim_result.group_summary_df is not None:
+            sim_store_cat.append(sim_result.group_summary_df)
 
         # Compute Forecasting Metrics:
         df_wmape_store_cat = predictions.groupby(['store_id', 'cat_id'], as_index=False, observed=True)[
@@ -253,13 +288,17 @@ def main(
         )
         wmape_store_cat.append(df_wmape_store_cat)
         wmape_store.append(df_wmape_store)
-        del predictions; gc.collect()
+        del predictions, sim_result; gc.collect()
         break
 
     wmape_store_cat = pd.concat(wmape_store_cat)
     wmape_store = pd.concat(wmape_store)
     wmape_store.to_csv(out_dir / f'wmape_store{suffix}.csv', index=False)
     wmape_store_cat.to_csv(out_dir / f'wmape_store_cat{suffix}.csv', index=False)
+    if sim_store:
+        pd.concat(sim_store, ignore_index=True).to_csv(out_dir / f'simulation_store{suffix}.csv', index=False)
+    if sim_store_cat:
+        pd.concat(sim_store_cat, ignore_index=True).to_csv(out_dir / f'simulation_store_cat{suffix}.csv', index=False)
     if quantile_metrics:
         quantile_metrics = pd.concat(quantile_metrics)
         qm_path = out_dir / f'quantile_metrics{suffix}.csv'
@@ -282,4 +321,6 @@ if __name__ == '__main__':
         catboost_train_days=args.catboost_train_days,
         log_file=args.log_file,
         log_level=args.log_level,
+        target_policy=args.target_policy,
+        service_level=args.service_level,
     )
