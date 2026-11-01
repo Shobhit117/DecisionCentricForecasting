@@ -74,7 +74,12 @@ def quantiles_to_pmf(levels: np.ndarray, values: np.ndarray, tol: float = 1e-4, 
 
 
 def quantiles_to_distribution(levels: list[float] | np.ndarray, values: list[float] | np.ndarray, tol: float = 1e-4, max_support: int | None = None) -> DiscreteDistribution:
-    """Builds a :class:`DiscreteDistribution` from a vector of predicted quantiles."""
+    """
+    Builds a :class:`DiscreteDistribution` from a vector of predicted quantiles.
+
+    The extrapolated upper tail is cut at ``1 - tol``; pass a smaller ``tol`` (e.g. via
+    ``support_tol_for_service_level``) when quantiles very close to 1 are needed.
+    """
     levels = validate_quantile_levels(levels)
     values = np.asarray(values, dtype=float)
     if values.shape != levels.shape:
@@ -82,7 +87,8 @@ def quantiles_to_distribution(levels: list[float] | np.ndarray, values: list[flo
     if np.any(~np.isfinite(values)):
         raise ValueError(f"Quantile values must be finite: {values}.")
     pmf, min_value = quantiles_to_pmf(levels, values, tol, max_support)
-    return DiscreteDistribution(pmf, min_value)
+    # An explicit ``max_support`` cap may cut off more mass than ``tol`` -> unknown truncation.
+    return DiscreteDistribution(pmf, min_value, truncation_tol=float(tol) if max_support is None else None)
 
 
 def distribution_mean(distr: DiscreteDistribution) -> float:

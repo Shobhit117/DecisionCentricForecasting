@@ -1,9 +1,9 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.9.27)  30 AUG 2026 16:08
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.5.2)  1 NOV 2026 20:00
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
-**prob_forecasting_main.tex
-(./prob_forecasting_main.tex
+**docs/slides/prob_forecasting_main.tex
+(./docs/slides/prob_forecasting_main.tex
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
 (c:/texlive/2025/texmf-dist/tex/latex/beamer/beamer.cls
@@ -967,7 +967,7 @@ Package biblatex Warning: 'babel/polyglossia' detected but 'csquotes' missing.
 
 \@quotelevel=\count474
 \@quotereset=\count475
-(./prob_forecasting_main.aux)
+(docs/slides/prob_forecasting_main.aux)
 \openout1 = `prob_forecasting_main.aux'.
 
 LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 36.
@@ -1047,7 +1047,7 @@ e
 ))
 Package hyperref Info: Link coloring OFF on input line 36.
 
-(./prob_forecasting_main.out) (./prob_forecasting_main.out)
+(docs/slides/prob_forecasting_main.out) (docs/slides/prob_forecasting_main.out)
 \@outlinefile=\write6
 \openout6 = `prob_forecasting_main.out'.
 
@@ -1141,19 +1141,19 @@ Package biblatex Info: Automatic encoding selection.
 Package biblatex Info: Trying to load bibliographic data...
 Package biblatex Info: ... file 'prob_forecasting_main.bbl' found.
 
-(./prob_forecasting_main.bbl)
+(docs/slides/prob_forecasting_main.bbl)
 Package biblatex Info: Reference section=0 on input line 36.
 Package biblatex Info: Reference segment=0 on input line 36.
- (./prob_forecasting_main.nav)
+ (docs/slides/prob_forecasting_main.nav)
 
 [1
 
 {c:/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map}]
-(./prob_forecasting_main.toc)
+(docs/slides/prob_forecasting_main.toc)
 
 [2
 
-] (./prob_forecasting_main.toc)
+] (docs/slides/prob_forecasting_main.toc)
 
 [3
 
@@ -1180,7 +1180,7 @@ thkerncmss.
 [4
 
 ]
-<figures/demand_same_mean_diff_quantile.pdf, id=196, 828.09375pt x 489.32813pt>
+<figures/demand_same_mean_diff_quantile.pdf, id=205, 828.09375pt x 489.32813pt>
 
 File: figures/demand_same_mean_diff_quantile.pdf Graphic file (type pdf)
 <use figures/demand_same_mean_diff_quantile.pdf>
@@ -1196,7 +1196,8 @@ put line 98.
 [6
 
 
- <./figures/demand_same_mean_diff_quantile.pdf>] (./prob_forecasting_main.toc)
+ <docs/slides/figures/demand_same_mean_diff_quantile.pdf>]
+(docs/slides/prob_forecasting_main.toc)
 
 [7
 
@@ -1235,12 +1236,12 @@ put line 98.
 [15
 
 
-] (./prob_forecasting_main.toc)
+] (docs/slides/prob_forecasting_main.toc)
 
 [16
 
 ]
-<figures/periodic_replenishment.pdf, id=925, 677.53125pt x 376.40625pt>
+<figures/periodic_replenishment.pdf, id=936, 677.53125pt x 376.40625pt>
 File: figures/periodic_replenishment.pdf Graphic file (type pdf)
 <use figures/periodic_replenishment.pdf>
 Package pdftex.def Info: figures/periodic_replenishment.pdf  used on input line
@@ -1254,12 +1255,12 @@ Overfull \vbox (3.63133pt too high) detected at line 217
 
 [17
 
- <./figures/periodic_replenishment.pdf>]
+ <docs/slides/figures/periodic_replenishment.pdf>]
 
 [18
 
 ]
-<figures/convolution_leadtime_figure.pdf, id=996, 1415.2875pt x 733.99219pt>
+<figures/convolution_leadtime_figure.pdf, id=1007, 1415.2875pt x 733.99219pt>
 File: figures/convolution_leadtime_figure.pdf Graphic file (type pdf)
 <use figures/convolution_leadtime_figure.pdf>
 Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
@@ -1269,7 +1270,8 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 
 [19
 
- <./figures/convolution_leadtime_figure.pdf>] (./prob_forecasting_main.toc)
+ <docs/slides/figures/convolution_leadtime_figure.pdf>]
+(docs/slides/prob_forecasting_main.toc)
 
 [20
 
@@ -1290,7 +1292,7 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 [24
 
 
-] (./prob_forecasting_main.toc)
+]
 
 [25
 
@@ -1300,16 +1302,39 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 
 ]
 
-LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
-(Font)              Font shape `OT1/cmr/m/sc' tried instead on input line 338.
-
-
-
 [27
+
+
+]
+
+[28
+
+
+] (docs/slides/prob_forecasting_main.toc)
+
+[29
+
+]
+
+[30
+
+]
+
+LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
+(Font)              Font shape `OT1/cmr/m/sc' tried instead on input line 396.
+
+
+
+[31
 
  <c:/texlive/2025/texmf-dist/tex/latex/beamer/beamericonarticle.pdf>]
 
-[28
+[32
+
+
+]
+
+[33
 
 
 ]
@@ -1322,52 +1347,55 @@ LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
 \tf@snm=\write9
 \openout9 = `prob_forecasting_main.snm'.
 
- (./prob_forecasting_main.aux)
+ (docs/slides/prob_forecasting_main.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
 Package rerunfilecheck Info: File `prob_forecasting_main.out' has not changed.
-(rerunfilecheck)             Checksum: A2585A1F09E59C3C88EEB66D2DFE3F8F;1092.
+(rerunfilecheck)             Checksum: 02DE6E5FFF1A1475E29E641151252BCE;1402.
 Package logreq Info: Writing requests to 'prob_forecasting_main.run.xml'.
 \openout1 = `prob_forecasting_main.run.xml'.
 
  ) 
 Here is how much of TeX's memory you used:
- 30608 strings out of 473190
- 599956 string characters out of 5719979
- 1400058 words of memory out of 5000000
- 53243 multiletter control sequences out of 15000+600000
+ 30686 strings out of 473190
+ 602248 string characters out of 5719980
+ 1402329 words of memory out of 5000000
+ 53305 multiletter control sequences out of 15000+600000
  574565 words of font info for 93 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 128i,21n,123p,1490b,2353s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 128i,21n,123p,1502b,2353s stack positions out of 10000i,1000n,20000p,200000b,200000s
 <c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmcsc10.pfb><c:/te
 xlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb><c:/texlive/202
-5/texmf-dist/fonts/type1/public/amsfonts/cmextra/cmex9.pfb><c:/texlive/2025/tex
-mf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb><c:/texlive/2025/texmf-dist/f
-onts/type1/public/amsfonts/cm/cmmi5.pfb><c:/texlive/2025/texmf-dist/fonts/type1
-/public/amsfonts/cm/cmmi6.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/am
-sfonts/cm/cmmi7.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/
-cmmi8.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb>
-<c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmss10.pfb><c:/texli
-ve/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmss12.pfb><c:/texlive/2025/t
-exmf-dist/fonts/type1/public/amsfonts/cm/cmss8.pfb><c:/texlive/2025/texmf-dist/
-fonts/type1/public/amsfonts/cm/cmss9.pfb><c:/texlive/2025/texmf-dist/fonts/type
-1/public/amsfonts/cm/cmssbx10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/publi
-c/amsfonts/cm/cmssi10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfon
-ts/cm/cmssi12.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cm
-ssi8.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmssi9.pfb>
-<c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb><c:/texli
-ve/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy5.pfb><c:/texlive/2025/te
-xmf-dist/fonts/type1/public/amsfonts/cm/cmsy6.pfb><c:/texlive/2025/texmf-dist/f
-onts/type1/public/amsfonts/cm/cmsy7.pfb><c:/texlive/2025/texmf-dist/fonts/type1
-/public/amsfonts/cm/cmsy9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/am
-sfonts/cm/cmtt10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/sy
-mbols/msbm10.pfb>
-Output written on prob_forecasting_main.pdf (28 pages, 549855 bytes).
+5/texmf-dist/fonts/type1/public/amsfonts/cmextra/cmex7.pfb><c:/texlive/2025/tex
+mf-dist/fonts/type1/public/amsfonts/cmextra/cmex9.pfb><c:/texlive/2025/texmf-di
+st/fonts/type1/public/amsfonts/cm/cmmi10.pfb><c:/texlive/2025/texmf-dist/fonts/
+type1/public/amsfonts/cm/cmmi5.pfb><c:/texlive/2025/texmf-dist/fonts/type1/publ
+ic/amsfonts/cm/cmmi6.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfont
+s/cm/cmmi7.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8
+.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb><c:/t
+exlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmss10.pfb><c:/texlive/20
+25/texmf-dist/fonts/type1/public/amsfonts/cm/cmss12.pfb><c:/texlive/2025/texmf-
+dist/fonts/type1/public/amsfonts/cm/cmss8.pfb><c:/texlive/2025/texmf-dist/fonts
+/type1/public/amsfonts/cm/cmss9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/pub
+lic/amsfonts/cm/cmssbx10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/ams
+fonts/cm/cmssi10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm
+/cmssi12.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmssi8.
+pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmssi9.pfb><c:/t
+exlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb><c:/texlive/20
+25/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy5.pfb><c:/texlive/2025/texmf-d
+ist/fonts/type1/public/amsfonts/cm/cmsy6.pfb><c:/texlive/2025/texmf-dist/fonts/
+type1/public/amsfonts/cm/cmsy7.pfb><c:/texlive/2025/texmf-dist/fonts/type1/publ
+ic/amsfonts/cm/cmsy9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfont
+s/cm/cmtt10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols
+/msbm10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols/msb
+m7.pfb>
+Output written on docs/slides/prob_forecasting_main.pdf (33 pages, 580599 bytes
+).
 PDF statistics:
- 1430 PDF objects out of 1440 (max. 8388607)
- 1103 compressed objects within 12 object streams
- 70 named destinations out of 1000 (max. 500000)
- 166 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 1598 PDF objects out of 1728 (max. 8388607)
+ 1258 compressed objects within 13 object streams
+ 85 named destinations out of 1000 (max. 500000)
+ 180 words of extra memory for PDF output out of 10000 (max. 10000000)
 

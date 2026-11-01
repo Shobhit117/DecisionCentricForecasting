@@ -3,4 +3,5 @@
 \beamer@sectionintoc {2}{Techniques for Probablistic Forecasting}{7}{0}{2}
 \beamer@sectionintoc {3}{Demand during Lead Time + Review Period}{16}{0}{3}
 \beamer@sectionintoc {4}{Stochastic Inventory Optimization}{20}{0}{4}
-\beamer@sectionintoc {5}{Conclusion}{25}{0}{5}
+\beamer@subsectionintoc {4}{1}{Hierarchical Newsvendor for Substitutable Demand}{25}{0}{4}
+\beamer@sectionintoc {5}{Conclusion}{29}{0}{5}

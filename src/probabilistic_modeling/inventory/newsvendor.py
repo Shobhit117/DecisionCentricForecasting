@@ -4,7 +4,11 @@ import numpy as np
 import pandas as pd
 from numba.typed import List as NumbaList
 from probabilistic_modeling.distributions.discrete import DiscreteDistribution
-from probabilistic_modeling.ddlt import _batch_pmf_quantiles_numba
+from probabilistic_modeling.ddlt import (
+    _batch_cdf_quantiles_numba,
+    _batch_pmf_quantiles_numba,
+    _build_prefix_cdfs_numba,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +60,11 @@ def solve_multi_product_newsvendor(
     denom = selling_price + shortage_penalty
     base_num = selling_price + shortage_penalty
 
-    def opt_inventory(k: float) -> np.ndarray:
-        alpha = np.clip((base_num - purchase_cost * (1.0 + k)) / denom, 0.0, 1.0)
-        return _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alpha)
+    def fractiles(k: float) -> np.ndarray:
+        return np.clip((base_num - purchase_cost * (1.0 + k)) / denom, 0.0, 1.0)
 
-    x = opt_inventory(0.0)
+    # Unconstrained solution (k = 0): one early-exit linear scan per product.
+    x = _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, fractiles(0.0))
     unconstrained_spend = float(np.sum(x * purchase_cost))
     if unconstrained_spend <= available_budget:
         logger.debug(
@@ -70,6 +74,16 @@ def solve_multi_product_newsvendor(
         )
         return x
     logger.debug("Iteration 0 (unconstrained): budget used = %.2f > %.2f", unconstrained_spend, available_budget)
+
+    # The critical fractile alpha_i(k) is non-increasing in k, so every later quantile index is
+    # <= the unconstrained one. Build only those CDF prefixes once (one pass of the same length
+    # as the scan above); each bisection step then costs O(sum log n_i) binary searches instead
+    # of O(sum idx_i) linear scans, with bit-identical results.
+    prefix_lengths = (x - mins) // bin_sizes + 1
+    cdf_flat, offsets = _build_prefix_cdfs_numba(pmfs, prefix_lengths)
+
+    def opt_inventory(k: float) -> np.ndarray:
+        return _batch_cdf_quantiles_numba(cdf_flat, offsets, mins, bin_sizes, fractiles(k))
 
     # Find upper bound on k large enough to force low inventory.
     k_lb = 0.0

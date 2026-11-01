@@ -964,7 +964,15 @@ def compute_lead_time_demand(
     pred_first_day: bool = True,
     period: Any = None,
     df: pd.DataFrame | None = None,
+    max_service_level: float | None = None,
 ) -> pd.DataFrame:
+    """
+    Computes DDLT distributions (``return_distribution=True``) or service-level targets.
+
+    ``max_service_level`` (e.g. ``0.9999``) tightens the support truncation of the daily
+    distributions so that downstream quantiles up to that level are not biased low. When
+    targets are computed directly, the ``service_level`` column is used automatically.
+    """
     if isinstance(model_data, ProbabilisticForecaster):
         return model_data.compute_ddlt(
             ts,
@@ -976,6 +984,7 @@ def compute_lead_time_demand(
             pred_first_day=pred_first_day,
             df=df,
             period=period,
+            max_service_level=max_service_level,
         )
     if model_type == "glm":
         return GLMForecaster().compute_ddlt(
@@ -989,6 +998,7 @@ def compute_lead_time_demand(
             df=df,
             period=period,
             model_data=model_data,
+            max_service_level=max_service_level,
         )
     if model_type == "catboost":
         return CatBoostQuantileForecaster(quantiles=model_data.quantiles).compute_ddlt(
@@ -1002,6 +1012,7 @@ def compute_lead_time_demand(
             df=df,
             period=period,
             model=model_data,
+            max_service_level=max_service_level,
         )
     raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm', 'catboost'.")
 

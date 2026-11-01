@@ -67,6 +67,86 @@
       \verb http://www.jstor.org/stable/1913643
       \endverb
     \endentry
+    \entry{kok2007}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d}{%
+           family={K{\"o}k},
+           familyi={K\bibinitperiod},
+           given={A.\bibnamedelimi G{\"u}rhan},
+           giveni={A\bibinitperiod\bibinitdelim G\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e}{%
+           family={Fisher},
+           familyi={F\bibinitperiod},
+           given={Marshall\bibnamedelimi L.},
+           giveni={M\bibinitperiod\bibinitdelim L\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {INFORMS}%
+      }
+      \strng{namehash}{kok2007hash}
+      \strng{fullhash}{kok2007hash}
+      \strng{fullhashraw}{kok2007hash}
+      \strng{bibnamehash}{kok2007hash}
+      \strng{authorbibnamehash}{kok2007hash}
+      \strng{authornamehash}{kok2007hash}
+      \strng{authorfullhash}{kok2007hash}
+      \strng{authorfullhashraw}{kok2007hash}
+      \field{sortinit}{K}
+      \field{sortinithash}{c02bf6bff1c488450c352b40f5d853ab}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Operations Research}
+      \field{number}{6}
+      \field{title}{Demand estimation and assortment optimization under substitution: Methodology and application}
+      \field{volume}{55}
+      \field{year}{2007}
+      \field{pages}{1001\bibrangedash 1021}
+      \range{pages}{21}
+    \endentry
+    \entry{mahajan2001}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f}{%
+           family={Mahajan},
+           familyi={M\bibinitperiod},
+           given={Siddharth},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a}{%
+           family={van\bibnamedelima Ryzin},
+           familyi={v\bibinitperiod\bibinitdelim R\bibinitperiod},
+           given={Garrett},
+           giveni={G\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {INFORMS}%
+      }
+      \strng{namehash}{mahajan2001hash}
+      \strng{fullhash}{mahajan2001hash}
+      \strng{fullhashraw}{mahajan2001hash}
+      \strng{bibnamehash}{mahajan2001hash}
+      \strng{authorbibnamehash}{mahajan2001hash}
+      \strng{authornamehash}{mahajan2001hash}
+      \strng{authorfullhash}{mahajan2001hash}
+      \strng{authorfullhashraw}{mahajan2001hash}
+      \field{sortinit}{M}
+      \field{sortinithash}{4625c616857f13d17ce56f7d4f97d451}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Operations Research}
+      \field{number}{3}
+      \field{title}{Stocking retail assortments under dynamic consumer substitution}
+      \field{volume}{49}
+      \field{year}{2001}
+      \field{pages}{334\bibrangedash 351}
+      \range{pages}{18}
+    \endentry
     \entry{nelder1972}{article}{}{}
       \name{author}{2}{}{%
         {{un=0,uniquepart=base,hash=97a60525676f2f0735b3bace8039e9af}{%
@@ -109,6 +189,46 @@
       \endverb
       \keyw{analysis of variance,contingency tables,exponential families,inverse polynomials,linear models,maximum likelihood,quantal response,regression,variance components,weighted least squares}
     \endentry
+    \entry{netessine2003}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b}{%
+           family={Netessine},
+           familyi={N\bibinitperiod},
+           given={Serguei},
+           giveni={S\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c}{%
+           family={Rudi},
+           familyi={R\bibinitperiod},
+           given={Nils},
+           giveni={N\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {INFORMS}%
+      }
+      \strng{namehash}{netessine2003hash}
+      \strng{fullhash}{netessine2003hash}
+      \strng{fullhashraw}{netessine2003hash}
+      \strng{bibnamehash}{netessine2003hash}
+      \strng{authorbibnamehash}{netessine2003hash}
+      \strng{authornamehash}{netessine2003hash}
+      \strng{authorfullhash}{netessine2003hash}
+      \strng{authorfullhashraw}{netessine2003hash}
+      \field{sortinit}{N}
+      \field{sortinithash}{22369a73d5f88983a108b63f07f37084}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Operations Research}
+      \field{number}{2}
+      \field{title}{Centralized and competitive inventory models with demand substitution}
+      \field{volume}{51}
+      \field{year}{2003}
+      \field{pages}{329\bibrangedash 335}
+      \range{pages}{7}
+    \endentry
     \entry{perakis2020}{article}{}{}
       \name{author}{3}{}{%
         {{un=0,uniquepart=base,hash=5fc631899047eb84eeaa6e01069ba04c}{%
@@ -147,6 +267,46 @@
       \field{journaltitle}{Available at SSRN 3632459}
       \field{title}{Leveraging the newsvendor for inventory distribution at a large fashion e-retailer with depth and capacity constraints}
       \field{year}{2020}
+    \endentry
+    \entry{rajaram2001}{article}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d}{%
+           family={Rajaram},
+           familyi={R\bibinitperiod},
+           given={Kumar},
+           giveni={K\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e}{%
+           family={Tang},
+           familyi={T\bibinitperiod},
+           given={Christopher\bibnamedelimi S.},
+           giveni={C\bibinitperiod\bibinitdelim S\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Elsevier}%
+      }
+      \strng{namehash}{rajaram2001hash}
+      \strng{fullhash}{rajaram2001hash}
+      \strng{fullhashraw}{rajaram2001hash}
+      \strng{bibnamehash}{rajaram2001hash}
+      \strng{authorbibnamehash}{rajaram2001hash}
+      \strng{authornamehash}{rajaram2001hash}
+      \strng{authorfullhash}{rajaram2001hash}
+      \strng{authorfullhashraw}{rajaram2001hash}
+      \field{sortinit}{R}
+      \field{sortinithash}{5e1c39a9d46ffb6bebd8f801023a9486}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{European Journal of Operational Research}
+      \field{number}{3}
+      \field{title}{The impact of product substitution on retail merchandising}
+      \field{volume}{135}
+      \field{year}{2001}
+      \field{pages}{582\bibrangedash 601}
+      \range{pages}{20}
     \endentry
     \entry{rigby2005}{article}{}{}
       \name{author}{2}{}{%

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import warnings
 import numpy as np
 from scipy import signal, stats
 from probabilistic_modeling.distributions import probability_utils as prob
@@ -14,6 +15,35 @@ SUPPORTED_DISTRS = {'nbinom': stats.nbinom,
                     'poisson': stats.poisson,
                     'geom': stats.geom,
                     'uniform': stats.randint}
+
+
+class TruncatedSupportWarning(UserWarning):
+    """
+    Raised when a quantile is requested beyond ``1 - truncation_tol``: the distribution's
+    finite support dropped that much upper-tail mass, so the returned value may be biased low.
+    Rebuild the distribution with a smaller ``tol`` (or pass ``max_service_level``).
+    """
+
+
+def _combine_truncation(*tols: "float | None") -> "float | None":
+    """Upper bound on the truncated tail mass of a sum of independent truncated variables."""
+    if any(t is None for t in tols):
+        return None
+    return float(sum(tols))
+
+
+def _lump_upper_tail(distr, params: tuple, min_value: int, max_value: int) -> np.ndarray:
+    """
+    PMF on ``[min_value, max_value]`` with the truncated upper-tail mass ``P(X > max_value)``
+    added to the last bin (instead of renormalising the whole PMF).
+
+    Renormalising by ``1 - tail`` would inflate the CDF at *every* support point by up to
+    ``tail`` and bias all high quantiles low. Lumping keeps ``F(x)`` exact for every
+    ``x < max_value``, so quantiles are exact up to ``F(max_value - 1)`` (~``1 - tol``).
+    """
+    pmf = distr.pmf(np.arange(min_value, max_value + 1), *params).astype(np.float64)
+    pmf[-1] += float(distr.sf(max_value, *params))
+    return pmf
 
 
 class PredictiveDistribution(ABC):
@@ -78,7 +108,8 @@ def compute_best_fit_distribution(data : np.ndarray) -> tuple[str, tuple[float]]
     return best_fit, best_fit_params
 
 class DiscreteDistribution(PredictiveDistribution):
-    def __init__(self, pmf: np.ndarray, min_value: int, bin_size: int = 1, distr_name: str = None, distr_params: tuple = None):
+    def __init__(self, pmf: np.ndarray, min_value: int, bin_size: int = 1, distr_name: str = None, distr_params: tuple = None,
+                 truncation_tol: float | None = None):
         self.pmf = np.ascontiguousarray(pmf / np.sum(pmf), dtype=np.float64)
         self.min = int(min_value)
         if (distr_name is not None) and (distr_name not in SUPPORTED_DISTRS.keys()):
@@ -86,9 +117,14 @@ class DiscreteDistribution(PredictiveDistribution):
         self.best_fit = distr_name
         self.best_fit_params = distr_params
         self.bin_size = int(bin_size)
+        # Upper bound on the upper-tail probability mass dropped when building this finite
+        # support (``None`` = unknown, ``0.0`` = exact). Quantiles above ``1 - truncation_tol``
+        # trigger a ``TruncatedSupportWarning``.
+        self.truncation_tol = truncation_tol
     
     def copy(self):
-        return DiscreteDistribution(self.pmf.copy(), self.min, self.bin_size, self.best_fit, self.best_fit_params)
+        return DiscreteDistribution(self.pmf.copy(), self.min, self.bin_size, self.best_fit, self.best_fit_params,
+                                    truncation_tol=self.truncation_tol)
     
     @property
     def max(self) -> int:
@@ -129,9 +165,15 @@ class DiscreteDistribution(PredictiveDistribution):
         return _pmf_crps_numba(self.pmf, self.min, self.bin_size, y_arr).reshape(np.shape(y))
 
     def sample(self, size: int = 1, rng: np.random.Generator | int | None = None) -> np.ndarray:
+        # Inverse-CDF sampling via the adaptive quantile kernel (CDF + binary search for large
+        # ``size``). Bypasses the truncation warning: occasional draws above ``1 - tol`` are
+        # expected and only cap a vanishing fraction of samples at the support maximum.
+        from probabilistic_modeling.ddlt import _pmf_quantiles_numba
+
         gen = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
         u = gen.random(size=size)
-        return self.quantile(u)
+        flat = _pmf_quantiles_numba(self.pmf, self.min, self.bin_size, np.ascontiguousarray(np.ravel(u)))
+        return flat.reshape(np.shape(u))
 
     @classmethod
     def from_data(cls, data: np.ndarray, method : str ='actual', tol : float = 1e-4):
@@ -153,23 +195,35 @@ class DiscreteDistribution(PredictiveDistribution):
         elif method == 'best_fit':
             best_fit, best_fit_params = compute_best_fit_distribution(data)
             max_value = int(SUPPORTED_DISTRS[best_fit].ppf(1 - tol, *best_fit_params))
-            pmf = SUPPORTED_DISTRS[best_fit].pmf(np.arange(min_value, max_value+1), *best_fit_params)
-            pmf /= np.sum(pmf)
+            pmf = _lump_upper_tail(SUPPORTED_DISTRS[best_fit], best_fit_params, min_value, max_value)
+            return cls(pmf, min_value, bin_size, best_fit, best_fit_params, truncation_tol=float(tol))
         else:
             raise ValueError(f"Invalid probability distribution initialization method: {method}. Available methods are: 'actual' and 'best_fit'.")
-        return cls(pmf, min_value, bin_size, best_fit, best_fit_params)
+        return cls(pmf, min_value, bin_size, best_fit, best_fit_params, truncation_tol=0.0)
     
     @classmethod
-    def from_parametric(cls, distr_name : str, params : tuple, tol : float = 1e-4):
+    def from_parametric(cls, distr_name : str, params : tuple, tol : float | None = None,
+                        max_service_level: float | None = None):
+        """
+        Builds a discrete distribution from a supported parametric family.
+
+        Unbounded supports are truncated at the ``1 - tol`` quantile. ``tol`` defaults to
+        ``DEFAULT_SUPPORT_TOL`` (1e-4) and is automatically tightened when
+        ``max_service_level`` is given so that quantiles up to that level stay exact.
+        """
+        from probabilistic_modeling.ddlt import DEFAULT_SUPPORT_TOL, support_tol_for_service_level
+
         if distr_name not in SUPPORTED_DISTRS.keys():
             raise ValueError(f"Distribution: {distr_name} is not supported.")
+        base_tol = DEFAULT_SUPPORT_TOL if tol is None else float(tol)
+        tol = support_tol_for_service_level(max_service_level, base_tol=base_tol)
         distr = SUPPORTED_DISTRS[distr_name]
         low, high = distr.support(*params)
         min_value = int(low)
-        max_value = int(high) if np.isfinite(high) else int(distr.ppf(1-tol, *params))
-        pmf = distr.pmf(np.arange(min_value, max_value+1), *params)
-        pmf /= np.sum(pmf)
-        return cls(pmf, min_value, 1, distr_name, params)
+        bounded = bool(np.isfinite(high))
+        max_value = int(high) if bounded else int(distr.ppf(1-tol, *params))
+        pmf = _lump_upper_tail(distr, params, min_value, max_value)
+        return cls(pmf, min_value, 1, distr_name, params, truncation_tol=0.0 if bounded else tol)
     
     def merge_bins(self, level : int = 10):
         if level == 1:
@@ -200,16 +254,33 @@ class DiscreteDistribution(PredictiveDistribution):
             self.merge_bins(new_bin_size)
     
     def quantile(self, q: list | np.ndarray | float) -> np.ndarray:
+        """
+        Discrete quantiles ``min{x : F(x) >= q}``.
+
+        Uses an adaptive Numba kernel: an early-exit linear scan for few queries, and a
+        single CDF build + binary search per query when many quantiles are requested
+        (e.g. ``sample(size=...)``). Results are identical in both modes.
+        """
         from probabilistic_modeling.ddlt import _pmf_quantiles_numba
 
-        q_arr = np.atleast_1d(np.asarray(q, dtype=np.float64))
+        q_arr = np.ascontiguousarray(np.atleast_1d(np.asarray(q, dtype=np.float64)).ravel())
         if np.any((q_arr < 0) | (q_arr > 1)):
             raise ValueError("Quantiles must be between 0 and 1.")
+        trunc = self.truncation_tol
+        if trunc is not None and trunc > 0.0 and np.any(q_arr > 1.0 - trunc):
+            warnings.warn(
+                f"Quantile level {float(np.max(q_arr)):.6g} exceeds 1 - truncation_tol ({1.0 - trunc:.6g}); "
+                "the finite support dropped up to that much upper-tail mass, so the result may be biased low. "
+                "Rebuild the distribution with a smaller 'tol' or pass 'max_service_level'.",
+                TruncatedSupportWarning,
+                stacklevel=2,
+            )
         return _pmf_quantiles_numba(self.pmf, self.min, self.bin_size, q_arr)
 
     def __add__(self, other : "DiscreteDistribution") -> "DiscreteDistribution":
         from probabilistic_modeling.ddlt import DEFAULT_TAIL_TOL, _convolve_1d_numba, _trim_pmf_numba
 
+        trunc = _combine_truncation(self.truncation_tol, other.truncation_tol)
         if self.bin_size != other.bin_size:
             self = self.copy()
             other = other.copy()
@@ -222,7 +293,7 @@ class DiscreteDistribution(PredictiveDistribution):
         new_pmf = _convolve_1d_numba(self.pmf, other.pmf)
         new_pmf /= np.sum(new_pmf)
         new_pmf, new_min = _trim_pmf_numba(new_pmf, new_min, new_bin_size, DEFAULT_TAIL_TOL)
-        return DiscreteDistribution(new_pmf, new_min, new_bin_size)
+        return DiscreteDistribution(new_pmf, new_min, new_bin_size, truncation_tol=trunc)
 
     def _align_bin_size(self):
         if (self.bin_size == 1) or (self.min % self.bin_size == 0):
@@ -330,7 +401,10 @@ class DiscreteDistribution(PredictiveDistribution):
             rv_mins[idx] = rv.min
 
         pmf, overall_min = _random_sum_aligned_numba(self.pmf, self.min, rv_pmfs, rv_mins, bin_size, tail_tol)
-        return DiscreteDistribution(pmf, overall_min, bin_size)
+        # Each outcome sums at most ``self.max`` truncated summands:
+        rv_truncs = [rv.truncation_tol for rv in aligned_rvs]
+        trunc = None if any(t is None for t in rv_truncs) else float(self.max * max(rv_truncs, default=0.0))
+        return DiscreteDistribution(pmf, overall_min, bin_size, truncation_tol=trunc)
 
     def plot(self, label : str = None
                  , title : str = None

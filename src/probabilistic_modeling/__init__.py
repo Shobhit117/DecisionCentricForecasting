@@ -38,6 +38,8 @@ _LAZY_EXPORTS: dict[str, str] = {
     "quantile_crps": "distributions.quantile",
     # lead-time demand
     "DDLTCalculator": "ddlt",
+    "support_tol_for_service_level": "ddlt",
+    "TruncatedSupportWarning": "distributions.discrete",
     # time series
     "DiscreteTimeSeries": "time_series",
     "TimeSeriesFeatureSpec": "time_series",

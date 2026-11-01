@@ -494,6 +494,7 @@ class ProbabilisticForecaster(ABC):
         pred_first_day: bool = True,
         df: pd.DataFrame | None = None,
         period: Any = None,
+        max_service_level: float | None = None,
     ) -> pd.DataFrame:
         ...
 
@@ -690,6 +691,7 @@ class GLMForecaster(ProbabilisticForecaster):
         df: pd.DataFrame | None = None,
         model_data: pd.DataFrame | GLMModel | None = None,
         period: Any = None,
+        max_service_level: float | None = None,
     ) -> pd.DataFrame:
         if lead_time is None:
             raise ValueError("'lead_time' distribution must be provided.")
@@ -705,7 +707,9 @@ class GLMForecaster(ProbabilisticForecaster):
             lead_time_keys=lead_time_keys,
             service_levels=service_levels,
             return_distribution=return_distribution,
-            group_fn=lambda gdf, lt_distr: DDLTCalculator(lt_distr, cycle_time).from_glm_group(
+            group_fn=lambda gdf, lt_distr: DDLTCalculator(
+                lt_distr, cycle_time, max_service_level=max_service_level
+            ).from_glm_group(
                 gdf,
                 lt_distr,
                 target_cols,
@@ -960,6 +964,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         df: pd.DataFrame | None = None,
         model: "CatBoostQuantileModel | None" = None,
         period: Any = None,
+        max_service_level: float | None = None,
     ) -> pd.DataFrame:
         if lead_time is None:
             raise ValueError("'lead_time' distribution must be provided.")
@@ -979,7 +984,9 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
             lead_time_keys=lead_time_keys,
             service_levels=service_levels,
             return_distribution=return_distribution,
-            group_fn=lambda gdf, lt_distr: DDLTCalculator(lt_distr, cycle_time, tol=self.tol).from_quantiles_group(
+            group_fn=lambda gdf, lt_distr: DDLTCalculator(
+                lt_distr, cycle_time, tol=self.tol, max_service_level=max_service_level
+            ).from_quantiles_group(
                 gdf,
                 lt_distr,
                 target_cols,

@@ -281,9 +281,20 @@ The numerically heavy parts are implemented as **Numba-compiled kernels** (`ddlt
 | Adaptive convolution: direct for small inputs, radix-2 FFT for large ones | Convolution | 12×–49× speed-ups on 10k–25k-bin distributions |
 | Optional `rocket-fft` integration | Convolution | Uses NumPy FFT inside Numba when installed |
 | O(1)-memory quantile lookup directly on PMFs | Newsvendor, quantile targets | No CDF arrays allocated |
+| Adaptive quantile search: early-exit scan for few queries, CDF + binary search for many | `quantile([...])`, `sample()` | Up to ~70× faster for thousands of queries; identical results |
+| CDF prefixes up to the unconstrained answer + binary search in the shadow-price loop | Newsvendor | ~1.2–1.4× (the k = 0 scan dominates) |
 | Parallel (`prange`) loops over items and Monte Carlo runs | Simulation, PMF reconstruction | Scales with CPU cores |
 
 > First calls are slower because of JIT compilation; subsequent runs hit the on-disk cache.
+
+### Very high service levels (99.99% and beyond)
+
+Unbounded distributions are stored on a finite support that cuts off a small upper-tail mass `tol` (default 1e-4). The cut-off mass is lumped into the last bin, so the CDF is exact below it, but quantiles above `1 − tol` would be biased low. The library guards against this:
+
+- `support_tol_for_service_level(sl, n_terms)` picks `tol = min(1e-4, (1 − sl) / (10 · n_terms))`;
+- `DDLTCalculator` applies it automatically from the `service_level` column (target mode) or from `max_service_level=` (distribution mode, also accepted by `compute_lead_time_demand` and `compute_ddlt`);
+- `DiscreteDistribution.from_parametric(..., max_service_level=0.9999)` does the same for single distributions;
+- every distribution carries a `truncation_tol`, and `quantile()` emits a `TruncatedSupportWarning` when asked for a level above `1 − truncation_tol`.
 
 ---
 

@@ -13,6 +13,7 @@ from typing import Any
 _LAZY_EXPORTS: dict[str, str] = {
     "DiscreteDistribution": "discrete",
     "PredictiveDistribution": "discrete",
+    "TruncatedSupportWarning": "discrete",
     "compute_best_fit_distribution": "discrete",
     "DEFAULT_QUANTILES": "quantile",
     "ContinuousQuantileDistribution": "quantile",

@@ -35,6 +35,50 @@ DEFAULT_TAIL_TOL = 1e-9
 FFT_CONVOLVE_THRESHOLD = 262_144
 FFT_MIN_SIDE = 256
 
+# Default upper-tail probability mass cut off when building finite supports
+# (``from_parametric``, quantile-tail extrapolation). Automatically tightened for
+# very high service levels by :func:`support_tol_for_service_level`.
+DEFAULT_SUPPORT_TOL = 1e-4
+# Safety factor between the truncated tail mass and ``1 - service_level``.
+SUPPORT_TOL_SAFETY_FACTOR = 10.0
+MIN_SUPPORT_TOL = 1e-12
+
+# Adaptive quantile search: build the CDF once and binary-search when several
+# quantiles are requested from the same (sufficiently long) PMF; otherwise the
+# early-exit linear scan is faster (it never touches bins beyond the answer).
+QUANTILE_BSEARCH_MIN_QUERIES = 8
+QUANTILE_BSEARCH_MIN_SUPPORT = 64
+
+
+def support_tol_for_service_level(
+    max_service_level: float | None,
+    n_terms: int = 1,
+    base_tol: float = DEFAULT_SUPPORT_TOL,
+    safety_factor: float = SUPPORT_TOL_SAFETY_FACTOR,
+) -> float:
+    """
+    Returns the per-distribution upper-tail truncation tolerance needed so that a
+    quantile at ``max_service_level`` is not distorted by support truncation.
+
+    Each of the (up to) ``n_terms`` truncated daily distributions summed into a DDLT
+    distribution can drop up to ``tol`` upper-tail mass, so the total truncated mass is
+    bounded by ``n_terms * tol``. We require it to be ``safety_factor`` times smaller
+    than ``1 - max_service_level``::
+
+        tol = min(base_tol, (1 - max_service_level) / (safety_factor * n_terms))
+
+    Examples (``n_terms=1``): 0.95 -> 1e-4 (default), 0.999 -> 1e-4, 0.9999 -> 1e-5,
+    0.99999 -> 1e-6.
+    """
+    if max_service_level is None or not np.isfinite(max_service_level):
+        return float(base_tol)
+    sl = float(max_service_level)
+    if sl <= 0.0:
+        return float(base_tol)
+    tail = max(1.0 - sl, 0.0)
+    required = tail / (float(safety_factor) * max(int(n_terms), 1))
+    return float(max(min(base_tol, required), MIN_SUPPORT_TOL))
+
 
 @njit(cache=True)
 def _direct_convolve_1d_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -238,6 +282,9 @@ def _pmf_quantile_scalar_numba(pmf: np.ndarray, min_val: int, bin_size: int, q: 
     Computes the discrete quantile at level ``q`` directly from ``pmf`` in O(1) auxiliary
     memory (without allocating or caching a CDF array).
     Matches ``np.searchsorted(np.cumsum(pmf), q, side='left')``.
+
+    Cost is O(index of the answer): optimal for a *single* query on a PMF, because building
+    a CDF for binary search would itself require a full O(n) pass.
     """
     n = len(pmf)
     if q <= 0.0 or n <= 1:
@@ -251,13 +298,173 @@ def _pmf_quantile_scalar_numba(pmf: np.ndarray, min_val: int, bin_size: int, q: 
 
 
 @njit(cache=True)
+def _pmf_to_cdf_numba(pmf: np.ndarray) -> np.ndarray:
+    """
+    Sequential cumulative sum with a running maximum.
+
+    Summation order is identical to :func:`_pmf_quantile_scalar_numba`, and the running
+    maximum keeps the CDF non-decreasing even if ``pmf`` contains tiny negative round-off
+    values (e.g. from FFT convolution). The first index where the running max reaches ``q``
+    is exactly the first index where the raw cumulative sum reaches ``q``, so binary search
+    on this array returns bit-identical results to the linear scan.
+    """
+    n = len(pmf)
+    cdf = np.empty(n, dtype=np.float64)
+    csum = 0.0
+    run_max = -np.inf
+    for i in range(n):
+        csum += pmf[i]
+        if csum > run_max:
+            run_max = csum
+        cdf[i] = run_max
+    return cdf
+
+
+@njit(cache=True)
+def _cdf_quantile_scalar_numba(
+    cdf: np.ndarray, start: int, n: int, min_val: int, bin_size: int, q: float
+) -> int:
+    """
+    Binary search for the smallest index ``i`` in ``cdf[start : start + n]`` with
+    ``cdf[i] >= q``. O(log n).
+
+    The search interval is the whole (finite) support ``[0, n - 1]``. Initialising ``hi`` to
+    the last index (rather than ``n``) also covers ``q > cdf[-1]``, which can happen when the
+    CDF ends at ``1 - eps`` due to floating-point round-off and ``q`` is very close to 1:
+    the last support point is returned, matching the linear scan.
+    """
+    if q <= 0.0 or n <= 1:
+        return min_val
+    lo = 0
+    hi = n - 1
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if cdf[start + mid] >= q:
+            hi = mid
+        else:
+            lo = mid + 1
+    return min_val + lo * bin_size
+
+
+@njit(cache=True)
 def _pmf_quantiles_numba(pmf: np.ndarray, min_val: int, bin_size: int, q_arr: np.ndarray) -> np.ndarray:
-    """Vectorized quantile evaluation on a single PMF with O(1) extra memory."""
+    """
+    Vectorized quantile evaluation on a single PMF with adaptive search:
+
+    - few queries or short support: early-exit linear scan per query, O(1) extra memory;
+    - many queries on a long support: build the CDF once (O(n)) and binary-search each
+      query (O(log n)), i.e. O(n + m log n) instead of O(m n).
+    """
+    m = len(q_arr)
+    n = len(pmf)
+    out = np.empty(m, dtype=np.int64)
+    if m >= QUANTILE_BSEARCH_MIN_QUERIES and n >= QUANTILE_BSEARCH_MIN_SUPPORT:
+        cdf = _pmf_to_cdf_numba(pmf)
+        for k in range(m):
+            out[k] = _cdf_quantile_scalar_numba(cdf, 0, n, min_val, bin_size, q_arr[k])
+    else:
+        for k in range(m):
+            out[k] = _pmf_quantile_scalar_numba(pmf, min_val, bin_size, q_arr[k])
+    return out
+
+
+@njit(cache=True)
+def _pmf_quantiles_linear_numba(pmf: np.ndarray, min_val: int, bin_size: int, q_arr: np.ndarray) -> np.ndarray:
+    """Reference implementation: one early-exit linear scan per query (O(m n))."""
     m = len(q_arr)
     out = np.empty(m, dtype=np.int64)
     for k in range(m):
         out[k] = _pmf_quantile_scalar_numba(pmf, min_val, bin_size, q_arr[k])
     return out
+
+
+@njit(cache=True)
+def _build_cdfs_flat_numba(pmf_flat: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """
+    Builds the CDFs of many PMFs stored back-to-back in ``pmf_flat``; PMF ``i`` occupies
+    ``pmf_flat[offsets[i] : offsets[i + 1]]``. Returns a flat CDF array with the same layout.
+    """
+    cdf_flat = np.empty(len(pmf_flat), dtype=np.float64)
+    for i in range(len(offsets) - 1):
+        s = offsets[i]
+        e = offsets[i + 1]
+        csum = 0.0
+        run_max = -np.inf
+        for j in range(s, e):
+            csum += pmf_flat[j]
+            if csum > run_max:
+                run_max = csum
+            cdf_flat[j] = run_max
+    return cdf_flat
+
+
+@njit(cache=True)
+def _batch_cdf_quantiles_numba(
+    cdf_flat: np.ndarray,
+    offsets: np.ndarray,
+    mins: np.ndarray,
+    bin_sizes: np.ndarray,
+    alphas: np.ndarray,
+) -> np.ndarray:
+    """Binary-search one quantile ``alphas[i]`` per precomputed CDF (O(log n_i) each)."""
+    n = len(offsets) - 1
+    out = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        s = offsets[i]
+        out[i] = _cdf_quantile_scalar_numba(
+            cdf_flat, s, offsets[i + 1] - s, int(mins[i]), int(bin_sizes[i]), float(alphas[i])
+        )
+    return out
+
+
+@njit(cache=True)
+def _build_prefix_cdfs_numba(pmfs: NumbaList, lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Builds only the first ``lengths[i]`` CDF entries of each PMF in ``pmfs`` (flat layout).
+
+    When every future query on PMF ``i`` is known to be ``<= cdf_i[lengths[i] - 1]`` (e.g.
+    in the newsvendor shadow-price search, where critical fractiles only *decrease* from the
+    unconstrained solution), the prefix is all that binary search ever needs. Building it
+    costs the same as one early-exit linear scan instead of a pass over the full support.
+    """
+    n = len(pmfs)
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    for i in range(n):
+        li = lengths[i]
+        if li > len(pmfs[i]):
+            li = len(pmfs[i])
+        if li < 1:
+            li = 1
+        offsets[i + 1] = offsets[i] + li
+    cdf_flat = np.empty(offsets[n], dtype=np.float64)
+    for i in range(n):
+        p = pmfs[i]
+        s = offsets[i]
+        csum = 0.0
+        run_max = -np.inf
+        for j in range(offsets[i + 1] - s):
+            csum += p[j]
+            if csum > run_max:
+                run_max = csum
+            cdf_flat[s + j] = run_max
+    return cdf_flat, offsets
+
+
+def build_cdf_table(pmfs: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Concatenates ``pmfs`` and builds all CDFs in one compiled pass.
+
+    Returns ``(cdf_flat, offsets)`` for use with :func:`_batch_cdf_quantiles_numba`.
+    Useful whenever the same set of distributions is queried repeatedly (e.g. inside the
+    newsvendor shadow-price search).
+    """
+    lengths = np.fromiter((len(p) for p in pmfs), dtype=np.int64, count=len(pmfs))
+    offsets = np.zeros(len(pmfs) + 1, dtype=np.int64)
+    np.cumsum(lengths, out=offsets[1:])
+    if len(pmfs) == 0:
+        return np.empty(0, dtype=np.float64), offsets
+    pmf_flat = np.ascontiguousarray(np.concatenate(pmfs), dtype=np.float64)
+    return _build_cdfs_flat_numba(pmf_flat, offsets), offsets
 
 
 @njit(cache=True)
@@ -532,6 +739,15 @@ class DDLTCalculator:
     Combines multi-horizon daily demand forecasts (represented either as quantile grids,
     GLM ``(mu, alpha)`` parameters, or lists of :class:`DiscreteDistribution`) with a
     lead-time distribution and review cycle time.
+
+    Support truncation
+    ------------------
+    Daily distributions are built on finite supports that cut off ``tol`` upper-tail mass.
+    For very high service levels (e.g. 99.99%) that truncation would bias the quantile
+    downwards, so the effective tolerance is automatically tightened to
+    ``support_tol_for_service_level(max_sl, n_terms=max(L + R))`` where ``max_sl`` is the
+    largest of ``max_service_level`` and the ``service_level`` column (when computing
+    targets). ``tol`` therefore acts as an upper bound; it is never loosened.
     """
 
     def __init__(
@@ -539,16 +755,33 @@ class DDLTCalculator:
         lead_time: DiscreteDistribution | dict[Any, DiscreteDistribution],
         cycle_time: int = 0,
         lead_time_keys: list[str] | None = None,
-        tol: float = 1e-4,
+        tol: float = DEFAULT_SUPPORT_TOL,
         tail_tol: float = DEFAULT_TAIL_TOL,
+        max_service_level: float | None = None,
     ):
         if cycle_time < 0:
             raise ValueError("'cycle_time' must be non-negative.")
+        if max_service_level is not None and not (0.0 <= float(max_service_level) <= 1.0):
+            raise ValueError("'max_service_level' must be between 0 and 1.")
         self.lead_time = lead_time
         self.cycle_time = cycle_time
         self.lead_time_keys = list(lead_time_keys) if lead_time_keys else []
         self.tol = tol
         self.tail_tol = tail_tol
+        self.max_service_level = max_service_level
+
+    def effective_tol(self, n_terms: int, service_levels: np.ndarray | None = None) -> float:
+        """Per-day support tolerance that keeps quantiles up to the max service level exact."""
+        candidates = []
+        if self.max_service_level is not None:
+            candidates.append(float(self.max_service_level))
+        if service_levels is not None and len(service_levels) > 0:
+            finite = service_levels[np.isfinite(service_levels)]
+            if len(finite) > 0:
+                candidates.append(float(np.max(finite)))
+        if not candidates:
+            return float(self.tol)
+        return support_tol_for_service_level(max(candidates), n_terms=n_terms, base_tol=float(self.tol))
 
     def _shifted_lead_time(self, lt: DiscreteDistribution) -> DiscreteDistribution:
         lt_with_cycle = lt.copy()
@@ -560,7 +793,9 @@ class DDLTCalculator:
         return lt_with_cycle
 
     @staticmethod
-    def _build_default_demand(row: pd.Series, max_lt: int, horizon: int) -> DiscreteDistribution | None:
+    def _build_default_demand(
+        row: pd.Series, max_lt: int, horizon: int, tol: float = DEFAULT_SUPPORT_TOL
+    ) -> DiscreteDistribution | None:
         if max_lt <= horizon:
             return None
         best_fit = row.get("best_fit")
@@ -574,7 +809,7 @@ class DDLTCalculator:
             for c in ("distr_param_0", "distr_param_1", "distr_param_2")
             if c in row and not pd.isna(row[c])
         )
-        return DiscreteDistribution.from_parametric(str(best_fit), params)
+        return DiscreteDistribution.from_parametric(str(best_fit), params, tol=tol)
 
     def from_quantiles_group(
         self,
@@ -622,13 +857,16 @@ class DDLTCalculator:
             if missing_param:
                 raise ValueError(f"Missing columns required to compute target inventory: {missing_param}.")
 
+        n_terms = max(int(lt_with_cycle.max), 1)
+        tol_eff = self.effective_tol(n_terms, None if return_distribution else service_levels_arr)
         logger.info(
-            "Computing Numba DDLT from quantiles for %d rows (horizon=%d, quantiles=%d, L+R support=[%d, %d])...",
+            "Computing Numba DDLT from quantiles for %d rows (horizon=%d, quantiles=%d, L+R support=[%d, %d], tol=%.1e)...",
             len(gdf),
             horizon,
             len(levels),
             lt_with_cycle.min,
             lt_with_cycle.max,
+            tol_eff,
         )
 
         num_q = len(levels)
@@ -644,7 +882,7 @@ class DDLTCalculator:
                 raise ValueError(f"Invalid CatBoost quantile forecast for row {row_num}: {row_quantiles}.")
 
             if needs_default:
-                default_distr = self._build_default_demand(gdf.iloc[row_num], lt_with_cycle.max, horizon)
+                default_distr = self._build_default_demand(gdf.iloc[row_num], lt_with_cycle.max, horizon, tol=tol_eff)
                 default_pmf = np.ascontiguousarray(default_distr.pmf, dtype=np.float64)
                 default_min = int(default_distr.min)
             else:
@@ -652,10 +890,10 @@ class DDLTCalculator:
                 default_min = 0
 
             ddlt_pmf, ddlt_min = _ddlt_from_quantiles_row_numba(
-                lt_pmf, lt_min, levels, row_quantiles, default_pmf, default_min, self.tol, self.tail_tol
+                lt_pmf, lt_min, levels, row_quantiles, default_pmf, default_min, tol_eff, self.tail_tol
             )
             if return_distribution:
-                results.append(DiscreteDistribution(ddlt_pmf, ddlt_min, 1))
+                results.append(DiscreteDistribution(ddlt_pmf, ddlt_min, 1, truncation_tol=n_terms * tol_eff))
             else:
                 q_val = _pmf_quantile_scalar_numba(ddlt_pmf, ddlt_min, 1, float(service_levels_arr[row_num]))
                 results.append(int(q_val))
@@ -709,12 +947,15 @@ class DDLTCalculator:
         if missing_cols:
             raise ValueError(f"Missing columns required to compute target inventory: {missing_cols}.")
 
+        n_terms = max(int(lt_with_cycle.max), 1)
+        tol_eff = self.effective_tol(n_terms, None if return_distribution else service_levels_arr)
         logger.info(
-            "Computing DDLT from GLM parameters for %d rows (horizon=%d, L+R support=[%d, %d])...",
+            "Computing DDLT from GLM parameters for %d rows (horizon=%d, L+R support=[%d, %d], tol=%.1e)...",
             len(gdf),
             horizon,
             lt_with_cycle.min,
             lt_with_cycle.max,
+            tol_eff,
         )
 
         mu_arr = gdf[glm_mu_cols].to_numpy(dtype=float)
@@ -725,7 +966,7 @@ class DDLTCalculator:
             mu = mu_arr[row_num]
             alpha = alpha_arr[row_num]
             default_demand = (
-                self._build_default_demand(gdf.iloc[row_num], lt_with_cycle.max, horizon)
+                self._build_default_demand(gdf.iloc[row_num], lt_with_cycle.max, horizon, tol=tol_eff)
                 if needs_default
                 else None
             )
@@ -735,13 +976,14 @@ class DDLTCalculator:
                 if pd.isna(curr_mu) or curr_mu < 0:
                     raise ValueError(f"Invalid GLM mean for row {row_num}: {curr_mu}.")
                 if pd.isna(curr_alpha) or curr_alpha <= 0:
-                    demand.append(DiscreteDistribution.from_parametric("poisson", (float(curr_mu), 0), tol=self.tol))
+                    demand.append(DiscreteDistribution.from_parametric("poisson", (float(curr_mu), 0), tol=tol_eff))
                 else:
                     n = 1.0 / curr_alpha
                     p = 1.0 / (1.0 + curr_mu * curr_alpha)
-                    demand.append(DiscreteDistribution.from_parametric("nbinom", (n, p, 0), tol=self.tol))
+                    demand.append(DiscreteDistribution.from_parametric("nbinom", (n, p, 0), tol=tol_eff))
 
             demand_during_lead_time = lt_with_cycle.random_sum(demand, default_demand, tail_tol=self.tail_tol)
+            demand_during_lead_time.truncation_tol = n_terms * tol_eff
             if return_distribution:
                 results.append(demand_during_lead_time)
             else:

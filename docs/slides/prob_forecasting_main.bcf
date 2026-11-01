@@ -2380,6 +2380,10 @@
     <bcf:citekey order="5" intorder="1">snyder2019</bcf:citekey>
     <bcf:citekey order="6" intorder="1">zhang2009</bcf:citekey>
     <bcf:citekey order="7" intorder="1">perakis2020</bcf:citekey>
+    <bcf:citekey order="8" intorder="1">mahajan2001</bcf:citekey>
+    <bcf:citekey order="9" intorder="1">netessine2003</bcf:citekey>
+    <bcf:citekey order="10" intorder="1">rajaram2001</bcf:citekey>
+    <bcf:citekey order="11" intorder="1">kok2007</bcf:citekey>
   </bcf:section>
   <!-- SORTING TEMPLATES -->
   <bcf:sortingtemplate name="nyt">

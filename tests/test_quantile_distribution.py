@@ -86,7 +86,11 @@ def test_numba_quantile_matches_searchsorted_cdf():
     qs = np.linspace(0.0, 1.0, 101)
     indices = np.clip(np.searchsorted(d.cdf, qs, side="left"), 0, len(d.pmf) - 1)
     expected = d.min + indices * d.bin_size
-    assert np.array_equal(d.quantile(qs), expected)
+    # q = 1.0 on a truncated (unbounded) family legitimately triggers the truncation warning:
+    from probabilistic_modeling.distributions.discrete import TruncatedSupportWarning
+
+    with pytest.warns(TruncatedSupportWarning):
+        assert np.array_equal(d.quantile(qs), expected)
 
 
 def test_invalid_levels_raise():
