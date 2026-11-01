@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "probabilistic-modeling"
+version = "0.2.0"
+description = "End-to-end probabilistic forecasting, distribution algebra, and inventory optimization library"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "polars",
+    "scipy",
+    "statsmodels",
+    "matplotlib",
+    "requests",
+    "pyarrow",
+    "numba",
+    "catboost",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+py-modules = [
+    "catboost_quantile",
+    "ddlt",
+    "discrete_distribution",
+    "forecasters",
+    "logging_utils",
+    "multi_product_newsvendor",
+    "probability_utils",
+    "process_m5_dataset",
+    "quantile_distribution",
+    "run_m5_pipeline",
+    "time_series",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

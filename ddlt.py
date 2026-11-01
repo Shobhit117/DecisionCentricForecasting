@@ -24,13 +24,21 @@ from discrete_distribution import DiscreteDistribution
 
 logger = logging.getLogger(__name__)
 
+try:
+    import rocket_fft as _rocket_fft  # type: ignore[import-not-found]  # noqa: F401
+    HAS_ROCKET_FFT = True
+except ImportError:
+    HAS_ROCKET_FFT = False
+
 _LEFT_LIMIT_EPS = 1e-9
 DEFAULT_TAIL_TOL = 1e-9
+FFT_CONVOLVE_THRESHOLD = 262_144
+FFT_MIN_SIDE = 256
 
 
 @njit(cache=True)
-def _convolve_1d_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """1D discrete convolution of two PMFs."""
+def _direct_convolve_1d_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Direct O(N * M) 1D discrete convolution of two PMFs."""
     na = len(a)
     nb = len(b)
     out = np.zeros(na + nb - 1, dtype=np.float64)
@@ -40,6 +48,155 @@ def _convolve_1d_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
             for j in range(nb):
                 out[i + j] += ai * b[j]
     return out
+
+
+@njit(cache=True)
+def _inplace_fft_radix2_numba(re: np.ndarray, im: np.ndarray, inverse: bool) -> None:
+    """
+    In-place iterative Cooley-Tukey Radix-2 FFT on separate contiguous float64 real/imag arrays.
+    Uses stage-wise twiddle recurrence (only 1 sin/cos evaluation per stage) for maximum speed.
+    ``len(re)`` must be a power of 2.
+    """
+    m = len(re)
+    j = 0
+    for i in range(1, m):
+        bit = m >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j ^= bit
+        if i < j:
+            re[i], re[j] = re[j], re[i]
+            im[i], im[j] = im[j], im[i]
+
+    w_re = np.empty(m >> 1, dtype=np.float64)
+    w_im = np.empty(m >> 1, dtype=np.float64)
+
+    length = 2
+    while length <= m:
+        half = length >> 1
+        angle = (2.0 * np.pi / length) if inverse else (-2.0 * np.pi / length)
+        wlen_re = np.cos(angle)
+        wlen_im = np.sin(angle)
+        cur_re = 1.0
+        cur_im = 0.0
+        for k in range(half):
+            w_re[k] = cur_re
+            w_im[k] = cur_im
+            nxt_re = cur_re * wlen_re - cur_im * wlen_im
+            cur_im = cur_re * wlen_im + cur_im * wlen_re
+            cur_re = nxt_re
+
+        for i in range(0, m, length):
+            for k in range(half):
+                u_idx = i + k
+                v_idx = u_idx + half
+                vr = re[v_idx] * w_re[k] - im[v_idx] * w_im[k]
+                vi = re[v_idx] * w_im[k] + im[v_idx] * w_re[k]
+                ur = re[u_idx]
+                ui = im[u_idx]
+                re[u_idx] = ur + vr
+                im[u_idx] = ui + vi
+                re[v_idx] = ur - vr
+                im[v_idx] = ui - vi
+        length <<= 1
+
+    if inverse:
+        inv_m = 1.0 / m
+        for i in range(m):
+            re[i] *= inv_m
+            im[i] *= inv_m
+
+
+@njit(cache=True)
+def _fft_convolve_radix2_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    O(N log N) Numba-compiled 1D real convolution packing both real PMFs ``a`` and ``b``
+    into a single complex FFT (`z = a + i*b`), unpacking `A[k]*B[k]` via conjugate symmetry,
+    and running a single inverse FFT.
+    """
+    na = len(a)
+    nb = len(b)
+    out_len = na + nb - 1
+    m = 1
+    while m < out_len:
+        m <<= 1
+
+    re = np.zeros(m, dtype=np.float64)
+    im = np.zeros(m, dtype=np.float64)
+    re[:na] = a
+    im[:nb] = b
+
+    _inplace_fft_radix2_numba(re, im, False)
+
+    # Unpack DFT(a) and DFT(b) from Z = DFT(a + i*b) and multiply in-place:
+    half_m = m >> 1
+    mask = m - 1
+    for k in range(half_m + 1):
+        mk = (m - k) & mask
+        r1 = re[k]
+        i1 = im[k]
+        r2 = re[mk]
+        i2 = im[mk]
+        a_re = 0.5 * (r1 + r2)
+        a_im = 0.5 * (i1 - i2)
+        b_re = 0.5 * (i1 + i2)
+        b_im = 0.5 * (r2 - r1)
+        c_re = a_re * b_re - a_im * b_im
+        c_im = a_re * b_im + a_im * b_re
+        re[k] = c_re
+        im[k] = c_im
+        if mk != k:
+            re[mk] = c_re
+            im[mk] = -c_im
+
+    _inplace_fft_radix2_numba(re, im, True)
+
+    out = np.empty(out_len, dtype=np.float64)
+    for i in range(out_len):
+        val = re[i]
+        out[i] = val if val > 0.0 else 0.0
+    return out
+
+
+if HAS_ROCKET_FFT:
+    @njit(cache=True)
+    def _fft_convolve_rocket_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """O(N log N) Numba-compiled 1D real convolution powered by rocket-fft (PocketFFT)."""
+        na = len(a)
+        nb = len(b)
+        out_len = na + nb - 1
+        m = 1
+        while m < out_len:
+            m <<= 1
+        fa = np.fft.rfft(a, m)
+        fb = np.fft.rfft(b, m)
+        conv = np.fft.irfft(fa * fb, m)
+        out = np.empty(out_len, dtype=np.float64)
+        for i in range(out_len):
+            val = conv[i]
+            out[i] = val if val > 0.0 else 0.0
+        return out
+
+    _fft_convolve_1d_numba = _fft_convolve_rocket_numba
+else:
+    _fft_convolve_1d_numba = _fft_convolve_radix2_numba
+
+
+@njit(cache=True)
+def _convolve_1d_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Adaptive 1D discrete convolution of two PMFs in compiled Numba code:
+    - Uses direct O(N * M) loop for compact supports (``len(a) * len(b) <= FFT_CONVOLVE_THRESHOLD``
+      or ``min(len(a), len(b)) < FFT_MIN_SIDE``).
+    - Automatically switches to O(N log N) Numba FFT convolution (`rocket-fft` if installed,
+      or pure-Numba Radix-2 single-complex-FFT) for large supports.
+    """
+    na = len(a)
+    nb = len(b)
+    if na >= FFT_MIN_SIDE and nb >= FFT_MIN_SIDE and na * nb > FFT_CONVOLVE_THRESHOLD:
+        return _fft_convolve_1d_numba(a, b)
+    return _direct_convolve_1d_numba(a, b)
 
 
 @njit(cache=True)
@@ -115,6 +272,51 @@ def _batch_pmf_quantiles_numba(
     out = np.empty(n, dtype=np.int64)
     for i in range(n):
         out[i] = _pmf_quantile_scalar_numba(pmfs[i], int(mins[i]), int(bin_sizes[i]), float(alphas[i]))
+    return out
+
+
+@njit(cache=True)
+def _pmf_crps_scalar_numba(pmf: np.ndarray, min_val: int, bin_size: int, y: float) -> float:
+    """
+    Computes the exact Continuous/Discrete Ranked Probability Score (CRPS)
+    ``int_{-inf}^{inf} (F(x) - 1(x >= y))^2 dx`` directly from a discrete PMF in O(1) memory.
+    """
+    n = len(pmf)
+    x_first = float(min_val)
+    x_last = float(min_val + (n - 1) * bin_size)
+    score = 0.0
+    if y < x_first:
+        score += x_first - y
+
+    csum = 0.0
+    step = float(bin_size)
+    for i in range(n - 1):
+        csum += pmf[i]
+        if csum > 1.0:
+            csum = 1.0
+        x_lo = float(min_val + i * bin_size)
+        x_hi = x_lo + step
+        if y <= x_lo:
+            diff = 1.0 - csum
+            score += step * diff * diff
+        elif y >= x_hi:
+            score += step * csum * csum
+        else:
+            diff = 1.0 - csum
+            score += (y - x_lo) * csum * csum + (x_hi - y) * diff * diff
+
+    if y > x_last:
+        score += y - x_last
+    return score
+
+
+@njit(cache=True)
+def _pmf_crps_numba(pmf: np.ndarray, min_val: int, bin_size: int, y_arr: np.ndarray) -> np.ndarray:
+    """Vectorized CRPS evaluation on a single PMF across an array of observations."""
+    m = len(y_arr)
+    out = np.empty(m, dtype=np.float64)
+    for k in range(m):
+        out[k] = _pmf_crps_scalar_numba(pmf, min_val, bin_size, float(y_arr[k]))
     return out
 
 

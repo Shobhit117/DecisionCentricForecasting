@@ -438,6 +438,35 @@ ddlt_predictions = compute_lead_time_demand(
 )
 ```
 
+### 4. Save Once & Predict Repeatedly on New Data (`load_forecaster` & `predict_from_raw`)
+
+Both `GLMForecaster` and `CatBoostQuantileForecaster` persist their complete training state—model weights, feature-engineering specification (`TimeSeriesFeatureSpec`), and per-series training metadata (`overdispersion`, fallback `best_fit` parameters)—into a self-contained directory bundle. A loaded forecaster can predict on specific periods, standalone feature DataFrames, or brand-new raw sales tables without needing the original training `DiscreteTimeSeries`:
+
+```python
+from forecasters import load_forecaster
+
+# 1. Save any fitted forecaster (GLMForecaster or CatBoostQuantileForecaster):
+forecaster.save("artifacts/my_forecaster_bundle")
+
+# 2. Load the bundle in a new session (auto-detects GLM vs. CatBoost):
+loaded = load_forecaster("artifacts/my_forecaster_bundle")
+
+# 3a. Predict on specific decision periods or standalone DataFrames:
+preds_day_60 = loaded.predict(ts, period=60)
+preds_window = loaded.predict(ts, period=[58, 59, 60])
+
+# 3b. Transform & predict directly from newly arrived raw sales + calendar tables:
+new_preds = loaded.predict_from_raw(
+    new_sales_df,
+    calendar_df=updated_calendar_df,
+    period=65,
+)
+
+# 3c. Compute DDLT directly from transformed inference rows (without `ts`):
+inf_df = loaded.transform(new_sales_df, calendar_df=updated_calendar_df, period=65)
+ddlt_df = loaded.compute_ddlt(inf_df, lead_time=lead_time_distr, lead_time_keys=["store_id"], cycle_time=1)
+```
+
 ---
 
 ## Development Roadmap

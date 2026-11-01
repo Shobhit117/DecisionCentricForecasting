@@ -1,15 +1,59 @@
+from abc import ABC, abstractmethod
 import numpy as np
-from scipy import stats
+from scipy import signal, stats
 import probability_utils as prob
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 from numba.typed import List as NumbaList
+
+# Product of support lengths above which FFT convolution is faster than O(N*M) direct loop:
+FFT_CONVOLVE_THRESHOLD = 65_536
 
 SUPPORTED_DISTRS = {'nbinom': stats.nbinom,
                     'binom': stats.binom,
                     'poisson': stats.poisson,
                     'geom': stats.geom,
                     'uniform': stats.randint}
+
+
+class PredictiveDistribution(ABC):
+    """
+    Common interface for 1D predictive probability distributions (both discrete and continuous).
+    """
+
+    @abstractmethod
+    def mean(self) -> float:
+        """Expected value E[X]."""
+        ...
+
+    @abstractmethod
+    def variance(self) -> float:
+        """Variance Var(X)."""
+        ...
+
+    def std(self) -> float:
+        """Standard deviation sqrt(Var(X))."""
+        return float(np.sqrt(max(0.0, self.variance())))
+
+    @abstractmethod
+    def quantile(self, q: list | np.ndarray | float) -> np.ndarray:
+        """Evaluates the quantile function F^{-1}(q) at one or more probability levels in [0, 1]."""
+        ...
+
+    @abstractmethod
+    def cdf_at(self, x: list | np.ndarray | float) -> np.ndarray:
+        """Evaluates the cumulative distribution function P(X <= x) at one or more values."""
+        ...
+
+    @abstractmethod
+    def crps(self, y: float | list | np.ndarray) -> float | np.ndarray:
+        """Continuous/Discrete Ranked Probability Score for observation(s) ``y``."""
+        ...
+
+    @abstractmethod
+    def sample(self, size: int = 1, rng: np.random.Generator | int | None = None) -> np.ndarray:
+        """Draws ``size`` random samples from the distribution."""
+        ...
 
 def compute_best_fit_distribution(data : np.ndarray) -> tuple[str, tuple[float]]:
     best_fit = None
@@ -33,7 +77,7 @@ def compute_best_fit_distribution(data : np.ndarray) -> tuple[str, tuple[float]]
             best_fit_params = params
     return best_fit, best_fit_params
 
-class DiscreteDistribution:
+class DiscreteDistribution(PredictiveDistribution):
     def __init__(self, pmf: np.ndarray, min_value: int, bin_size: int = 1, distr_name: str = None, distr_params: tuple = None):
         self.pmf = np.ascontiguousarray(pmf / np.sum(pmf), dtype=np.float64)
         self.min = int(min_value)
@@ -51,8 +95,43 @@ class DiscreteDistribution:
         return self.min + self.bin_size * len(self.pmf) - 1
 
     @property
+    def support(self) -> np.ndarray:
+        return self.min + self.bin_size * np.arange(len(self.pmf), dtype=np.int64)
+
+    @property
     def cdf(self) -> np.ndarray:
         return np.cumsum(self.pmf)
+
+    def mean(self) -> float:
+        return float(np.dot(self.support, self.pmf))
+
+    def variance(self) -> float:
+        sup = self.support.astype(np.float64)
+        mu = float(np.dot(sup, self.pmf))
+        return float(np.dot((sup - mu) ** 2, self.pmf))
+
+    def cdf_at(self, x: list | np.ndarray | float) -> np.ndarray:
+        x_arr = np.atleast_1d(np.asarray(x, dtype=np.float64))
+        idx = np.floor((x_arr - self.min) / self.bin_size).astype(np.int64)
+        cdf_vals = self.cdf
+        out = np.zeros(len(x_arr), dtype=np.float64)
+        in_range = (idx >= 0) & (idx < len(cdf_vals))
+        out[in_range] = cdf_vals[idx[in_range]]
+        out[idx >= len(cdf_vals)] = 1.0
+        return out
+
+    def crps(self, y: float | list | np.ndarray) -> float | np.ndarray:
+        from ddlt import _pmf_crps_numba, _pmf_crps_scalar_numba
+
+        if np.ndim(y) == 0:
+            return float(_pmf_crps_scalar_numba(self.pmf, self.min, self.bin_size, float(y)))
+        y_arr = np.ascontiguousarray(np.asarray(y, dtype=np.float64).ravel())
+        return _pmf_crps_numba(self.pmf, self.min, self.bin_size, y_arr).reshape(np.shape(y))
+
+    def sample(self, size: int = 1, rng: np.random.Generator | int | None = None) -> np.ndarray:
+        gen = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
+        u = gen.random(size=size)
+        return self.quantile(u)
 
     @classmethod
     def from_data(cls, data: np.ndarray, method : str ='actual', tol : float = 1e-4):

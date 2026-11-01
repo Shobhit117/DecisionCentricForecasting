@@ -97,12 +97,19 @@ class CatBoostQuantileModel:
     train_groups: list[str] = field(default_factory=list)
     # models[group_key][target_col] -> CatBoostRegressor; group_key is a tuple of strings (empty for a global model)
     models: dict[tuple, dict[str, Any]] = field(default_factory=dict)
+    horizon_feature_cols: dict[str, list[str]] = field(default_factory=dict)
+    horizon_cat_feature_cols: dict[str, list[str]] = field(default_factory=dict)
 
     @staticmethod
     def group_key(values: Any) -> tuple[str, ...]:
         if not isinstance(values, tuple):
             values = (values,)
         return tuple(str(v) for v in values)
+
+    def features_for_target(self, target_col: str) -> tuple[list[str], list[str]]:
+        num_cols = self.horizon_feature_cols.get(target_col, self.feature_cols)
+        cat_cols = self.horizon_cat_feature_cols.get(target_col, self.cat_feature_cols)
+        return num_cols, cat_cols
 
     def quantile_cols(self, target_col: str) -> list[str]:
         return [quantile_col_name(target_col, q) for q in self.quantiles]
@@ -115,7 +122,8 @@ class CatBoostQuantileModel:
                     rows.append({**dict(zip(self.train_groups, group_key)), "target": target, "feature": feat, "importance": imp})
         return pd.DataFrame(rows)
 
-    def save(self, out_dir: Path, prefix: str = "catboost") -> None:
+    def save(self, out_dir: Path | str, prefix: str = "catboost") -> None:
+        out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         meta = {
             "quantiles": list(self.quantiles),
@@ -123,6 +131,8 @@ class CatBoostQuantileModel:
             "feature_cols": self.feature_cols,
             "cat_feature_cols": self.cat_feature_cols,
             "train_groups": self.train_groups,
+            "horizon_feature_cols": self.horizon_feature_cols,
+            "horizon_cat_feature_cols": self.horizon_cat_feature_cols,
             "models": [],
         }
         for group_key, group_models in self.models.items():
@@ -132,16 +142,25 @@ class CatBoostQuantileModel:
                 model.save_model(str(out_dir / file_name))
                 meta["models"].append({"group_key": [str(k) for k in group_key], "target": target, "file": file_name,
                                        "best_iteration": model.get_best_iteration()})
-        with open(out_dir / f"{prefix}_meta.json", "w") as f:
+        with open(out_dir / f"{prefix}_meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
     @classmethod
-    def load(cls, out_dir: Path, prefix: str = "catboost") -> "CatBoostQuantileModel":
+    def load(cls, out_dir: Path | str, prefix: str = "catboost") -> "CatBoostQuantileModel":
         from catboost import CatBoostRegressor
 
-        with open(out_dir / f"{prefix}_meta.json") as f:
+        out_dir = Path(out_dir)
+        with open(out_dir / f"{prefix}_meta.json", encoding="utf-8") as f:
             meta = json.load(f)
-        obj = cls(tuple(meta["quantiles"]), meta["target_cols"], meta["feature_cols"], meta["cat_feature_cols"], meta["train_groups"])
+        obj = cls(
+            tuple(meta["quantiles"]),
+            meta["target_cols"],
+            meta["feature_cols"],
+            meta["cat_feature_cols"],
+            meta["train_groups"],
+            horizon_feature_cols=meta.get("horizon_feature_cols", {}),
+            horizon_cat_feature_cols=meta.get("horizon_cat_feature_cols", {}),
+        )
         for entry in meta["models"]:
             model = CatBoostRegressor()
             model.load_model(str(out_dir / entry["file"]))

@@ -243,3 +243,222 @@ def test_setup_logging_writes_log_file(tmp_path):
     assert "Progress check: step 1/3" in content
     assert "test_logger" in content
 
+
+def test_continuous_and_discrete_predictive_distribution_interface():
+    from discrete_distribution import PredictiveDistribution
+    from quantile_distribution import ContinuousQuantileDistribution, quantile_crps
+
+    # 1. DiscreteDistribution implements PredictiveDistribution, moments, cdf_at, crps, sample
+    d = DiscreteDistribution.from_parametric("poisson", (5.0, 0))
+    assert isinstance(d, PredictiveDistribution)
+    assert np.isclose(d.mean(), 5.0, rtol=1e-2)
+    assert np.isclose(d.variance(), 5.0, rtol=1e-2)
+    assert np.isclose(d.std(), np.sqrt(5.0), rtol=1e-2)
+    assert np.allclose(d.cdf_at([d.min - 1, d.max + 10]), [0.0, 1.0])
+    crps_scalar = d.crps(5.0)
+    crps_vec = d.crps([3.0, 5.0, 8.0])
+    assert crps_scalar > 0.0 and crps_vec.shape == (3,)
+    assert crps_vec[1] < crps_vec[2]  # CRPS is minimized near the median/mean
+    samples = d.sample(size=200, rng=42)
+    assert samples.shape == (200,) and (samples >= 0).all()
+
+    # 2. ContinuousQuantileDistribution supports both non-negative and unbounded (negative) domains
+    norm_dist = stats.norm(loc=-2.5, scale=4.0)
+    q_vals = norm_dist.ppf(LEVELS)
+    cont = ContinuousQuantileDistribution(LEVELS, q_vals, lower_bound=None)
+    assert isinstance(cont, PredictiveDistribution)
+    assert cont.quantile(0.1)[0] < 0.0  # Preserves negative values when lower_bound=None
+    assert np.isclose(cont.mean(), -2.5, atol=0.25)
+    assert np.isclose(cont.std(), 4.0, atol=0.5)
+    assert np.isclose(cont.cdf_at(-2.5)[0], 0.5, atol=0.05)
+    assert cont.crps(-2.5) < cont.crps(10.0)
+    assert quantile_crps(np.array([-2.5, 0.0]), np.vstack([q_vals, q_vals]), LEVELS).shape == (2,)
+
+
+def test_fft_convolution_matches_direct_numba_convolution():
+    from ddlt import DEFAULT_TAIL_TOL, _direct_convolve_1d_numba, _fft_convolve_1d_numba, _trim_pmf_numba
+
+    # Create two 600-point distributions so len(a)*len(b) = 360,000 > FFT_CONVOLVE_THRESHOLD (262,144)
+    p = np.linspace(1.0, 3.0, 600)
+    p /= p.sum()
+    d1 = DiscreteDistribution(p, min_value=5)
+    d2 = DiscreteDistribution(p[::-1], min_value=10)
+    conv_fft = d1 + d2
+
+    raw_direct = _direct_convolve_1d_numba(d1.pmf, d2.pmf)
+    raw_fft = _fft_convolve_1d_numba(d1.pmf, d2.pmf)
+    assert np.allclose(raw_fft, raw_direct, atol=1e-11)
+
+    raw_direct /= raw_direct.sum()
+    expected_pmf, expected_min = _trim_pmf_numba(raw_direct, 15, 1, DEFAULT_TAIL_TOL)
+    assert conv_fft.min == expected_min
+    assert np.allclose(conv_fft.pmf, expected_pmf, atol=1e-10)
+
+
+def test_trim_leading_zeros_and_horizon_restricted_leads():
+    # item_late launches on day 11 (days 1..10 are 0); item_early is active from day 1
+    days = list(range(1, 26))
+    rows = []
+    for d in days:
+        rows.append({"id": "item_early", "day": d, "demand": 3})
+        rows.append({"id": "item_late", "day": d, "demand": 0 if d <= 10 else 4})
+    sales_df = pd.DataFrame(rows)
+    cal_df = pd.DataFrame({"day": list(range(1, 30)), "promo": [1 if d % 5 == 0 else 0 for d in range(1, 30)]})
+
+    ts = DiscreteTimeSeries(
+        sales_df,
+        ts_id_cols=["id"],
+        period_col="day",
+        var_col="demand",
+        lags=(1, 2),
+        rolling_windows=(2,),
+        num_future_targets=3,
+        num_test_days=0,
+        downsample_zeros_frac=None,
+        fit_historical_distributions=False,
+        trim_leading_zeros=True,
+    )
+    ts.add_feature(cal_df, "promo", join_on=[], lags=(-1, -2))
+
+    # item_late's first active period is day 11; after lag(1, 2), its first engineered row is day 13:
+    late_days = ts.df.loc[ts.df["id"] == "item_late", "day"].astype(int)
+    assert late_days.min() == 13
+
+    # Horizon feature restriction excludes future leads beyond h:
+    f_h0 = ts.get_features_for_horizon("target_t_plus_0", restrict_future_leads=True)
+    f_h1 = ts.get_features_for_horizon("target_t_plus_1", restrict_future_leads=True)
+    f_h2 = ts.get_features_for_horizon("target_t_plus_2", restrict_future_leads=True)
+    assert "promo_lag_minus_1" not in f_h0 and "promo_lag_minus_2" not in f_h0
+    assert "promo_lag_minus_1" in f_h1 and "promo_lag_minus_2" not in f_h1
+    assert "promo_lag_minus_1" in f_h2 and "promo_lag_minus_2" in f_h2
+
+
+def test_reusable_forecaster_save_load_and_multi_prediction(tmp_path):
+    """
+    Verifies that both GLMForecaster and CatBoostQuantileForecaster can be:
+    1. Trained once;
+    2. Saved to a self-contained directory bundle and loaded via `load_forecaster`;
+    3. Used repeatedly to predict on different periods, standalone DataFrames (without `ts`),
+       and brand-new raw sales + covariate DataFrames (`predict_from_raw`), as well as DDLT
+       with fallback distributions when L + R > horizon.
+    """
+    from forecasters import evaluate_quantile_forecasts, load_forecaster
+
+    rng = np.random.default_rng(123)
+    days = list(range(1, 51))
+    records = []
+    # item_A: low-variance (Poisson-like); item_B: overdispersed (NB-like)
+    for d in days:
+        records.append({
+            "store_id": "S1",
+            "cat_id": "FOODS",
+            "item_id": "item_A",
+            "day": d,
+            "demand": int(rng.poisson(4.0)),
+        })
+        records.append({
+            "store_id": "S1",
+            "cat_id": "FOODS",
+            "item_id": "item_B",
+            "day": d,
+            "demand": int(rng.negative_binomial(2, 0.25)),
+        })
+    sales_df = pd.DataFrame(records)
+    calendar_df = pd.DataFrame({
+        "day": list(range(1, 65)),
+        "wday": [(d - 1) % 7 + 1 for d in range(1, 65)],
+        "promo": [1 if d % 6 == 0 else 0 for d in range(1, 65)],
+    })
+
+    ts = DiscreteTimeSeries(
+        sales_df,
+        ts_id_cols=["store_id", "cat_id", "item_id"],
+        period_col="day",
+        var_col="demand",
+        lags=(1, 7),
+        rolling_windows=(7,),
+        num_future_targets=2,
+        num_test_days=5,
+        use_one_hot_encoding=False,
+        downsample_zeros_frac=None,
+        fit_historical_distributions=True,
+    )
+    ts.add_calendar_features(calendar_df, "wday", use_day_of_week_features=False, use_week_end_feature=True)
+    ts.add_feature(calendar_df, "promo", join_on=[], lags=(-1,))
+
+    # Lead time + cycle time max = 3 > horizon (2), exercising fallback best_fit from series_metadata:
+    lt_distr = {"S1": DiscreteDistribution(np.array([0.5, 0.5]), min_value=2)}
+
+    # --- A. Test GLMForecaster save / load / reusable multi-prediction ---
+    glm = GLMForecaster(train_groups=["store_id", "cat_id"], restrict_future_leads=True)
+    glm.fit(ts)
+    assert glm.model is not None
+    coef_table = glm.model.coefficients_table()
+    assert "alpha" not in coef_table["feature"].values  # alpha is cleanly separated from regression covariates
+
+    glm_dir = tmp_path / "glm_bundle"
+    glm.save(glm_dir)
+    loaded_glm = load_forecaster(glm_dir)
+    assert isinstance(loaded_glm, GLMForecaster)
+
+    # 1) Predict on specific single period and multiple periods:
+    pred_day46 = loaded_glm.predict(ts, period=46)
+    pred_days_46_47 = loaded_glm.predict(ts, period=[46, 47])
+    assert len(pred_day46) == 2 and (pred_day46["day"] == 46).all()
+    assert len(pred_days_46_47) == 4
+
+    # 2) Predict on a standalone DataFrame stripped of training metadata (overdispersion, best_fit) without `ts`:
+    bare_df = ts.get_inference_data(period=48).drop(
+        columns=["overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2"]
+    )
+    pred_bare = loaded_glm.predict(bare_df)
+    assert len(pred_bare) == 2 and pred_bare["target_t_plus_0_mu"].notna().all()
+
+    # 3) Compute DDLT directly from bare_df without `ts` (uses persisted series_metadata_ for best_fit fallback):
+    ddlt_glm = loaded_glm.compute_ddlt(bare_df, lead_time=lt_distr, lead_time_keys=["store_id"], cycle_time=1)
+    assert len(ddlt_glm) == 2 and (ddlt_glm["target_inventory"] >= 0).all()
+
+    # --- B. Test CatBoostQuantileForecaster save / load / predict_from_raw ---
+    cb = CatBoostQuantileForecaster(
+        quantiles=(0.1, 0.5, 0.9),
+        extra_cat_cols=("item_id", "cat_id"),
+        num_valid_days=5,
+        catboost_params={"iterations": 12, "depth": 4, "verbose": False},
+        restrict_future_leads=True,
+    )
+    cb.fit(ts)
+    cb_dir = tmp_path / "cb_bundle"
+    cb.save(cb_dir)
+
+    loaded_cb = load_forecaster(cb_dir)
+    assert isinstance(loaded_cb, CatBoostQuantileForecaster)
+
+    # Evaluate quantile forecasts (including new CRPS column):
+    cb_test_preds = loaded_cb.predict(ts)
+    q_eval = evaluate_quantile_forecasts(cb_test_preds, loaded_cb.target_cols_, loaded_cb.quantiles)
+    assert "crps" in q_eval.columns and (q_eval["crps"] >= 0).all()
+
+    # 4) Reusable inference on brand-new future days (days 35..55) from raw tables without `ts`:
+    new_records = [r for r in records if r["day"] >= 35]
+    for d in range(51, 56):
+        for item_id in ("item_A", "item_B"):
+            new_records.append({
+                "store_id": "S1",
+                "cat_id": "FOODS",
+                "item_id": item_id,
+                "day": d,
+                "demand": 5,
+            })
+    new_sales_df = pd.DataFrame(new_records)
+
+    raw_preds_day55 = loaded_cb.predict_from_raw(new_sales_df, calendar_df=calendar_df, period=55)
+    assert len(raw_preds_day55) == 2
+    assert (raw_preds_day55["day"] == 55).all()
+    assert raw_preds_day55["target_t_plus_1_mu"].notna().all()
+
+    # And DDLT on the transformed new raw data without `ts`:
+    transformed_day55 = loaded_cb.transform(new_sales_df, calendar_df=calendar_df, period=55)
+    ddlt_cb = loaded_cb.compute_ddlt(transformed_day55, lead_time=lt_distr, lead_time_keys=["store_id"], cycle_time=1)
+    assert len(ddlt_cb) == 2 and (ddlt_cb["target_inventory"] >= 0).all()
+
+

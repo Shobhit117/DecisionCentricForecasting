@@ -243,3 +243,92 @@ def test_long_support_ddlt_speed(long_lead_time, warmed_up):
     print(f"   numba raw kernel             {t_raw*1e3:9.1f} ms ({t_raw/n*1e3:7.2f} ms/row) | speedup {t_old/t_raw:5.1f}x")
     print(f"   projected for 85,372 rows: legacy ~{t_old/n*85372:,.0f} s | numba wrapper ~{t_wrap/n*85372:,.0f} s | raw kernel ~{t_raw/n*85372:,.0f} s")
     assert t_raw < t_old
+
+
+def test_big_sequence_fft_convolution_and_ddlt_speed(long_lead_time):
+    """
+    Benchmarks Numba O(N log N) FFT convolution vs direct O(N^2) Numba convolution and
+    legacy random_sum on very large support sequences (N = 10,000 and 25,000 bins).
+    """
+    from numba.typed import List as NumbaList
+    from ddlt import (
+        HAS_ROCKET_FFT,
+        _convolve_1d_numba,
+        _direct_convolve_1d_numba,
+        _fft_convolve_1d_numba,
+        _fft_convolve_radix2_numba,
+        _random_sum_aligned_numba,
+    )
+
+    rng = np.random.default_rng(42)
+
+    # Warm-up JIT compilation on a small array:
+    small = np.array([0.2, 0.5, 0.3], dtype=np.float64)
+    _direct_convolve_1d_numba(small, small)
+    _fft_convolve_radix2_numba(small, small)
+    _fft_convolve_1d_numba(small, small)
+
+    print(f"\n[Big-Sequence Numba FFT Benchmark | HAS_ROCKET_FFT={HAS_ROCKET_FFT}]")
+    for n_bins in (10_000, 25_000):
+        a = rng.gamma(2.0, 2.0, size=n_bins).astype(np.float64)
+        b = rng.gamma(3.0, 1.5, size=n_bins).astype(np.float64)
+        a /= a.sum()
+        b /= b.sum()
+
+        out_direct = _direct_convolve_1d_numba(a, b)
+        out_radix2 = _fft_convolve_radix2_numba(a, b)
+        out_fft = _fft_convolve_1d_numba(a, b)
+        out_auto = _convolve_1d_numba(a, b)
+
+        assert np.allclose(out_radix2, out_direct, atol=1e-12)
+        assert np.allclose(out_fft, out_direct, atol=1e-12)
+        assert np.allclose(out_auto, out_direct, atol=1e-12)
+
+        t_direct = _timeit(lambda: _direct_convolve_1d_numba(a, b), repeats=2)
+        t_radix2 = _timeit(lambda: _fft_convolve_radix2_numba(a, b), repeats=3)
+        t_fft = _timeit(lambda: _fft_convolve_1d_numba(a, b), repeats=3)
+        print(
+            f"   1D convolve ({n_bins:,} x {n_bins:,} bins): "
+            f"direct O(N^2)={t_direct*1e3:7.2f} ms | "
+            f"numba radix2 FFT={t_radix2*1e3:6.2f} ms ({t_direct/t_radix2:5.1f}x) | "
+            f"active numba FFT={t_fft*1e3:6.2f} ms ({t_direct/t_fft:5.1f}x)"
+        )
+        assert t_fft < t_direct
+
+    # Multi-day DDLT random_sum with 2,500-bin daily PMFs over a 10-day lead time
+    # (cumulative support grows up to ~30,000 bins across the 12 summands):
+    big_support = 2_500
+    n_days = LT_MIN + LT_DAYS - 1  # 12 days
+    x_grid = np.arange(big_support, dtype=np.float64)
+    daily_pmfs = []
+    for d in range(n_days):
+        mu = 600.0 + 30.0 * d
+        r = 12.0
+        p = stats.nbinom(r, r / (r + mu)).pmf(x_grid)
+        daily_pmfs.append(np.ascontiguousarray(p / p.sum(), dtype=np.float64))
+
+    lt_old = legacy.DiscreteDistribution(long_lead_time.copy(), LT_MIN)
+    old_days = [legacy.DiscreteDistribution(p.copy(), 0) for p in daily_pmfs]
+
+    typed_pmfs = NumbaList()
+    for p in daily_pmfs:
+        typed_pmfs.append(p)
+    zero_mins = np.zeros(n_days, dtype=np.int64)
+
+    res_old = lt_old.random_sum(old_days)
+    res_pmf, res_min = _random_sum_aligned_numba(long_lead_time, LT_MIN, typed_pmfs, zero_mins, 1)
+    res_new = DiscreteDistribution(res_pmf, res_min)
+
+    q_levels = np.array([0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99])
+    np.testing.assert_array_equal(res_old.quantile(q_levels), res_new.quantile(q_levels))
+
+    t_ddlt_old = _timeit(lambda: lt_old.random_sum(old_days), repeats=2)
+    t_ddlt_new = _timeit(
+        lambda: _random_sum_aligned_numba(long_lead_time, LT_MIN, typed_pmfs, zero_mins, 1),
+        repeats=3,
+    )
+    print(
+        f"   12-day DDLT random_sum ({big_support:,}-bin daily PMFs -> {len(res_old.pmf):,}-bin DDLT): "
+        f"legacy={t_ddlt_old*1e3:7.2f} ms | numba FFT={t_ddlt_new*1e3:6.2f} ms | speedup={t_ddlt_old/t_ddlt_new:5.1f}x"
+    )
+    assert t_ddlt_new < t_ddlt_old

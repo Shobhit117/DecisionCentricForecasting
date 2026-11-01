@@ -185,7 +185,9 @@ def main(
             model_data = forecaster.fit(ts)
             model_path = out_dir / f'model_data_{store_name}.csv'
             model_data.to_csv(model_path, index=False)
-            logger.info("Saved GLM model metadata to %s", model_path)
+            models_dir = out_dir / f'glm_models_{store_name}'
+            forecaster.save(models_dir)
+            logger.info("Saved GLM model bundle to %s and CSV metadata to %s", models_dir, model_path)
         else:
             forecaster = CatBoostQuantileForecaster(
                 quantiles=quantiles,
@@ -194,10 +196,10 @@ def main(
             )
             model_data = forecaster.fit(ts)
             models_dir = out_dir / f'catboost_models_{store_name}'
-            model_data.save(models_dir)
+            forecaster.save(models_dir)
             fi_path = out_dir / f'feature_importance{suffix}_{store_name}.csv'
             model_data.feature_importance().to_csv(fi_path, index=False)
-            logger.info("Saved CatBoost models to %s and feature importances to %s", models_dir, fi_path)
+            logger.info("Saved CatBoost model bundle to %s and feature importances to %s", models_dir, fi_path)
 
         predictions = compute_lead_time_demand(
             ts,
