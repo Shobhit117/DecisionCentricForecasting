@@ -4,11 +4,7 @@ import numpy as np
 import pandas as pd
 from numba.typed import List as NumbaList
 from probabilistic_modeling.distributions.discrete import DiscreteDistribution
-from probabilistic_modeling.ddlt import (
-    _batch_cdf_quantiles_numba,
-    _batch_pmf_quantiles_numba,
-    _build_prefix_cdfs_numba,
-)
+from probabilistic_modeling.ddlt import _batch_pmf_quantiles_numba
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +15,7 @@ def solve_multi_product_newsvendor(
     purchase_cost: list[float] | np.ndarray,
     shortage_penalty: list[float] | np.ndarray,
     available_budget: float,
+    salvage_value: list[float] | np.ndarray | None = None,
     max_iters: int = 200,
     tol: float = 1e-4,
 ) -> np.ndarray:
@@ -36,12 +33,21 @@ def solve_multi_product_newsvendor(
     purchase_cost = np.asarray(purchase_cost, dtype=float)
     shortage_penalty = np.asarray(shortage_penalty, dtype=float)
 
+    if salvage_value is None:
+        salvage_value = np.zeros(num_products, dtype=float)
+    else:
+        if num_products != len(salvage_value):
+            raise ValueError(f"Salvage value length mismatch: expected {num_products}, got {len(salvage_value)}.")
+        salvage_value = np.asarray(salvage_value, dtype=float)
+
     if np.any(selling_price <= 0):
         raise ValueError("Selling price must be positive.")
     if np.any(purchase_cost <= 0):
         raise ValueError("Purchase cost must be positive.")
     if np.any(shortage_penalty < 0):
         raise ValueError("Shortage penalty must be non-negative.")
+    if np.any(salvage_value >= purchase_cost):
+        raise ValueError("Salvage value must be strictly less than purchase cost.")
     if available_budget < 0:
         raise ValueError("Available budget must be non-negative.")
 
@@ -57,14 +63,14 @@ def solve_multi_product_newsvendor(
     for distr in demand_list:
         pmfs.append(distr.pmf)
 
-    denom = selling_price + shortage_penalty
+    denom = selling_price - salvage_value + shortage_penalty
     base_num = selling_price + shortage_penalty
 
-    def fractiles(k: float) -> np.ndarray:
-        return np.clip((base_num - purchase_cost * (1.0 + k)) / denom, 0.0, 1.0)
+    def opt_inventory(k: float) -> np.ndarray:
+        alpha = np.clip((base_num - purchase_cost * (1.0 + k)) / denom, 0.0, 1.0)
+        return _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alpha)
 
-    # Unconstrained solution (k = 0): one early-exit linear scan per product.
-    x = _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, fractiles(0.0))
+    x = opt_inventory(0.0)
     unconstrained_spend = float(np.sum(x * purchase_cost))
     if unconstrained_spend <= available_budget:
         logger.debug(
@@ -75,19 +81,9 @@ def solve_multi_product_newsvendor(
         return x
     logger.debug("Iteration 0 (unconstrained): budget used = %.2f > %.2f", unconstrained_spend, available_budget)
 
-    # The critical fractile alpha_i(k) is non-increasing in k, so every later quantile index is
-    # <= the unconstrained one. Build only those CDF prefixes once (one pass of the same length
-    # as the scan above); each bisection step then costs O(sum log n_i) binary searches instead
-    # of O(sum idx_i) linear scans, with bit-identical results.
-    prefix_lengths = (x - mins) // bin_sizes + 1
-    cdf_flat, offsets = _build_prefix_cdfs_numba(pmfs, prefix_lengths)
-
-    def opt_inventory(k: float) -> np.ndarray:
-        return _batch_cdf_quantiles_numba(cdf_flat, offsets, mins, bin_sizes, fractiles(k))
-
     # Find upper bound on k large enough to force low inventory.
     k_lb = 0.0
-    k_ub = float(np.max(denom / purchase_cost - 1.0))
+    k_ub = float(np.max(base_num / purchase_cost - 1.0))
 
     # Initiate binary search on k:
     for i in range(max_iters):
@@ -121,6 +117,7 @@ def _solve_multi_product_newsvendor(
     one budget per store per decision day).
     """
     t0 = time.perf_counter()
+    has_salvage = 'salvage_value' in df.columns
     if group_cols is not None:
         valid_group_cols = [c for c in group_cols if c in df.columns]
         if valid_group_cols and df[valid_group_cols].drop_duplicates().shape[0] > 1:
@@ -142,6 +139,7 @@ def _solve_multi_product_newsvendor(
                     sub['purchase_cost'].to_numpy(),
                     sub['shortage_penalty'].to_numpy(),
                     total_budget,
+                    salvage_value=sub['salvage_value'].to_numpy() if has_salvage else None,
                 )
                 result_df.loc[idx, out_col_name] = inv
                 spends.append(float(np.sum(inv * sub['purchase_cost'].to_numpy())))
@@ -165,9 +163,15 @@ def _solve_multi_product_newsvendor(
     selling_price = df['sell_price'].to_numpy()
     purchase_cost = df['purchase_cost'].to_numpy()
     shortage_penalty = df['shortage_penalty'].to_numpy()
+    salvage_value = df['salvage_value'].to_numpy() if has_salvage else None
     result_df = df.drop(columns=['demand_distribution']).copy()
     inv = solve_multi_product_newsvendor(
-        demand_distributions, selling_price, purchase_cost, shortage_penalty, total_budget
+        demand_distributions,
+        selling_price,
+        purchase_cost,
+        shortage_penalty,
+        total_budget,
+        salvage_value=salvage_value,
     )
     result_df[out_col_name] = inv
     logger.info(

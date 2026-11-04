@@ -3,5 +3,6 @@
 \beamer@sectionintoc {2}{Techniques for Probablistic Forecasting}{7}{0}{2}
 \beamer@sectionintoc {3}{Demand during Lead Time + Review Period}{16}{0}{3}
 \beamer@sectionintoc {4}{Stochastic Inventory Optimization}{20}{0}{4}
-\beamer@subsectionintoc {4}{1}{Hierarchical Newsvendor for Substitutable Demand}{25}{0}{4}
-\beamer@sectionintoc {5}{Conclusion}{29}{0}{5}
+\beamer@subsectionintoc {4}{1}{Perishable vs.\ Non-Perishable Products}{25}{0}{4}
+\beamer@subsectionintoc {4}{2}{Hierarchical Newsvendor for Substitutable Demand}{27}{0}{4}
+\beamer@sectionintoc {5}{Conclusion}{32}{0}{5}
