@@ -1,7 +1,5 @@
 import numpy as np
 from scipy import stats
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 
 def rmse_discrete(data : np.ndarray, distr : stats.rv_discrete, params : tuple) -> float:
     # Compute RMSE for discrete RVs:
@@ -54,6 +52,9 @@ def fit_uniform(data: np.ndarray) -> tuple[int, int, int]:
     return (low, high, 0)
 
 def plot_distr_fit(data: np.ndarray, distr: stats.rv_discrete, params: tuple):
+    import matplotlib.pyplot as plt  # optional, imported lazily (plotting only)
+    from matplotlib.ticker import MaxNLocator
+
     data = np.array(np.round(data), dtype=int)
     (x, y) = np.unique(data, return_counts=True)
     y = y / np.sum(y)

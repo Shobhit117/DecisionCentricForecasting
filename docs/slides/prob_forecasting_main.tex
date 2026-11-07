@@ -22,7 +22,7 @@ style=authoryear,
 % \renewcommand{\thefootnote}{\alph{footnote}}
 \renewcommand{\thefootnote}{[\arabic{footnote}]}
 
-\title[Probablistic Forecasting]{Decision-Centric Probabilistic Forecasting for Inventory Optimization}
+\title[Probabilistic Forecasting]{Decision-Centric Probabilistic Forecasting for Inventory Optimization}
 \author{Shobhit Bhatnagar}
 %\institute{Flipkart}
 \date{\today}
@@ -327,20 +327,23 @@ x_i^*(\lambda) = F_i^{-1}\left( \frac{p_i-c_i (1+\lambda)+r_i}{p_i - s_i + r_i} 
 \framebreak
 \begin{scriptsize}
 \textbf{Parameterizing $s_i$ Across Product Types:}
-\vspace{0.2em}
+\vspace{0.1em}
 
-\renewcommand{\arraystretch}{1.15}
+\renewcommand{\arraystretch}{1.05}
 \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.21\textwidth} >{\raggedright\arraybackslash}p{0.26\textwidth} >{\raggedright\arraybackslash}p{0.21\textwidth} >{\raggedright\arraybackslash}p{0.20\textwidth}@{}}
 \toprule
 \textbf{Product Type} & \textbf{Leftover Stock Fate} & \textbf{Definition of $s_i$} & \textbf{Overage Cost ($c_o = c_i - s_i$)} \\
 \midrule
-\textbf{1.\ Strictly Perishable} \newline (Shelf life $\leq L+R$, e.g., fresh bakery, meat) & Spoils at end of cycle or cleared at markdown price $v_i < c_i$. & $s_i = v_i$ \newline (often $s_i = 0$) & $c_i - v_i$ \newline (up to full purchase cost $c_i$) \\
+\textbf{1.\ Strictly Perishable} \newline (Shelf life $M_i \leq L+R$, e.g., fresh bakery, meat) & Spoils at end of cycle or cleared at markdown price $v_i < c_i$. & $s_i = v_i$ \newline (often $s_i = 0$) & $c_i - v_i$ \newline (up to full purchase cost $c_i$) \\
 \midrule
-\textbf{2.\ Non-Perishable} \newline (Infinite shelf life, e.g., electronics, staples) & Carried over to next cycle; saves buying 1 unit ($c_i$) minus holding cost $h_i$. & $s_i = c_i - h_i$ & $h_i$ \newline (only the per-cycle holding cost) \\
+\textbf{2.\ Non-Perishable} \newline (Shelf life $M_i \to \infty$, e.g., electronics, staples) & Carried over to next cycle; saves buying 1 unit ($c_i$) minus holding cost $h_i$. & $s_i = c_i - h_i$ & $h_i$ \newline (only the per-cycle holding cost) \\
 \midrule
 \textbf{3.\ Semi-Perishable / Obsolescence Risk} \newline (Spoilage prob.\ $\gamma_i \in [0,1]$ per cycle) & Carries over with prob.\ $(1-\gamma_i)$ or clears at $v_i$ with prob.\ $\gamma_i$. & $s_i = (1-\gamma_i)(c_i - h_i) + \gamma_i v_i$ & $(1-\gamma_i)h_i + \gamma_i(c_i - v_i)$ \\
 \bottomrule
 \end{tabular}
+
+\vspace{0.35em}
+\textbf{Approximating $\gamma_i$ from Shelf Life $M_i$:} For shelf life $M_i$ over exposure window $L+R$, the per-cycle spoilage rate $\gamma_i \approx \min\!\left(1,\, \frac{L + R}{M_i}\right)$ smoothly interpolates between strictly perishable ($\gamma_i = 1$ when $M_i \leq L+R$) and non-perishable ($\gamma_i \to 0$ as $M_i \to \infty$) without depending on the decision variable $x_i$.
 \end{scriptsize}
 \end{frame}
 
@@ -434,6 +437,7 @@ Q_M^*(\lambda; \theta_M) &= (1 - \theta_M)\, Q_M^{\text{ind}}(\lambda) + \theta_
 \section{Conclusion}
 
 \begin{frame}{Takeaways}
+\begin{small}
 \begin{itemize}
 \item Forecasts are not the objective, inventory decisions are. 
 % \item Point forecasts are insufficient when inventory decisions depend on service levels and asymmetric costs.
@@ -444,14 +448,14 @@ Q_M^*(\lambda; \theta_M) &= (1 - \theta_M)\, Q_M^{\text{ind}}(\lambda) + \theta_
 \begin{align*}
 D^{L+R}_{t} = D_{t+1} + \cdots + D_{t+L+R}
 \end{align*}
-\item Inventory targets are obtained by solving a stochastic optimization problem that explicitly accounts for
+\item Inventory targets are obtained by solving a stochastic optimization problem that explicitly accounts for:
 \begin{itemize}
-    \item service level requirements,
-    \item holding and shortage costs,
-    \item and working capital constraints.
+    \item service level requirements, shortage penalties, and working capital constraints ($B$),
+    \item \textbf{perishability vs.\ carry-over economics} via the salvage / carry-over value $s_i$ (bridging strictly perishable, semi-perishable, and non-perishable goods),
+    \item and \textbf{demand substitution \& risk pooling} via a two-stage hierarchical (MSKU-to-SKU) newsvendor decomposition.
 \end{itemize}
 \end{itemize}
-
+\end{small}
 \end{frame}
 
 \begin{frame}[t,allowframebreaks]{References}

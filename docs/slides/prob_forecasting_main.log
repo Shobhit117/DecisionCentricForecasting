@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.5.2)  4 NOV 2026 16:23
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.5.2)  4 NOV 2026 20:26
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -1331,6 +1331,7 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 
 [27
 
+
 ]
 
 [28
@@ -1339,41 +1340,45 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 
 [29
 
-
 ]
 
 [30
+
 
 ]
 
 [31
 
-
-] (docs/slides/prob_forecasting_main.toc)
+]
 
 [32
 
-]
+
+] (docs/slides/prob_forecasting_main.toc)
 
 [33
 
 ]
 
-LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
-(Font)              Font shape `OT1/cmr/m/sc' tried instead on input line 461.
-
-
-
 [34
+
+]
+
+LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
+(Font)              Font shape `OT1/cmr/m/sc' tried instead on input line 465.
+
+
+
+[35
 
  <c:/texlive/2025/texmf-dist/tex/latex/beamer/beamericonarticle.pdf>]
 
-[35
+[36
 
 
 ]
 
-[36
+[37
 
 
 ]
@@ -1392,49 +1397,50 @@ LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
 Package rerunfilecheck Info: File `prob_forecasting_main.out' has not changed.
-(rerunfilecheck)             Checksum: E1CC529AC151486567E39A0DAB9C4D70;1659.
+(rerunfilecheck)             Checksum: 1EFC892504056EA6C2042AE6BD4CDED5;1659.
 Package logreq Info: Writing requests to 'prob_forecasting_main.run.xml'.
 \openout1 = `prob_forecasting_main.run.xml'.
 
  ) 
 Here is how much of TeX's memory you used:
- 30847 strings out of 473190
- 604650 string characters out of 5719980
- 1405425 words of memory out of 5000000
- 53453 multiletter control sequences out of 15000+600000
+ 30851 strings out of 473190
+ 604687 string characters out of 5719980
+ 1406426 words of memory out of 5000000
+ 53455 multiletter control sequences out of 15000+600000
  574859 words of font info for 94 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
  128i,21n,123p,1502b,2353s stack positions out of 10000i,1000n,20000p,200000b,200000s
 <c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmcsc10.pfb><c:/te
 xlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb><c:/texlive/202
 5/texmf-dist/fonts/type1/public/amsfonts/cmextra/cmex7.pfb><c:/texlive/2025/tex
-mf-dist/fonts/type1/public/amsfonts/cmextra/cmex9.pfb><c:/texlive/2025/texmf-di
-st/fonts/type1/public/amsfonts/cm/cmmi10.pfb><c:/texlive/2025/texmf-dist/fonts/
-type1/public/amsfonts/cm/cmmi5.pfb><c:/texlive/2025/texmf-dist/fonts/type1/publ
-ic/amsfonts/cm/cmmi6.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfont
-s/cm/cmmi7.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8
-.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb><c:/t
-exlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmss10.pfb><c:/texlive/20
-25/texmf-dist/fonts/type1/public/amsfonts/cm/cmss12.pfb><c:/texlive/2025/texmf-
-dist/fonts/type1/public/amsfonts/cm/cmss8.pfb><c:/texlive/2025/texmf-dist/fonts
-/type1/public/amsfonts/cm/cmss9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/pub
-lic/amsfonts/cm/cmssbx10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/ams
-fonts/cm/cmssi10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm
-/cmssi12.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmssi8.
-pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmssi9.pfb><c:/t
-exlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb><c:/texlive/20
-25/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy5.pfb><c:/texlive/2025/texmf-d
-ist/fonts/type1/public/amsfonts/cm/cmsy6.pfb><c:/texlive/2025/texmf-dist/fonts/
-type1/public/amsfonts/cm/cmsy7.pfb><c:/texlive/2025/texmf-dist/fonts/type1/publ
-ic/amsfonts/cm/cmsy8.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfont
-s/cm/cmsy9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmtt1
-0.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pf
-b><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm7.pfb>
-Output written on docs/slides/prob_forecasting_main.pdf (36 pages, 604637 bytes
+mf-dist/fonts/type1/public/amsfonts/cmextra/cmex8.pfb><c:/texlive/2025/texmf-di
+st/fonts/type1/public/amsfonts/cmextra/cmex9.pfb><c:/texlive/2025/texmf-dist/fo
+nts/type1/public/amsfonts/cm/cmmi10.pfb><c:/texlive/2025/texmf-dist/fonts/type1
+/public/amsfonts/cm/cmmi5.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/am
+sfonts/cm/cmmi6.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/
+cmmi7.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb>
+<c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb><c:/texliv
+e/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmss10.pfb><c:/texlive/2025/te
+xmf-dist/fonts/type1/public/amsfonts/cm/cmss12.pfb><c:/texlive/2025/texmf-dist/
+fonts/type1/public/amsfonts/cm/cmss8.pfb><c:/texlive/2025/texmf-dist/fonts/type
+1/public/amsfonts/cm/cmss9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/a
+msfonts/cm/cmssbx10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts
+/cm/cmssi10.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmss
+i12.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmssi8.pfb><
+c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmssi9.pfb><c:/texliv
+e/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb><c:/texlive/2025/te
+xmf-dist/fonts/type1/public/amsfonts/cm/cmsy5.pfb><c:/texlive/2025/texmf-dist/f
+onts/type1/public/amsfonts/cm/cmsy6.pfb><c:/texlive/2025/texmf-dist/fonts/type1
+/public/amsfonts/cm/cmsy7.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/am
+sfonts/cm/cmsy8.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/
+cmsy9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmtt10.pfb
+><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb><c:
+/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm7.pfb>
+Output written on docs/slides/prob_forecasting_main.pdf (37 pages, 616030 bytes
 ).
 PDF statistics:
- 1697 PDF objects out of 1728 (max. 8388607)
- 1349 compressed objects within 14 object streams
- 92 named destinations out of 1000 (max. 500000)
+ 1731 PDF objects out of 2073 (max. 8388607)
+ 1380 compressed objects within 14 object streams
+ 94 named destinations out of 1000 (max. 500000)
  188 words of extra memory for PDF output out of 10000 (max. 10000000)
 

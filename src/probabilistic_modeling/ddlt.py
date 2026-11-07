@@ -12,6 +12,7 @@ Provides:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -732,6 +733,114 @@ def _ddlt_from_quantiles_row_numba(
     return _random_sum_aligned_numba(lt_pmf, lt_min, rv_pmfs, rv_mins, 1, tail_tol)
 
 
+_COUNT_PMF_MAX_SUPPORT = 50_000_000
+
+
+@njit(cache=True)
+def _count_pmf_truncated_numba(mu: float, alpha: float, tol: float) -> np.ndarray:
+    """
+    PMF of a Poisson(``mu``) (``alpha`` <= 0 or NaN) or NB2(``mu``, ``alpha``) count on
+    ``[0, K]``, where ``K`` is the smallest ``k`` with ``F(k) >= 1 - tol`` (i.e. the scipy
+    ``ppf(1 - tol)`` support used by ``DiscreteDistribution.from_parametric``). The truncated
+    upper-tail mass ``1 - F(K)`` is lumped into the last bin, so the CDF is exact below ``K``.
+
+    NB2 uses scipy's ``nbinom(n, p)`` parametrisation with ``n = 1 / alpha`` and
+    ``p = 1 / (1 + mu * alpha)``. PMF terms are evaluated in log space (``lgamma``) so very
+    large means do not underflow.
+    """
+    if not (mu > 0.0):
+        return np.ones(1, dtype=np.float64)
+    use_nb = alpha > 0.0  # False for NaN
+    target = 1.0 - tol
+
+    n = 0.0
+    log_p_term = 0.0
+    log_q = 0.0
+    lg_n = 0.0
+    log_mu = 0.0
+    if use_nb:
+        n = 1.0 / alpha
+        p = 1.0 / (1.0 + mu * alpha)
+        log_p_term = n * math.log(p)
+        log_q = math.log1p(-p) if p < 1.0 else -np.inf
+        lg_n = math.lgamma(n)
+        sd = math.sqrt(mu * (1.0 + mu * alpha))
+    else:
+        log_mu = math.log(mu)
+        sd = math.sqrt(mu)
+
+    cap = int(mu + 12.0 * sd + 32.0)
+    pmf = np.empty(cap, dtype=np.float64)
+    cdf = 0.0
+    k = 0
+    while True:
+        if k >= cap:
+            if cap >= _COUNT_PMF_MAX_SUPPORT:
+                k -= 1
+                break
+            new_cap = min(cap * 2, _COUNT_PMF_MAX_SUPPORT)
+            grown = np.empty(new_cap, dtype=np.float64)
+            grown[:cap] = pmf
+            pmf = grown
+            cap = new_cap
+        if use_nb:
+            lp = math.lgamma(k + n) - lg_n - math.lgamma(k + 1.0) + log_p_term
+            if k > 0:
+                lp += k * log_q
+        else:
+            lp = k * log_mu - mu - math.lgamma(k + 1.0)
+        pk = math.exp(lp)
+        pmf[k] = pk
+        cdf += pk
+        if cdf >= target:
+            break
+        k += 1
+
+    out = pmf[: k + 1].copy()
+    tail = 1.0 - cdf
+    if tail > 0.0:
+        out[k] += tail
+    s = np.sum(out)
+    if s > 0.0:
+        out /= s
+    return out
+
+
+@njit(cache=True)
+def _ddlt_from_glm_row_numba(
+    lt_pmf: np.ndarray,
+    lt_min: int,
+    mu_row: np.ndarray,
+    alpha_row: np.ndarray,
+    default_pmf: np.ndarray,
+    default_min: int,
+    tol: float = DEFAULT_SUPPORT_TOL,
+    tail_tol: float = DEFAULT_TAIL_TOL,
+) -> tuple[np.ndarray, int]:
+    """
+    Builds the per-horizon Poisson / NB2 PMFs from GLM ``(mu, alpha)`` and computes the
+    random-sum DDLT distribution in one compiled call (GLM counterpart of
+    :func:`_ddlt_from_quantiles_row_numba`). Days beyond the forecast horizon use
+    ``(default_pmf, default_min)``.
+    """
+    horizon = len(mu_row)
+    lt_max = lt_min + len(lt_pmf) - 1
+    if lt_max <= 0:
+        return np.ones(1, dtype=np.float64), 0
+    total_days = lt_max if lt_max > horizon else horizon
+
+    rv_pmfs = NumbaList()
+    rv_mins = np.empty(total_days, dtype=np.int64)
+    for h in range(horizon):
+        rv_pmfs.append(_count_pmf_truncated_numba(mu_row[h], alpha_row[h], tol))
+        rv_mins[h] = 0
+    for h in range(horizon, total_days):
+        rv_pmfs.append(default_pmf)
+        rv_mins[h] = default_min
+
+    return _random_sum_aligned_numba(lt_pmf, lt_min, rv_pmfs, rv_mins, 1, tail_tol)
+
+
 class DDLTCalculator:
     """
     Model-agnostic Demand-During-Lead-Time (DDLT) calculator.
@@ -811,6 +920,29 @@ class DDLTCalculator:
         )
         return DiscreteDistribution.from_parametric(str(best_fit), params, tol=tol)
 
+    def _default_demand_arrays(
+        self, gdf: pd.DataFrame, max_lt: int, horizon: int, tol: float
+    ) -> list[tuple[np.ndarray, int]]:
+        """
+        Per-row ``(pmf, min)`` of the historical best-fit fallback distribution used for days
+        beyond the forecast horizon. Reads the parameter columns once (no per-row ``iloc``)
+        and builds each distinct ``(best_fit, params)`` combination only once.
+        """
+        cols = ["best_fit", "distr_param_0", "distr_param_1", "distr_param_2"]
+        present = [c for c in cols if c in gdf.columns]
+        values = gdf[present].to_numpy(dtype=object)
+        cache: dict[tuple, tuple[np.ndarray, int]] = {}
+        out: list[tuple[np.ndarray, int]] = []
+        for row in values:
+            key = tuple(None if pd.isna(v) else v for v in row)
+            hit = cache.get(key)
+            if hit is None:
+                distr = self._build_default_demand(pd.Series(row, index=present), max_lt, horizon, tol=tol)
+                hit = (np.ascontiguousarray(distr.pmf, dtype=np.float64), int(distr.min))
+                cache[key] = hit
+            out.append(hit)
+        return out
+
     def from_quantiles_group(
         self,
         gdf: pd.DataFrame,
@@ -874,6 +1006,7 @@ class DDLTCalculator:
             gdf[q_cols].to_numpy(dtype=np.float64).reshape(len(gdf), horizon, num_q)
         )
         dummy_pmf = np.ones(1, dtype=np.float64)
+        defaults = self._default_demand_arrays(gdf, int(lt_with_cycle.max), horizon, tol_eff) if needs_default else None
 
         results = []
         for row_num in range(len(gdf)):
@@ -882,9 +1015,7 @@ class DDLTCalculator:
                 raise ValueError(f"Invalid CatBoost quantile forecast for row {row_num}: {row_quantiles}.")
 
             if needs_default:
-                default_distr = self._build_default_demand(gdf.iloc[row_num], lt_with_cycle.max, horizon, tol=tol_eff)
-                default_pmf = np.ascontiguousarray(default_distr.pmf, dtype=np.float64)
-                default_min = int(default_distr.min)
+                default_pmf, default_min = defaults[row_num]
             else:
                 default_pmf = dummy_pmf
                 default_min = 0
@@ -958,36 +1089,29 @@ class DDLTCalculator:
             tol_eff,
         )
 
-        mu_arr = gdf[glm_mu_cols].to_numpy(dtype=float)
-        alpha_arr = gdf[glm_alpha_cols].to_numpy(dtype=float)
+        mu_arr = np.ascontiguousarray(gdf[glm_mu_cols].to_numpy(dtype=np.float64))
+        alpha_arr = np.ascontiguousarray(gdf[glm_alpha_cols].to_numpy(dtype=np.float64))
+        bad = ~np.isfinite(mu_arr) | (mu_arr < 0)
+        if np.any(bad):
+            row_num = int(np.argmax(bad.any(axis=1)))
+            raise ValueError(f"Invalid GLM mean for row {row_num}: {mu_arr[row_num]}.")
+
+        lt_pmf = np.ascontiguousarray(lt_with_cycle.pmf, dtype=np.float64)
+        lt_min = int(lt_with_cycle.min)
+        defaults = self._default_demand_arrays(gdf, int(lt_with_cycle.max), horizon, tol_eff) if needs_default else None
+        dummy_pmf = np.ones(1, dtype=np.float64)
 
         results = []
         for row_num in range(len(gdf)):
-            mu = mu_arr[row_num]
-            alpha = alpha_arr[row_num]
-            default_demand = (
-                self._build_default_demand(gdf.iloc[row_num], lt_with_cycle.max, horizon, tol=tol_eff)
-                if needs_default
-                else None
+            default_pmf, default_min = defaults[row_num] if defaults is not None else (dummy_pmf, 0)
+            ddlt_pmf, ddlt_min = _ddlt_from_glm_row_numba(
+                lt_pmf, lt_min, mu_arr[row_num], alpha_arr[row_num], default_pmf, default_min, tol_eff, self.tail_tol
             )
-
-            demand = []
-            for curr_mu, curr_alpha in zip(mu, alpha):
-                if pd.isna(curr_mu) or curr_mu < 0:
-                    raise ValueError(f"Invalid GLM mean for row {row_num}: {curr_mu}.")
-                if pd.isna(curr_alpha) or curr_alpha <= 0:
-                    demand.append(DiscreteDistribution.from_parametric("poisson", (float(curr_mu), 0), tol=tol_eff))
-                else:
-                    n = 1.0 / curr_alpha
-                    p = 1.0 / (1.0 + curr_mu * curr_alpha)
-                    demand.append(DiscreteDistribution.from_parametric("nbinom", (n, p, 0), tol=tol_eff))
-
-            demand_during_lead_time = lt_with_cycle.random_sum(demand, default_demand, tail_tol=self.tail_tol)
-            demand_during_lead_time.truncation_tol = n_terms * tol_eff
             if return_distribution:
-                results.append(demand_during_lead_time)
+                results.append(DiscreteDistribution(ddlt_pmf, ddlt_min, 1, truncation_tol=n_terms * tol_eff))
             else:
-                results.append(demand_during_lead_time.quantile(service_levels_arr[row_num]).item())
+                q_val = _pmf_quantile_scalar_numba(ddlt_pmf, ddlt_min, 1, float(service_levels_arr[row_num]))
+                results.append(int(q_val))
 
         if return_distribution:
             gdf["demand_distribution"] = results

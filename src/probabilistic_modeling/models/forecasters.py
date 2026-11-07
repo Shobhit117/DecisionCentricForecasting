@@ -478,8 +478,13 @@ class ProbabilisticForecaster(ABC):
         self,
         ts: "DiscreteTimeSeries | pd.DataFrame | None" = None,
         df: pd.DataFrame | None = None,
+        model: Any = None,
         period: Any = None,
     ) -> pd.DataFrame:
+        """
+        Predicts every forecast horizon. ``model`` optionally overrides the fitted model
+        container (``GLMModel`` / coefficient table for GLMs, ``CatBoostQuantileModel`` for CatBoost).
+        """
         ...
 
     @abstractmethod
@@ -493,9 +498,11 @@ class ProbabilisticForecaster(ABC):
         return_distribution: bool = False,
         pred_first_day: bool = True,
         df: pd.DataFrame | None = None,
+        model: Any = None,
         period: Any = None,
         max_service_level: float | None = None,
     ) -> pd.DataFrame:
+        """Shared signature for all forecasters (``model`` has the same meaning as in ``predict``)."""
         ...
 
     @abstractmethod
@@ -607,10 +614,14 @@ class GLMForecaster(ProbabilisticForecaster):
         self,
         ts: "DiscreteTimeSeries | pd.DataFrame | None" = None,
         df: pd.DataFrame | None = None,
-        model_data: pd.DataFrame | GLMModel | None = None,
+        model: pd.DataFrame | GLMModel | None = None,
         period: Any = None,
+        model_data: pd.DataFrame | GLMModel | None = None,
     ) -> pd.DataFrame:
         t0 = time.perf_counter()
+        if model is None:
+            model = model_data  # backward-compatible alias
+        model_data = model
         if isinstance(model_data, GLMModel):
             glm_container = model_data
             model_df = glm_container.to_dataframe()
@@ -689,13 +700,14 @@ class GLMForecaster(ProbabilisticForecaster):
         return_distribution: bool = False,
         pred_first_day: bool = True,
         df: pd.DataFrame | None = None,
-        model_data: pd.DataFrame | GLMModel | None = None,
+        model: pd.DataFrame | GLMModel | None = None,
         period: Any = None,
         max_service_level: float | None = None,
+        model_data: pd.DataFrame | GLMModel | None = None,
     ) -> pd.DataFrame:
         if lead_time is None:
             raise ValueError("'lead_time' distribution must be provided.")
-        predictions = self.predict(ts, df=df, model_data=model_data, period=period)
+        predictions = self.predict(ts, df=df, model=model if model is not None else model_data, period=period)
         _, target_cols, _, period_col = self._resolve_inference_inputs(
             ts=ts,
             df=predictions,
@@ -1058,6 +1070,10 @@ def load_forecaster(out_dir: Path | str) -> ProbabilisticForecaster:
     if meta_file.exists():
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
         f_type = meta.get("forecaster_type")
+        if f_type == "empirical":
+            from probabilistic_modeling.models.baseline import EmpiricalQuantileForecaster
+
+            return EmpiricalQuantileForecaster.load(out_path)
         if f_type == "glm":
             return GLMForecaster.load(out_path)
         if f_type == "catboost":

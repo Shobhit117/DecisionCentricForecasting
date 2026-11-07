@@ -48,9 +48,13 @@ _LAZY_EXPORTS: dict[str, str] = {
     "ProbabilisticForecaster": "models.forecasters",
     "GLMForecaster": "models.forecasters",
     "CatBoostQuantileForecaster": "models.forecasters",
+    "EmpiricalQuantileForecaster": "models.baseline",
     "load_forecaster": "models.forecasters",
     "compute_forecasting_metrics": "models.forecasters",
     "evaluate_quantile_forecasts": "models.forecasters",
+    # evaluation
+    "evaluate_ddlt_calibration": "evaluation.ddlt_calibration",
+    "DDLTCalibrationResult": "evaluation.ddlt_calibration",
     # inventory
     "InventorySimulator": "inventory.simulation",
     "InventorySimulationResult": "inventory.simulation",

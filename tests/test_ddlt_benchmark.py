@@ -102,6 +102,7 @@ def test_numba_ddlt_matches_legacy(lead_time, warmed_up):
         np.testing.assert_array_equal(trimmed_distr.quantile(q_grid), expected.quantile(q_grid))
 
 
+@pytest.mark.benchmark
 def test_quantile_to_pmf_speed(warmed_up):
     q_rows = make_quantile_rows(N_ROWS, seed=2)[:, 0, :]
     for r in q_rows[:5]:
@@ -113,6 +114,7 @@ def test_quantile_to_pmf_speed(warmed_up):
     assert t_new < t_old
 
 
+@pytest.mark.benchmark
 def test_random_sum_speed(lead_time, warmed_up):
     """Isolates the random-sum (convolution + mixture) step, given precomputed daily PMFs."""
     q_rows = make_quantile_rows(N_ROWS, seed=3)
@@ -134,6 +136,7 @@ def test_random_sum_speed(lead_time, warmed_up):
     assert t_new < t_old
 
 
+@pytest.mark.benchmark
 def test_end_to_end_ddlt_speed(lead_time, warmed_up):
     """Full pipeline per row: quantiles -> daily PMFs -> DDLT PMF -> 95th percentile."""
     q_rows = make_quantile_rows(N_ROWS, seed=4)
@@ -198,6 +201,7 @@ def long_lead_time():
     return pmf / pmf.sum()
 
 
+@pytest.mark.benchmark
 def test_long_support_ddlt_speed(long_lead_time, warmed_up):
     from numba.typed import List as NumbaList
 
@@ -244,6 +248,7 @@ def test_long_support_ddlt_speed(long_lead_time, warmed_up):
     assert t_raw < t_old
 
 
+@pytest.mark.benchmark
 def test_big_sequence_fft_convolution_and_ddlt_speed(long_lead_time):
     """
     Benchmarks Numba O(N log N) FFT convolution vs direct O(N^2) Numba convolution and

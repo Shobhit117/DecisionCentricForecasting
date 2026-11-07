@@ -1,14 +1,9 @@
 from abc import ABC, abstractmethod
 import warnings
 import numpy as np
-from scipy import signal, stats
+from scipy import stats
 from probabilistic_modeling.distributions import probability_utils as prob
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 from numba.typed import List as NumbaList
-
-# Product of support lengths above which FFT convolution is faster than O(N*M) direct loop:
-FFT_CONVOLVE_THRESHOLD = 65_536
 
 SUPPORTED_DISTRS = {'nbinom': stats.nbinom,
                     'binom': stats.binom,
@@ -225,7 +220,17 @@ class DiscreteDistribution(PredictiveDistribution):
         pmf = _lump_upper_tail(distr, params, min_value, max_value)
         return cls(pmf, min_value, 1, distr_name, params, truncation_tol=0.0 if bounded else tol)
     
-    def merge_bins(self, level : int = 10):
+    def merge_bins(self, level : int = 10, inplace: bool = True) -> "DiscreteDistribution":
+        """
+        Merges every ``level`` consecutive bins. Mutates ``self`` unless ``inplace=False``,
+        in which case a new distribution is returned and ``self`` is left untouched.
+        Returns the (possibly new) distribution in both cases.
+        """
+        target = self if inplace else self.copy()
+        target._merge_bins_inplace(level)
+        return target
+
+    def _merge_bins_inplace(self, level: int) -> None:
         if level == 1:
             return
         pad_size = (level - (len(self.pmf) % level)) % level
@@ -235,7 +240,16 @@ class DiscreteDistribution(PredictiveDistribution):
         self.pmf = np.ascontiguousarray(padded_pmf.reshape(-1, level).sum(axis=1), dtype=np.float64)
         self.bin_size *= level
     
-    def split_bins(self, level : int = None):
+    def split_bins(self, level : int = None, inplace: bool = True) -> "DiscreteDistribution":
+        """
+        Splits every bin into ``level`` bins (default: down to unit bins). Mutates ``self``
+        unless ``inplace=False``. Returns the (possibly new) distribution in both cases.
+        """
+        target = self if inplace else self.copy()
+        target._split_bins_inplace(level)
+        return target
+
+    def _split_bins_inplace(self, level: int | None) -> None:
         if level == 1:
             return
         if level is None:
@@ -251,7 +265,7 @@ class DiscreteDistribution(PredictiveDistribution):
             self.pmf = np.ascontiguousarray(self.pmf / np.sum(self.pmf), dtype=np.float64)
             new_bin_size = self.bin_size // level
             self.bin_size = 1
-            self.merge_bins(new_bin_size)
+            self._merge_bins_inplace(new_bin_size)
     
     def quantile(self, q: list | np.ndarray | float) -> np.ndarray:
         """
@@ -282,11 +296,9 @@ class DiscreteDistribution(PredictiveDistribution):
 
         trunc = _combine_truncation(self.truncation_tol, other.truncation_tol)
         if self.bin_size != other.bin_size:
-            self = self.copy()
-            other = other.copy()
             new_bin_size = int(np.gcd(self.bin_size, other.bin_size))
-            self.split_bins(self.bin_size // new_bin_size)
-            other.split_bins(other.bin_size // new_bin_size)
+            self = self.split_bins(self.bin_size // new_bin_size, inplace=False)
+            other = other.split_bins(other.bin_size // new_bin_size, inplace=False)
         else:
             new_bin_size = self.bin_size
         new_min = self.min + other.min
@@ -311,12 +323,18 @@ class DiscreteDistribution(PredictiveDistribution):
 
         self.pmf, self.min = _trim_pmf_numba(self.pmf, self.min, self.bin_size, tol)
 
-    def shift(self, by : int):
-        self.min += int(by)
-        if (self.best_fit is not None) and (self.best_fit_params is not None):
-            params = list(self.best_fit_params)
+    def shift(self, by : int, inplace: bool = True) -> "DiscreteDistribution":
+        """
+        Shifts the support by ``by``. Mutates ``self`` unless ``inplace=False``.
+        Returns the (possibly new) distribution in both cases.
+        """
+        target = self if inplace else self.copy()
+        target.min += int(by)
+        if (target.best_fit is not None) and (target.best_fit_params is not None):
+            params = list(target.best_fit_params)
             params[-1] += by # shift the location parameter
-            self.best_fit_params = tuple(params)
+            target.best_fit_params = tuple(params)
+        return target
 
     def __matmul__(self, other : "DiscreteDistribution") -> "DiscreteDistribution":
         if self.min < 0:
@@ -326,7 +344,7 @@ class DiscreteDistribution(PredictiveDistribution):
             raise ValueError("Summand distribution must have non-negative support.")
         
         if self.bin_size != 1:
-            self.split_bins()
+            self = self.split_bins(inplace=False)  # never mutate the caller's operand
         
         if other.min % other.bin_size != 0:
             other = other.copy()
@@ -410,6 +428,9 @@ class DiscreteDistribution(PredictiveDistribution):
                  , title : str = None
                  , xlabel : str = None
                  , ylabel : str = None):
+        import matplotlib.pyplot as plt  # optional, imported lazily (plotting only)
+        from matplotlib.ticker import MaxNLocator
+
         plt.figure()
         plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
         shift = self.bin_size / 2 if self.bin_size > 1 else 0

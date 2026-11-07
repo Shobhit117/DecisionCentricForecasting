@@ -31,3 +31,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Timing assertions are machine-dependent: skipped by default, run with `pytest -m benchmark -s`.
+addopts = "-m 'not benchmark'"
+markers = [
+    "benchmark: timing/speed-up tests (machine-dependent; run explicitly with -m benchmark)",
+]

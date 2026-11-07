@@ -875,7 +875,7 @@ class DiscreteTimeSeries:
         return GLMForecaster(train_groups=train_groups).fit(self)
 
     def predict_glm(self, model_data: pd.DataFrame) -> pd.DataFrame:
-        return GLMForecaster().predict(self, model_data=model_data)
+        return GLMForecaster().predict(self, model=model_data)
 
     def _compute_forecasting_metrics(self, pred_df: pd.DataFrame, pred_columns: list[str]):
         compute_forecasting_metrics(pred_df, self.target_cols, pred_columns)
@@ -997,7 +997,7 @@ def compute_lead_time_demand(
             pred_first_day=pred_first_day,
             df=df,
             period=period,
-            model_data=model_data,
+            model=model_data,
             max_service_level=max_service_level,
         )
     if model_type == "catboost":

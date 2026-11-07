@@ -354,6 +354,7 @@ def _best_time(fn, *args, reps=5):
     return best
 
 
+@pytest.mark.benchmark
 def test_many_quantile_queries_speedup():
     rng = np.random.default_rng(0)
     pmf = rng.random(20_000)
@@ -372,6 +373,7 @@ def test_many_quantile_queries_speedup():
     assert t_ada1 < 3 * t_lin1 + 5e-6
 
 
+@pytest.mark.benchmark
 def test_newsvendor_speedup_on_long_supports():
     dists, price, cost, shortage = _random_products(500, "large", seed=5)
     budget = 0.5 * float(np.sum(_reference_newsvendor(dists, price, cost, shortage, np.inf) * cost))

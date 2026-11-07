@@ -268,6 +268,23 @@ flowchart LR
 - **Probabilistic accuracy**: pinball loss per quantile, empirical coverage per quantile level (calibration), and **CRPS** (for both quantile grids and discrete PMFs).
 - **Decision quality**: the simulation KPIs above — the ultimate test of a probabilistic forecast.
 
+### 4.9 DDLT calibration and the naive baseline
+
+Daily metrics can look fine while the **decision distribution** is wrong. Inventory targets are quantiles of the DDLT distribution, so `evaluate_ddlt_calibration` (`probabilistic_modeling.evaluation`) checks the DDLT itself against realised demand over the replenishment window. Because the lead time of a hypothetical backtest order is unknown, every statistic is an exact expectation over the lead-time distribution.
+
+| Metric | Calibrated value | How to read it |
+|---|---|---|
+| `pit_coverage` at τ (and `gap_pp`) | τ (0 pp) | Below τ → targets too low; above → too high. Discrete-correct, so it can be compared to τ directly |
+| `coverage` at τ | ≥ τ | Raw achieved cycle service level P(Y ≤ q_τ); always somewhat above τ for discrete demand even when calibrated |
+| PIT histogram (`density` by decile) | flat at 1.0 | U-shape → too narrow; hump → too wide; slope → biased |
+| `dispersion_ratio` = E[(Y−μ)²] / E[σ²] | 1.0 | **> 1 means the DDLT is too narrow**, the typical symptom of ignoring day-to-day correlation |
+| `bias_pct` | 0 | Mean over- or under-forecast of lead-time demand |
+| `crps` | lower is better | Overall distribution quality; compare models |
+
+`EmpiricalQuantileForecaster` (`models.baseline`) is a deliberately simple yardstick. It uses per-series empirical quantiles of the last *W* days (`trailing`) or of the same weekday (`seasonal`), with no covariates and no look-ahead. It produces the same columns as the CatBoost forecaster, so it flows through the same DDLT, policy, simulation and calibration code. A model is only worth its complexity if it beats this baseline on decision KPIs (fill rate for a given stock level, or profit).
+
+Both are wired into the M5 script: `--evaluate-ddlt --baseline trailing` writes `ddlt_calibration_*.csv` and `decision_benchmark.csv`.
+
 ---
 
 ## 5. Performance Engineering
@@ -277,6 +294,7 @@ The numerically heavy parts are implemented as **Numba-compiled kernels** (`ddlt
 | Technique | Where | Effect |
 |---|---|---|
 | Fused random-sum kernel accumulating directly into one output vector | DDLT | No intermediate 2D matrices |
+| Compiled Poisson / NB2 PMFs (log-space) feeding the random-sum kernel | GLM → DDLT | ~20× faster than per-day scipy objects |
 | Tail trimming of negligible probability mass | Convolution | Keeps supports small |
 | Adaptive convolution: direct for small inputs, radix-2 FFT for large ones | Convolution | 12×–49× speed-ups on 10k–25k-bin distributions |
 | Optional `rocket-fft` integration | Convolution | Uses NumPy FFT inside Numba when installed |
@@ -398,7 +416,7 @@ Typical adaptations:
 
 ## 8. Testing
 
-- `python -m pytest -q` runs the suite (the `src/` directory is put on the path automatically via `pyproject.toml`).
+- `python -m pytest -q` runs the suite (the `src/` directory is put on the path automatically via `pyproject.toml`). Machine-dependent timing tests carry the `benchmark` marker and are skipped by default; run them with `python -m pytest -m benchmark -s`.
 - Tests cover quantile reconstruction, distribution algebra, DDLT calculation, newsvendor optimisation, forecaster save/load/predict-from-raw, logging, and inventory-simulation conservation identities (stock balance, sold + lost = demand, order-up-to consistency, carry-over between days).
 - `tests/test_ddlt_benchmark.py` checks numerical equivalence and speed against a legacy pure-NumPy implementation; run with `-s` to print timings.
 

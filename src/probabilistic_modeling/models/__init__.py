@@ -1,4 +1,4 @@
-"""Probabilistic forecasters (grouped count GLMs and CatBoost multi-quantile regression)."""
+"""Probabilistic forecasters (grouped count GLMs, CatBoost multi-quantile regression, empirical baseline)."""
 from probabilistic_modeling.models.forecasters import (
     CatBoostQuantileForecaster,
     GLMForecaster,
@@ -7,9 +7,11 @@ from probabilistic_modeling.models.forecasters import (
     evaluate_quantile_forecasts,
     load_forecaster,
 )
+from probabilistic_modeling.models.baseline import EmpiricalQuantileForecaster
 
 __all__ = [
     "CatBoostQuantileForecaster",
+    "EmpiricalQuantileForecaster",
     "GLMForecaster",
     "ProbabilisticForecaster",
     "compute_forecasting_metrics",

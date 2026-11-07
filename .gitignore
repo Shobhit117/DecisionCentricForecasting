@@ -1,9 +1,38 @@
+# Data & outputs
+data/
 model_data.csv
 predictions.csv
-data
-backup
-__pycache__
+backup/
+
+# Python
+__pycache__/
+*.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 build/
 dist/
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# LaTeX build artifacts (keep .tex, .bib, figures/ and the compiled .pdf)
+docs/slides/*.aux
+docs/slides/*.bbl
+docs/slides/*.bcf
+docs/slides/*.blg
+docs/slides/*.log
+docs/slides/*.nav
+docs/slides/*.out
+docs/slides/*.run.xml
+docs/slides/*.snm
+docs/slides/*.toc
+docs/slides/*.synctex.gz
+docs/slides/*.synctex.gz.sum.synctex
+docs/slides/*.fdb_latexmk
+docs/slides/*.fls

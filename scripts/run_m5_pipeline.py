@@ -22,6 +22,8 @@ except ImportError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from probabilistic_modeling.models.forecasters import CatBoostQuantileForecaster, GLMForecaster, evaluate_quantile_forecasts
+from probabilistic_modeling.models.baseline import EmpiricalQuantileForecaster
+from probabilistic_modeling.evaluation import evaluate_ddlt_calibration
 from probabilistic_modeling.inventory.simulation import resolve_target_inventory, simulate_inventory
 from probabilistic_modeling.logging_utils import setup_logging
 from probabilistic_modeling.distributions.quantile import DEFAULT_QUANTILES
@@ -113,6 +115,30 @@ def parse_args():
         default=0.95,
         help="Target service-level quantile in [0, 1] when --target-policy=quantile (default: 0.95).",
     )
+    parser.add_argument(
+        "--stores",
+        nargs="+",
+        default=None,
+        help="Store ids to process, e.g. --stores CA_1 TX_2 (default: all stores).",
+    )
+    parser.add_argument(
+        "--evaluate-ddlt",
+        action="store_true",
+        help="Write a DDLT calibration report (coverage, PIT, dispersion ratio, CRPS) for every model run.",
+    )
+    parser.add_argument(
+        "--baseline",
+        choices=["none", "trailing", "seasonal"],
+        default="none",
+        help="Also run an empirical-quantile baseline through the same DDLT, policy and simulation "
+             "and write a decision benchmark (default: none).",
+    )
+    parser.add_argument(
+        "--baseline-window",
+        type=int,
+        default=56,
+        help="Trailing window (days) for --baseline trailing; seasonal uses window // 7 weeks (default: 56).",
+    )
     return parser.parse_args()
 
 
@@ -157,6 +183,10 @@ def main(
     log_level="INFO",
     target_policy="newsvendor",
     service_level=0.95,
+    stores=None,
+    evaluate_ddlt=False,
+    baseline="none",
+    baseline_window=56,
 ):
     setup_logging(log_file=log_file, level=log_level)
     pipeline_t0 = time.perf_counter()
@@ -174,6 +204,7 @@ def main(
     sim_store = []
     sim_store_cat = []
     quantile_metrics = []
+    calib_summary, calib_coverage, calib_pit = [], [], []
 
     lead_time_df = pd.read_parquet(synthetic_data_dir / 'lead_time.parquet')
     lead_time_distr, lead_time_keys = compute_distribution_dict(lead_time_df, value='lead_time', keys=['store_id'])
@@ -188,7 +219,47 @@ def main(
         df['under_wmape'] = np.round(100 * df['under_diff'] / df['actual'], 2)
         df['over_wmape'] = np.round(100 * df['over_diff'] / df['actual'], 2)
 
+    def _decide_and_evaluate(ddlt_df, label, history_df, store_name):
+        """Calibration report (optional) -> target inventory -> simulation for one model's DDLT rows."""
+        if evaluate_ddlt:
+            calib = evaluate_ddlt_calibration(
+                ddlt_df, history_df, lead_time_distr, ['store_id', 'item_id'],
+                lead_time_keys=lead_time_keys, cycle_time=cycle_time, group_cols=['cat_id'],
+            )
+            logger.info("[%s | %s]\n%s", store_name, label, calib.report())
+            for frame, sink in ((calib.summary_df, calib_summary), (calib.coverage_df, calib_coverage),
+                                (calib.pit_df, calib_pit)):
+                sink.append(frame.assign(store_id=store_name, model=label))
+
+        decided = resolve_target_inventory(
+            ddlt_df,
+            policy=target_policy,
+            service_level=service_level,
+            budget=budget_per_store,
+            group_cols=['store_id', 'day'],
+        )
+        if 'demand_distribution' in decided.columns:
+            decided = decided.drop(columns=['demand_distribution'])
+
+        sim_result = simulate_inventory(
+            decided,
+            lead_time=lead_time_distr,
+            lead_time_keys=lead_time_keys,
+            cycle_time=cycle_time,
+            policy="precomputed",
+            group_cols=['store_id', 'cat_id'],
+        )
+        sim_store.append(sim_result.summarize(group_cols=['store_id']).assign(model=label))
+        if sim_result.group_summary_df is not None:
+            sim_store_cat.append(sim_result.group_summary_df.assign(model=label))
+        return decided
+
     store_files = sorted(p for p in m5_data_dir.iterdir() if p.name.startswith('sales_data'))
+    if stores:
+        wanted = set(stores)
+        store_files = [p for p in store_files if re.search(r"sales_data_([^.]+)\.parquet", p.name).group(1) in wanted]
+        if not store_files:
+            raise ValueError(f"None of the requested stores {sorted(wanted)} were found in {m5_data_dir}.")
     for store_idx, item in enumerate(store_files, start=1):
         store_t0 = time.perf_counter()
         sales_df = pd.read_parquet(item)
@@ -206,6 +277,8 @@ def main(
         ts = build_time_series(
             sales_df, calendar_df, prices_df, model, fit_historical_distributions=needs_fallback_distr
         )
+        # Complete raw panel: realised demand for calibration + history for the empirical baseline
+        history_df = sales_df[['store_id', 'item_id', 'day', 'demand']].copy()
         del sales_df; gc.collect()
 
         logger.info("Null values in sell_price column: %d", int(ts.df['sell_price'].isna().sum()))
@@ -256,31 +329,36 @@ def main(
             predictions['sell_price'] = np.expm1(predictions['sell_price'])  # Keep original sell price
 
         predictions = predictions.merge(store_newsvendor_df, on=['store_id', 'item_id'], how='left')
-        predictions = resolve_target_inventory(
-            predictions,
-            policy=target_policy,
-            service_level=service_level,
-            budget=budget_per_store,
-            group_cols=['store_id', 'day'],
-        )
-        if 'demand_distribution' in predictions.columns:
-            predictions = predictions.drop(columns=['demand_distribution'])
+
+        # Optional naive baseline on exactly the same decision rows, lead times and policy:
+        baseline_ddlt = None
+        if baseline != "none":
+            base_cols = [c for c in ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id', 'day',
+                                     'target_t_plus_0', 'sell_price', 'purchase_cost', 'shortage_penalty']
+                         if c in predictions.columns]
+            baseline_fc = EmpiricalQuantileForecaster(
+                quantiles=quantiles,
+                method=baseline,
+                window=baseline_window,
+                n_weeks=max(1, baseline_window // 7),
+                horizon=horizon,
+                ts_id_cols=['store_id', 'item_id'],
+            ).fit(history_df)
+            baseline_ddlt = baseline_fc.compute_ddlt(
+                df=predictions[base_cols], lead_time=lead_time_distr, lead_time_keys=lead_time_keys,
+                cycle_time=cycle_time, return_distribution=True, pred_first_day=False,
+            )
+
+        predictions = _decide_and_evaluate(predictions, model, history_df, store_name)
         pred_path = out_dir / f'predictions{suffix}_{store_name}.csv'
         predictions.to_csv(pred_path, index=False)
         logger.info("Saved predictions and inventory decisions to %s", pred_path)
 
-        # Run Multi-Period Inventory Simulation over the test window:
-        sim_result = simulate_inventory(
-            predictions,
-            lead_time=lead_time_distr,
-            lead_time_keys=lead_time_keys,
-            cycle_time=cycle_time,
-            policy="precomputed",
-            group_cols=['store_id', 'cat_id'],
-        )
-        sim_store.append(sim_result.summarize(group_cols=['store_id']))
-        if sim_result.group_summary_df is not None:
-            sim_store_cat.append(sim_result.group_summary_df)
+        if baseline_ddlt is not None:
+            label = f"empirical_{baseline}"
+            baseline_decided = _decide_and_evaluate(baseline_ddlt, label, history_df, store_name)
+            baseline_decided.to_csv(out_dir / f'predictions_{label}_{store_name}.csv', index=False)
+            del baseline_ddlt, baseline_decided
 
         # Compute Forecasting Metrics:
         df_wmape_store_cat = predictions.groupby(['store_id', 'cat_id'], as_index=False, observed=True)[
@@ -301,17 +379,29 @@ def main(
         )
         wmape_store_cat.append(df_wmape_store_cat)
         wmape_store.append(df_wmape_store)
-        del predictions, sim_result; gc.collect()
-        break
+        del predictions, history_df; gc.collect()
 
     wmape_store_cat = pd.concat(wmape_store_cat)
     wmape_store = pd.concat(wmape_store)
     wmape_store.to_csv(out_dir / f'wmape_store{suffix}.csv', index=False)
     wmape_store_cat.to_csv(out_dir / f'wmape_store_cat{suffix}.csv', index=False)
     if sim_store:
-        pd.concat(sim_store, ignore_index=True).to_csv(out_dir / f'simulation_store{suffix}.csv', index=False)
+        sim_all = pd.concat(sim_store, ignore_index=True)
+        sim_all.to_csv(out_dir / f'simulation_store{suffix}.csv', index=False)
+        if baseline != "none":
+            kpis = [c for c in ['model', 'store_id', 'fill_rate', 'cycle_service_level', 'avg_on_hand',
+                                'inventory_turnover', 'total_lost_sales', 'total_profit', 'profit_margin_pct']
+                    if c in sim_all.columns]
+            bench_path = out_dir / f'decision_benchmark{suffix}.csv'
+            sim_all[kpis].to_csv(bench_path, index=False)
+            logger.info("Decision benchmark (saved to %s):\n%s", bench_path, sim_all[kpis].to_string(index=False))
     if sim_store_cat:
         pd.concat(sim_store_cat, ignore_index=True).to_csv(out_dir / f'simulation_store_cat{suffix}.csv', index=False)
+    if calib_summary:
+        pd.concat(calib_summary, ignore_index=True).to_csv(out_dir / f'ddlt_calibration_summary{suffix}.csv', index=False)
+        pd.concat(calib_coverage, ignore_index=True).to_csv(out_dir / f'ddlt_calibration_coverage{suffix}.csv', index=False)
+        pd.concat(calib_pit, ignore_index=True).to_csv(out_dir / f'ddlt_calibration_pit{suffix}.csv', index=False)
+        logger.info("Saved DDLT calibration reports to %s", out_dir)
     if quantile_metrics:
         quantile_metrics = pd.concat(quantile_metrics)
         qm_path = out_dir / f'quantile_metrics{suffix}.csv'
@@ -336,4 +426,8 @@ if __name__ == '__main__':
         log_level=args.log_level,
         target_policy=args.target_policy,
         service_level=args.service_level,
+        stores=args.stores,
+        evaluate_ddlt=args.evaluate_ddlt,
+        baseline=args.baseline,
+        baseline_window=args.baseline_window,
     )

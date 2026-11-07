@@ -113,6 +113,10 @@ python scripts/process_m5_dataset.py --download
 python scripts/run_m5_pipeline.py --model glm
 python scripts/run_m5_pipeline.py --model catboost --catboost-iterations 400 --catboost-train-days 365
 python scripts/run_m5_pipeline.py --model glm --target-policy quantile --service-level 0.95
+
+# 3. Is the DDLT calibrated, and does the model beat a naive baseline on decisions?
+python scripts/run_m5_pipeline.py --model glm --stores CA_1 --target-policy quantile \
+    --evaluate-ddlt --baseline trailing
 ```
 
 <details>
@@ -124,6 +128,10 @@ python scripts/run_m5_pipeline.py --model glm --target-policy quantile --service
 | `--target-policy` | `newsvendor` | `newsvendor` (budgeted) or `quantile` |
 | `--service-level` | `0.95` | Quantile used with `--target-policy quantile` |
 | `--budget-per-store` | `15000` | Purchasing budget per store per decision day |
+| `--stores` | all | Subset of stores, e.g. `--stores CA_1 TX_2` |
+| `--evaluate-ddlt` | off | Write DDLT calibration reports (coverage, PIT, dispersion ratio, CRPS) |
+| `--baseline` | `none` | `trailing` / `seasonal` empirical-quantile baseline through the same DDLT, policy and simulation |
+| `--baseline-window` | `56` | Baseline history window in days |
 | `--quantiles` | `0.05 … 0.99` | Quantile grid for CatBoost |
 | `--catboost-iterations` | `1000` | Max boosting iterations per horizon |
 | `--catboost-train-days` | `730` | Training history window (`0` = all) |
@@ -144,7 +152,9 @@ python scripts/run_m5_pipeline.py --model glm --target-policy quantile --service
 | `predictions[_catboost]_<STORE>.csv` | Horizon means, quantiles and `target_inventory` per item-day |
 | `wmape_store*.csv`, `wmape_store_cat*.csv` | Point accuracy by store / category |
 | `quantile_metrics_catboost.csv` | Pinball loss, coverage, CRPS per horizon and quantile |
-| `simulation_store*.csv`, `simulation_store_cat*.csv` | Inventory simulation KPIs by store / category |
+| `simulation_store*.csv`, `simulation_store_cat*.csv` | Inventory simulation KPIs by store / category (one row per model) |
+| `ddlt_calibration_{summary,coverage,pit}*.csv` | DDLT calibration report (`--evaluate-ddlt`) |
+| `decision_benchmark*.csv`, `predictions_empirical_*_<STORE>.csv` | Model vs. baseline decision KPIs (`--baseline`) |
 
 ---
 
@@ -169,8 +179,8 @@ data/                (git-ignored) raw, processed and output data
 ## Development
 
 ```bash
-python -m pytest -q                                   # full test suite
-python -m pytest tests/test_ddlt_benchmark.py -s -q   # numerical equivalence + timings
+python -m pytest -q                       # full test suite (timing benchmarks are skipped)
+python -m pytest -m benchmark -s -q       # speed benchmarks with printed timings
 ```
 
 Numba kernels are JIT-compiled on first use and cached on disk, so the first run is slower.
@@ -185,6 +195,8 @@ Numba kernels are JIT-compiled on first use and cached on disk, so the first run
 - [x] Reusable forecaster bundles
 - [x] Multi-period inventory simulation with decision KPIs
 - [x] `src/` package layout
+- [x] DDLT calibration report + empirical-quantile baseline
+- [x] Numba GLM → DDLT path (~20× faster)
 - [ ] Rolling-origin backtesting
 - [ ] GLM vs CatBoost decision benchmarking
 - [ ] Constrained replenishment (budget, capacity, MOQ) inside the simulation
