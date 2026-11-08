@@ -68,9 +68,12 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        choices=["glm", "catboost"],
+        choices=["glm", "glm_hurdle", "catboost"],
         default=DEFAULT_MODEL,
-        help=f"Forecasting model: Poisson/negative-binomial GLMs or CatBoost multi-quantile regression (default: {DEFAULT_MODEL}).",
+        help=(
+            f"Forecasting model: Poisson/negative-binomial GLMs ('glm'), zero-hurdle GLMs "
+            f"('glm_hurdle'), or CatBoost multi-quantile regression (default: {DEFAULT_MODEL})."
+        ),
     )
     parser.add_argument(
         "--quantiles",
@@ -282,12 +285,15 @@ def main(
         del sales_df; gc.collect()
 
         logger.info("Null values in sell_price column: %d", int(ts.df['sell_price'].isna().sum()))
-        if model == "glm":
-            forecaster = GLMForecaster(train_groups=['store_id', 'cat_id'])
+        if model in ("glm", "glm_hurdle"):
+            forecaster = GLMForecaster(
+                train_groups=['store_id', 'cat_id'],
+                hurdle=(model == "glm_hurdle"),
+            )
             model_data = forecaster.fit(ts)
-            model_path = out_dir / f'model_data_{store_name}.csv'
+            model_path = out_dir / f'model_data{suffix}_{store_name}.csv'
             model_data.to_csv(model_path, index=False)
-            models_dir = out_dir / f'glm_models_{store_name}'
+            models_dir = out_dir / f'glm_models{suffix}_{store_name}'
             forecaster.save(models_dir)
             logger.info("Saved GLM model bundle to %s and CSV metadata to %s", models_dir, model_path)
         else:

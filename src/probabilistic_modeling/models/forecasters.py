@@ -176,6 +176,184 @@ def evaluate_quantile_forecasts(
     return pd.DataFrame(rows)
 
 
+def _hurdle_conditional_mean(lam: np.ndarray | float, alpha: float | None) -> np.ndarray | float:
+    """
+    Computes the conditional positive expectation `E[Y | Y > 0] = lambda / (1 - P_0(lambda, alpha))`
+    for a Zero-Truncated Poisson (`alpha is None`, `NaN`, or `<= 0`) or Zero-Truncated NB2 (`alpha > 0`).
+
+    Why this helper is needed
+    -------------------------
+    In a Zero-Hurdle GLM, the count stage models `Y | Y > 0` using a zero-truncated distribution
+    with untruncated rate parameter `lambda = exp(X @ beta_count)`. The unconditional mean is:
+
+        mu = E[Y] = pi * E[Y | Y > 0] = pi * lambda / (1 - P_0(lambda, alpha))
+
+    where `P_0(lambda) = exp(-lambda)` for Poisson and `P_0(lambda, alpha) = (1 + alpha * lambda)^(-1/alpha)`
+    for NB2. Using `-expm1(...)` and clamping the conditional mean at `>= 1.0` preserves full
+    floating-point precision as `lambda -> 0+` (where `lambda / (1 - P_0) -> 1.0`).
+    """
+    is_scalar = np.ndim(lam) == 0
+    lam_arr = np.asarray(lam, dtype=np.float64)
+    use_nb = alpha is not None and np.isfinite(alpha) and float(alpha) > 0.0
+    if use_nb:
+        a = float(alpha)
+        log_p0 = -(1.0 / a) * np.log1p(np.maximum(a * lam_arr, 0.0))
+        pos_mass = -np.expm1(log_p0)
+    else:
+        pos_mass = -np.expm1(-np.maximum(lam_arr, 0.0))
+
+    cond_mu = np.where(pos_mass > 1e-12, np.maximum(lam_arr / np.maximum(pos_mass, 1e-12), 1.0), 1.0)
+    return float(cond_mu) if is_scalar else cond_mu
+
+
+def _fit_hurdle_binary_stage(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    regularization_alpha: float | None = None,
+    l1_wt: float = 0.0,
+) -> tuple[dict[str, float], Any]:
+    """
+    Fits the binary hurdle stage `P(Y > 0 | X)` using a logistic regression GLM (`smf.logit`),
+    with graceful fallback when a group's target is all-zero, all-positive, or exhibits
+    perfect separation / constant covariates.
+    """
+    zero_coefs = {str(f): 0.0 for f in feature_cols}
+    if len(train_df) == 0:
+        return {"Intercept": -30.0, **zero_coefs}, None
+
+    is_pos = (train_df[target_col] > 0).astype(int)
+    n_pos = int(is_pos.sum())
+    if n_pos == 0:
+        return {"Intercept": -30.0, **zero_coefs}, None
+    if n_pos == len(train_df):
+        return {"Intercept": 30.0, **zero_coefs}, None
+
+    active_features = [
+        f for f in feature_cols if f in train_df.columns and train_df[f].nunique(dropna=True) > 1
+    ]
+    work_df = train_df[active_features].copy() if active_features else pd.DataFrame(index=train_df.index)
+    work_df["_hurdle_y"] = is_pos.to_numpy()
+    formula = f"_hurdle_y ~ {' + '.join(active_features)}" if active_features else "_hurdle_y ~ 1"
+
+    summary = None
+    params_dict: dict[str, float] | None = None
+    try:
+        logit_model = smf.logit(formula=formula, data=work_df)
+        if regularization_alpha is not None and regularization_alpha > 0.0:
+            res = logit_model.fit_regularized(
+                alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
+            )
+        else:
+            try:
+                res = logit_model.fit(maxiter=100, disp=False)
+                summary = res.summary()
+            except Exception:
+                res = logit_model.fit(method="bfgs", maxiter=100, disp=False)
+        cand = {str(k): float(v) for k, v in res.params.to_dict().items()}
+        if all(np.isfinite(v) and abs(v) < 50.0 for v in cand.values()):
+            params_dict = cand
+        else:
+            res_reg = logit_model.fit_regularized(alpha=1e-4, L1_wt=0.0, maxiter=100, disp=False)
+            cand_reg = {str(k): float(v) for k, v in res_reg.params.to_dict().items()}
+            if all(np.isfinite(v) for v in cand_reg.values()):
+                params_dict = {k: float(np.clip(v, -30.0, 30.0)) for k, v in cand_reg.items()}
+    except Exception:
+        params_dict = None
+
+    if params_dict is None:
+        p_bar = float(np.clip(is_pos.mean(), 1e-6, 1.0 - 1e-6))
+        return {"Intercept": float(np.log(p_bar / (1.0 - p_bar))), **zero_coefs}, None
+
+    hurdle_params = {
+        "Intercept": float(params_dict.get("Intercept", 0.0)),
+        **{str(f): float(params_dict.get(f, 0.0)) for f in feature_cols},
+    }
+    return hurdle_params, summary
+
+
+def _fit_hurdle_count_stage(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    base_type: str,
+    regularization_alpha: float | None = None,
+    l1_wt: float = 0.0,
+) -> tuple[dict[str, float], float | None, Any]:
+    """
+    Fits the zero-truncated count stage `P(Y = k | Y > 0, X)` (`k >= 1`) on positive rows
+    using `TruncatedLFNegativeBinomialP` (`base_type="nbinom"`) or `TruncatedLFPoisson`
+    (`base_type="poisson"`), with automatic fallback if positive observations are all `1`
+    or if Newton optimization encounters a singular Hessian on sparse subsets.
+    """
+    from statsmodels.discrete.truncated_model import TruncatedLFNegativeBinomialP, TruncatedLFPoisson
+
+    zero_coefs = {str(f): 0.0 for f in feature_cols}
+    pos_df = train_df[train_df[target_col] > 0]
+    if len(pos_df) == 0 or float(pos_df[target_col].max()) <= 1.0:
+        return {"Intercept": -20.0, **zero_coefs}, None, None
+
+    active_features = [
+        f for f in feature_cols if f in pos_df.columns and pos_df[f].nunique(dropna=True) > 1
+    ]
+    if len(pos_df) <= len(active_features) + 1:
+        active_features = []
+    formula = f"{target_col} ~ {' + '.join(active_features)}" if active_features else f"{target_col} ~ 1"
+
+    def _try_truncated_fit(dist_cls, f_str: str) -> tuple[dict[str, float] | None, float | None, Any]:
+        try:
+            mod = dist_cls.from_formula(f_str, data=pos_df)
+            if regularization_alpha is not None and regularization_alpha > 0.0:
+                res = mod.fit_regularized(
+                    alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
+                )
+                summ = None
+            else:
+                try:
+                    res = mod.fit(maxiter=100, disp=False)
+                    summ = res.summary()
+                except Exception:
+                    res = mod.fit(method="bfgs", maxiter=100, disp=False)
+                    summ = None
+            raw = {str(k): float(v) for k, v in res.params.to_dict().items()}
+            a_val = raw.pop("alpha", None)
+            if not all(np.isfinite(v) and abs(v) < 50.0 for v in raw.values()):
+                return None, None, None
+            if dist_cls is TruncatedLFNegativeBinomialP:
+                if a_val is None or not np.isfinite(a_val) or a_val <= 0.0 or a_val > 1e4:
+                    return None, None, None
+                return raw, float(a_val), summ
+            return raw, None, summ
+        except Exception:
+            return None, None, None
+
+    raw_params: dict[str, float] | None = None
+    alpha_val: float | None = None
+    summary = None
+
+    if base_type == "nbinom":
+        raw_params, alpha_val, summary = _try_truncated_fit(TruncatedLFNegativeBinomialP, formula)
+        if raw_params is None and active_features:
+            raw_params, alpha_val, summary = _try_truncated_fit(
+                TruncatedLFNegativeBinomialP, f"{target_col} ~ 1"
+            )
+
+    if raw_params is None:
+        raw_params, alpha_val, summary = _try_truncated_fit(TruncatedLFPoisson, formula)
+        if raw_params is None and active_features:
+            raw_params, alpha_val, summary = _try_truncated_fit(TruncatedLFPoisson, f"{target_col} ~ 1")
+
+    if raw_params is None:
+        mu_pos = max(float(pos_df[target_col].mean()) - 1.0, 1e-4)
+        return {"Intercept": float(np.log(mu_pos)), **zero_coefs}, None, None
+
+    count_params = {
+        "Intercept": float(raw_params.get("Intercept", 0.0)),
+        **{str(f): float(raw_params.get(f, 0.0)) for f in feature_cols},
+    }
+    return count_params, alpha_val, summary
+
+
 def train_single_glm(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -183,44 +361,77 @@ def train_single_glm(
     model_type: str = "nbinom",
     regularization_alpha: float | None = None,
     l1_wt: float = 0.0,
+    hurdle: bool = False,
 ) -> tuple[dict[str, Any], Any]:
     """
-    Trains a single log-link Poisson or Negative Binomial GLM for one group and one horizon.
+    Trains a single log-link Poisson or Negative Binomial GLM (standard or zero-hurdle)
+    for one group and one horizon.
 
     What it does
     ------------
     1. Filters `df` to training rows (`is_test == 0`) where `target_col` is not `NaN`.
-    2. Builds the Statsmodels formula `target_col ~ feature_1 + feature_2 + ...` and
+    2. **Standard GLM (`hurdle=False`, `model_type in ("nbinom", "poisson")`)**:
+       Builds the Statsmodels formula `target_col ~ feature_1 + feature_2 + ...` and
        instantiates either `smf.negativebinomial` (`model_type="nbinom"`) or `smf.poisson`
-       (`model_type="poisson"`).
-    3. Fits via maximum likelihood (`.fit(maxiter=100)`) or L1/L2 penalized likelihood
-       (`.fit_regularized(alpha=..., L1_wt=...)` when `regularization_alpha > 0`).
+       (`model_type="poisson"`), fitting via MLE or penalized likelihood.
+    3. **Zero-Hurdle GLM (`hurdle=True` or `model_type in ("hurdle_nbinom", "hurdle_poisson")`)**:
+       Fits a two-part hurdle model:
+       - *Binary hurdle stage*: logistic regression (`smf.logit`) on `1{target_col > 0}`
+         across all training rows, producing `"hurdle_coefficients"`.
+       - *Zero-truncated count stage*: `TruncatedLFNegativeBinomialP` (`"hurdle_nbinom"`)
+         or `TruncatedLFPoisson` (`"hurdle_poisson"`) fitted strictly on positive training
+         rows (`target_col > 0`), producing `"coefficients"` and `"alpha"`.
     4. Separates the Negative Binomial dispersion parameter `"alpha"` from the regression
        `"coefficients"` dictionary so `"coefficients"` strictly maps `"Intercept"` and
        covariate names to their linear weights.
-
-    Why separating `alpha` from `coefficients` is needed
-    ----------------------------------------------------
-    Statsmodels' `smf.negativebinomial` appends the estimated dispersion parameter `alpha`
-    directly onto `result.params` alongside `"Intercept"` and the regression covariates.
-    Popping `"alpha"` out of `raw_params` into its own top-level key ensures that if a
-    dataset ever had a covariate or nothing named `alpha`, linear predictor dot products
-    (`X.dot(coefs)`) only multiply actual regression coefficients.
 
     Where it is used
     ----------------
     Called by `GLMForecaster.fit` and `time_series.train_glm`.
     """
+    if hurdle and model_type in ("nbinom", "poisson"):
+        model_type = f"hurdle_{model_type}"
+
     train_df = df[~df[target_col].isna()]
     if "is_test" in train_df.columns:
         train_df = train_df[train_df["is_test"] == 0]
+
+    if model_type in ("hurdle_nbinom", "hurdle_poisson"):
+        base_type = "nbinom" if model_type == "hurdle_nbinom" else "poisson"
+        hurdle_params, hurdle_summary = _fit_hurdle_binary_stage(
+            train_df,
+            feature_cols,
+            target_col,
+            regularization_alpha=regularization_alpha,
+            l1_wt=l1_wt,
+        )
+        count_params, alpha_val, count_summary = _fit_hurdle_count_stage(
+            train_df,
+            feature_cols,
+            target_col,
+            base_type=base_type,
+            regularization_alpha=regularization_alpha,
+            l1_wt=l1_wt,
+        )
+        prod_model = {
+            "model_type": model_type,
+            "horizon": target_col,
+            "coefficients": count_params,
+            "hurdle_coefficients": hurdle_params,
+            "alpha": float(alpha_val) if alpha_val is not None and np.isfinite(alpha_val) else None,
+        }
+        return prod_model, count_summary if count_summary is not None else hurdle_summary
+
     formula = f"{target_col} ~ {' + '.join(feature_cols)}"
     if model_type == "nbinom":
         model = smf.negativebinomial(formula=formula, data=train_df)
     elif model_type == "poisson":
         model = smf.poisson(formula=formula, data=train_df)
     else:
-        raise ValueError(f"Unsupported distribution: '{model_type}'. Supported options are 'nbinom', 'poisson'.")
+        raise ValueError(
+            f"Unsupported distribution: '{model_type}'. Supported options are "
+            "'nbinom', 'poisson', 'hurdle_nbinom', 'hurdle_poisson'."
+        )
 
     if regularization_alpha is not None and regularization_alpha > 0.0:
         result = model.fit_regularized(alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False)
@@ -279,7 +490,7 @@ class GLMModel:
         for group_key, horizon_dict in self.models.items():
             row: dict[str, Any] = {}
             for col_name, key_val in zip(self.train_groups, group_key):
-                if col_name == "overdispersion":
+                if col_name in ("overdispersion", "positive_overdispersion"):
                     try:
                         row[col_name] = int(key_val)
                     except ValueError:
@@ -331,6 +542,11 @@ class GLMModel:
 
     def coefficients_table(self) -> pd.DataFrame:
         """Returns a tidy long-format DataFrame of fitted GLM coefficients across groups and horizons."""
+        has_hurdle = any(
+            "hurdle_coefficients" in m_dict
+            for horizon_dict in self.models.values()
+            for m_dict in horizon_dict.values()
+        )
         rows = []
         for group_key, horizon_dict in self.models.items():
             group_info = dict(zip(self.train_groups, group_key))
@@ -338,14 +554,28 @@ class GLMModel:
                 model_type = m_dict.get("model_type")
                 alpha = m_dict.get("alpha")
                 for feat, coef in m_dict.get("coefficients", {}).items():
-                    rows.append({
+                    row = {
                         **group_info,
                         "target": target,
                         "model_type": model_type,
                         "alpha": alpha,
                         "feature": feat,
                         "coefficient": coef,
-                    })
+                    }
+                    if has_hurdle:
+                        row["component"] = "count"
+                    rows.append(row)
+                if "hurdle_coefficients" in m_dict:
+                    for feat, coef in m_dict.get("hurdle_coefficients", {}).items():
+                        rows.append({
+                            **group_info,
+                            "target": target,
+                            "model_type": model_type,
+                            "alpha": None,
+                            "feature": feat,
+                            "coefficient": coef,
+                            "component": "hurdle",
+                        })
         return pd.DataFrame(rows)
 
     def save(self, out_dir: Path | str, prefix: str = "glm") -> None:
@@ -496,6 +726,8 @@ class ProbabilisticForecaster(ABC):
                 test_data = pd.merge(test_data, meta_sub, on=join_keys, how="left")
                 if "overdispersion" in missing_meta_cols:
                     test_data["overdispersion"] = test_data["overdispersion"].fillna(0).astype(int)
+                if "positive_overdispersion" in missing_meta_cols:
+                    test_data["positive_overdispersion"] = test_data["positive_overdispersion"].fillna(0).astype(int)
 
         return test_data, target_cols, feature_cols, period_col
 
@@ -628,20 +860,26 @@ class ProbabilisticForecaster(ABC):
 
 class GLMForecaster(ProbabilisticForecaster):
     """
-    Grouped Poisson / Negative-Binomial GLM forecaster across multiple horizons.
+    Grouped Poisson / Negative-Binomial GLM forecaster (standard or zero-hurdle) across multiple horizons.
 
     What it does
     ------------
-    - **Training (`fit`)**: Partitions the training panel by `train_groups + ["overdispersion"]`.
-      For each partition, automatically fits a Negative Binomial GLM (`model_type="nbinom"`)
-      if `overdispersion == 1` or a Poisson GLM (`model_type="poisson"`) if `overdispersion == 0`
-      independently for each horizon `target_t_plus_0 .. target_t_plus_{H-1}`.
-    - **Prediction (`predict`)**: Evaluates `target_t_plus_h_mu = exp(X @ beta)` and attaches
-      `target_t_plus_h_alpha` for every horizon using vectorized matrix multiplication per group.
-    - **DDLT (`compute_ddlt`)**: Passes the predicted `(mu, alpha)` columns to
-      `DDLTCalculator.from_glm_group`, which constructs truncated Poisson/NB2 PMFs in
-      compiled Numba log-space (`_count_pmf_truncated_numba`) and convolves them over the
-      lead-time distribution.
+    - **Training (`fit`)**:
+      * When `hurdle=False` (default): Partitions the training panel by `train_groups + ["overdispersion"]`.
+        Fits a Negative Binomial GLM (`model_type="nbinom"`) if `overdispersion == 1` or a Poisson GLM
+        (`model_type="poisson"`) if `overdispersion == 0`.
+      * When `hurdle=True`: Partitions the training panel by `train_groups + ["positive_overdispersion"]`,
+        where `positive_overdispersion` is computed strictly on positive training observations (`demand > 0`).
+        Fits a Zero-Hurdle Negative Binomial GLM (`model_type="hurdle_nbinom"`) if `positive_overdispersion == 1`
+        or a Zero-Hurdle Poisson GLM (`model_type="hurdle_poisson"`) if `positive_overdispersion == 0`.
+    - **Prediction (`predict`)**:
+      * Standard GLM: Evaluates `target_t_plus_h_mu = exp(X @ beta)` and attaches `target_t_plus_h_alpha`.
+      * Zero-Hurdle GLM: Evaluates hurdle probability `target_t_plus_h_pi = sigmoid(X @ gamma)`,
+        untruncated count rate `target_t_plus_h_lambda = exp(X @ beta)`, `target_t_plus_h_alpha`,
+        and unconditional expected value `target_t_plus_h_mu = pi * lambda / (1 - P_0(lambda, alpha))`.
+    - **DDLT (`compute_ddlt`)**: Passes the predicted GLM parameter columns to
+      `DDLTCalculator.from_glm_group`, which constructs truncated Poisson/NB2 or Zero-Hurdle
+      Poisson/NB2 PMFs in compiled Numba log-space and convolves them over the lead-time distribution.
     """
 
     forecaster_type = "glm"
@@ -652,30 +890,51 @@ class GLMForecaster(ProbabilisticForecaster):
         regularization_alpha: float | None = None,
         l1_wt: float = 0.0,
         restrict_future_leads: bool = False,
+        hurdle: bool = False,
     ):
         super().__init__()
         self.train_groups = list(train_groups) if train_groups is not None else []
         self.regularization_alpha = regularization_alpha
         self.l1_wt = l1_wt
         self.restrict_future_leads = restrict_future_leads
+        self.hurdle = bool(hurdle)
         self.model_data: pd.DataFrame | None = None
         self.model: GLMModel | None = None
 
     def fit(self, ts: "DiscreteTimeSeries") -> pd.DataFrame:
         """
-        Fits grouped multi-horizon Poisson / Negative Binomial GLMs on `ts` and returns
-        the wide `model_data` DataFrame (while also storing `self.model: GLMModel`).
+        Fits grouped multi-horizon Poisson / Negative Binomial GLMs (standard or zero-hurdle) on `ts`
+        and returns the wide `model_data` DataFrame (while also storing `self.model: GLMModel`).
         """
         t0 = time.perf_counter()
         self._bind_training_context(ts)
+        dispersion_col = "positive_overdispersion" if self.hurdle else "overdispersion"
+        if dispersion_col not in ts.df.columns:
+            # Ensure positive_overdispersion is present if ts was constructed without it:
+            if self.hurdle and ts.var_col in ts.df.columns and ts.ts_id_cols:
+                tmp_pos = np.where(
+                    (ts.df["is_test"] == 0 if "is_test" in ts.df.columns else True) & (ts.df[ts.var_col] > 0),
+                    ts.df[ts.var_col],
+                    np.nan,
+                )
+                pos_s = pd.Series(tmp_pos, index=ts.df.index)
+                grp = pos_s.groupby([ts.df[c] for c in ts.ts_id_cols], observed=True)
+                ts.df["positive_overdispersion"] = (grp.transform("var") > grp.transform("mean")).fillna(False).astype(int)
+                if self.series_metadata_ is not None and "positive_overdispersion" not in self.series_metadata_.columns:
+                    meta_pos = ts.df[list(ts.ts_id_cols) + ["positive_overdispersion"]].drop_duplicates(subset=list(ts.ts_id_cols))
+                    self.series_metadata_ = pd.merge(self.series_metadata_, meta_pos, on=list(ts.ts_id_cols), how="left")
+            elif "overdispersion" in ts.df.columns:
+                dispersion_col = "overdispersion"
+
         partition_cols = list(self.train_groups)
-        if "overdispersion" not in partition_cols:
-            partition_cols.append("overdispersion")
+        if dispersion_col not in partition_cols:
+            partition_cols.append(dispersion_col)
 
         train_df = ts.df[ts.df["is_test"] == 0] if ts.test_start_period is not None else ts.df
         n_groups = train_df[partition_cols].drop_duplicates().shape[0]
         logger.info(
-            "Starting GLM training across %d group(s) and %d horizon(s) (%d training rows)...",
+            "Starting %sGLM training across %d group(s) and %d horizon(s) (%d training rows)...",
+            "Hurdle " if self.hurdle else "",
             n_groups,
             len(ts.target_cols),
             len(train_df),
@@ -689,12 +948,15 @@ class GLMForecaster(ProbabilisticForecaster):
         def _train_group(group_df: pd.DataFrame) -> pd.Series:
             group_name = getattr(group_df, "name", "unknown")
             if isinstance(group_name, tuple):
-                idx = partition_cols.index("overdispersion")
+                idx = partition_cols.index(dispersion_col)
                 is_overdispersed = group_name[idx]
             else:
                 is_overdispersed = group_name
 
-            model_type = "nbinom" if is_overdispersed == 1 else "poisson"
+            if self.hurdle:
+                model_type = "hurdle_nbinom" if is_overdispersed == 1 else "hurdle_poisson"
+            else:
+                model_type = "nbinom" if is_overdispersed == 1 else "poisson"
             group_result = {}
             n_horizons = len(ts.target_cols)
             for h_idx, target in enumerate(ts.target_cols, start=1):
@@ -715,6 +977,7 @@ class GLMForecaster(ProbabilisticForecaster):
                     model_type,
                     regularization_alpha=self.regularization_alpha,
                     l1_wt=self.l1_wt,
+                    hurdle=self.hurdle,
                 )
                 group_result[target] = model_dict
                 if summary is not None:
@@ -747,7 +1010,8 @@ class GLMForecaster(ProbabilisticForecaster):
         model_data: pd.DataFrame | GLMModel | None = None,
     ) -> pd.DataFrame:
         """
-        Generates `<target>_mu` and `<target>_alpha` predictions for every horizon in `target_cols`.
+        Generates `<target>_mu` and `<target>_alpha` predictions (plus `<target>_pi` and
+        `<target>_lambda` for zero-hurdle models) for every horizon in `target_cols`.
 
         Why string-keyed fallback lookup is included
         --------------------------------------------
@@ -784,9 +1048,30 @@ class GLMForecaster(ProbabilisticForecaster):
             fallback_feature_cols=glm_container.feature_cols,
         )
         train_groups = [col for col in model_df.columns if col not in target_cols]
+        # Fallback if a standalone DataFrame was passed without `positive_overdispersion`:
+        if "positive_overdispersion" in train_groups and "positive_overdispersion" not in test_data.columns:
+            if "overdispersion" in test_data.columns:
+                test_data["positive_overdispersion"] = test_data["overdispersion"].fillna(0).astype(int)
+            else:
+                test_data["positive_overdispersion"] = 0
+        if "overdispersion" in train_groups and "overdispersion" not in test_data.columns:
+            if "positive_overdispersion" in test_data.columns:
+                test_data["overdispersion"] = test_data["positive_overdispersion"].fillna(0).astype(int)
+            else:
+                test_data["overdispersion"] = 0
+
+        has_hurdle = self.hurdle or any(
+            isinstance(m_dict, dict)
+            and ("hurdle_coefficients" in m_dict or str(m_dict.get("model_type", "")).startswith("hurdle_"))
+            for h_dict in glm_container.models.values()
+            for m_dict in h_dict.values()
+        )
         logger.info("Generating GLM predictions for %d rows across %d horizons...", len(test_data), len(target_cols))
 
         for target in target_cols:
+            if has_hurdle:
+                test_data[f"{target}_pi"] = np.nan
+                test_data[f"{target}_lambda"] = np.nan
             test_data[f"{target}_mu"] = np.nan
             test_data[f"{target}_alpha"] = np.nan
 
@@ -819,11 +1104,25 @@ class GLMForecaster(ProbabilisticForecaster):
                     continue
                 coefs = dict(model_dict["coefficients"])
                 alpha_val = model_dict.get("alpha", coefs.pop("alpha", np.nan))
+                alpha_clean = float(alpha_val) if alpha_val is not None and np.isfinite(alpha_val) else np.nan
                 coef_series = pd.Series(coefs, dtype=float)
                 X_aligned = X.reindex(columns=coef_series.index).fillna(0.0)
                 z = X_aligned.dot(coef_series)
-                test_data.loc[group_idx, f"{target}_mu"] = np.exp(z)
-                test_data.loc[group_idx, f"{target}_alpha"] = float(alpha_val) if alpha_val is not None else np.nan
+                lam = np.exp(np.clip(z.to_numpy(dtype=np.float64), -50.0, 50.0))
+
+                if "hurdle_coefficients" in model_dict or str(model_dict.get("model_type", "")).startswith("hurdle_"):
+                    h_coefs = dict(model_dict.get("hurdle_coefficients", {"Intercept": 0.0}))
+                    h_series = pd.Series(h_coefs, dtype=float)
+                    X_h = X.reindex(columns=h_series.index).fillna(0.0)
+                    z_h = np.clip(X_h.dot(h_series).to_numpy(dtype=np.float64), -50.0, 50.0)
+                    pi = 1.0 / (1.0 + np.exp(-z_h))
+                    mu = pi * _hurdle_conditional_mean(lam, alpha_clean)
+                    test_data.loc[group_idx, f"{target}_pi"] = pi
+                    test_data.loc[group_idx, f"{target}_lambda"] = lam
+                    test_data.loc[group_idx, f"{target}_mu"] = mu
+                else:
+                    test_data.loc[group_idx, f"{target}_mu"] = lam
+                test_data.loc[group_idx, f"{target}_alpha"] = alpha_clean
 
         compute_forecasting_metrics(test_data, target_cols, [f"{target}_mu" for target in target_cols])
         logger.info("GLM predictions completed in %.2fs", time.perf_counter() - t0)
@@ -888,6 +1187,7 @@ class GLMForecaster(ProbabilisticForecaster):
                 "regularization_alpha": self.regularization_alpha,
                 "l1_wt": self.l1_wt,
                 "restrict_future_leads": self.restrict_future_leads,
+                "hurdle": self.hurdle,
                 "prefix": prefix,
             },
         )
@@ -902,11 +1202,21 @@ class GLMForecaster(ProbabilisticForecaster):
         meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
         saved_prefix = meta.get("prefix", prefix)
         glm_model = GLMModel.load(out_path, prefix=saved_prefix)
+        inferred_hurdle = any(
+            isinstance(m_dict, dict)
+            and ("hurdle_coefficients" in m_dict or str(m_dict.get("model_type", "")).startswith("hurdle_"))
+            for h_dict in glm_model.models.values()
+            for m_dict in h_dict.values()
+        )
         forecaster = cls(
-            train_groups=meta.get("train_groups", [c for c in glm_model.train_groups if c != "overdispersion"]),
+            train_groups=meta.get(
+                "train_groups",
+                [c for c in glm_model.train_groups if c not in ("overdispersion", "positive_overdispersion")],
+            ),
             regularization_alpha=meta.get("regularization_alpha"),
             l1_wt=float(meta.get("l1_wt", 0.0)),
             restrict_future_leads=bool(meta.get("restrict_future_leads", False)),
+            hurdle=bool(meta.get("hurdle", inferred_hurdle)),
         )
         forecaster.model = glm_model
         forecaster.model_data = glm_model.to_dataframe()

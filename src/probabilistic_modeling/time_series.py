@@ -44,6 +44,7 @@ from probabilistic_modeling.models.forecasters import (
     CatBoostQuantileForecaster,
     GLMForecaster,
     ProbabilisticForecaster,
+    _hurdle_conditional_mean,
     compute_forecasting_metrics,
     evaluate_quantile_forecasts,
     train_single_glm,
@@ -381,6 +382,7 @@ def train_glm(
     feature_cols: list[str],
     target_col: str,
     model_type: str = "nbinom",
+    hurdle: bool = False,
 ) -> tuple[dict, Any]:
     """
     Trains a Generalized Linear Model (GLM) on the provided DataFrame.
@@ -388,13 +390,14 @@ def train_glm(
     What it does
     ------------
     Thin convenience wrapper around `train_single_glm` in `models/forecasters.py` that fits
-    a log-link Poisson or Negative Binomial GLM (`target_col ~ feature_cols`) on non-test rows.
+    a log-link Poisson or Negative Binomial GLM (`target_col ~ feature_cols`) on non-test rows,
+    either as a standard count GLM (`hurdle=False`) or a two-part zero-hurdle GLM (`hurdle=True`).
 
     Where it is used
     ----------------
     Exported at package root for standalone single-horizon GLM fitting and backward compatibility.
     """
-    return train_single_glm(df, feature_cols, target_col, model_type)
+    return train_single_glm(df, feature_cols, target_col, model_type, hurdle=hurdle)
 
 
 def predict_glm(
@@ -403,12 +406,14 @@ def predict_glm(
 ) -> tuple[float, float | None]:
     """
     Computes the expected value (`mu`) and dispersion parameter (`alpha`) for a single
-    observation using trained GLM coefficients.
+    observation using trained GLM coefficients (standard or zero-hurdle).
 
     What it does
     ------------
     Evaluates the linear predictor `z = Intercept + sum_j x_j * beta_j`, applies the
-    inverse log-link `mu = exp(z)`, and extracts `alpha = model_data.get("alpha", np.nan)`.
+    inverse log-link `lam = exp(z)`, and extracts `alpha = model_data.get("alpha", np.nan)`.
+    For zero-hurdle models (`"hurdle_coefficients"` present in `model_data`), also evaluates
+    `pi = sigmoid(z_hurdle)` and returns `mu = pi * lam / (1 - P_0(lam, alpha))`.
 
     Where it is used
     ----------------
@@ -421,8 +426,18 @@ def predict_glm(
     for feature_name, coef_value in coefficients.items():
         if feature_name != "Intercept":
             z += feature_dict.get(feature_name, 0.0) * coef_value
-    mu = np.exp(z)
+    lam = float(np.exp(np.clip(z, -50.0, 50.0)))
     alpha = model_data.get("alpha", np.nan)
+    if "hurdle_coefficients" in model_data or str(model_data.get("model_type", "")).startswith("hurdle_"):
+        h_coefs = model_data.get("hurdle_coefficients", {"Intercept": 0.0})
+        z_h = h_coefs.get("Intercept", 0.0)
+        for feature_name, coef_value in h_coefs.items():
+            if feature_name != "Intercept":
+                z_h += feature_dict.get(feature_name, 0.0) * coef_value
+        pi = float(1.0 / (1.0 + np.exp(-np.clip(z_h, -50.0, 50.0))))
+        mu = float(pi * _hurdle_conditional_mean(lam, alpha))
+    else:
+        mu = lam
     return mu, alpha
 
 
@@ -616,7 +631,7 @@ class DiscreteTimeSeries:
     def _extract_series_metadata(self):
         """
         Extracts one row per series containing static training metadata (`overdispersion`,
-        `best_fit`, `distr_param_0..2`) into `self.series_metadata`.
+        `positive_overdispersion`, `best_fit`, `distr_param_0..2`) into `self.series_metadata`.
 
         Why it is needed
         ----------------
@@ -625,7 +640,7 @@ class DiscreteTimeSeries:
         distribution parameters to new inference data without re-fitting on test periods.
         """
         meta_cols = list(self.ts_id_cols)
-        for c in ("overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2"):
+        for c in ("overdispersion", "positive_overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2"):
             if c in self.df.columns:
                 meta_cols.append(c)
         self.series_metadata = self.df[meta_cols].drop_duplicates(subset=self.ts_id_cols).reset_index(drop=True)
@@ -642,8 +657,8 @@ class DiscreteTimeSeries:
         Why it is needed
         ----------------
         Ensures that at inference time every series uses the exact same `overdispersion`
-        routing (Poisson vs. Negative Binomial) and `best_fit` fallback parameters learned
-        during training.
+        and `positive_overdispersion` routing (Poisson vs. Negative Binomial) and `best_fit`
+        fallback parameters learned during training.
         """
         meta = pretrained_meta.copy()
         for col in self.ts_id_cols:
@@ -651,7 +666,7 @@ class DiscreteTimeSeries:
                 meta[col] = meta[col].astype(self.df[col].dtype)
         meta_cols = [
             c
-            for c in ("overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2")
+            for c in ("overdispersion", "positive_overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2")
             if c in meta.columns
         ]
         self.df = pd.merge(
@@ -662,6 +677,8 @@ class DiscreteTimeSeries:
         )
         if "overdispersion" in self.df.columns:
             self.df["overdispersion"] = self.df["overdispersion"].fillna(0).astype(int)
+        if "positive_overdispersion" in self.df.columns:
+            self.df["positive_overdispersion"] = self.df["positive_overdispersion"].fillna(0).astype(int)
         if "best_fit" in self.df.columns:
             self.df["best_fit"] = self.df["best_fit"].astype("category")
             if use_best_fit_feature:
@@ -875,19 +892,28 @@ class DiscreteTimeSeries:
 
     def _add_overdispersion_flag(self, grouped: DataFrameGroupBy):
         """
-        Computes a per-series binary indicator `overdispersion = 1` iff the training-window
-        sample variance exceeds the training-window sample mean (`var > mean`).
+        Computes per-series binary indicators:
+        - `overdispersion = 1` iff the training-window sample variance exceeds the
+          training-window sample mean (`var > mean`) across all training observations.
+        - `positive_overdispersion = 1` iff the sample variance exceeds the sample mean
+          strictly across positive training observations (`demand > 0`).
 
         Where it is used
         ----------------
-        Used by `GLMForecaster.fit` to automatically select a Negative Binomial GLM
-        (`overdispersion == 1`) vs. a Poisson GLM (`overdispersion == 0`) for each group.
+        Used by `GLMForecaster.fit` to automatically select a Negative Binomial vs. Poisson GLM
+        for standard GLMs (`overdispersion`) and Zero-Hurdle GLMs (`positive_overdispersion`).
         """
         tmp_col = self._create_tmp_col_for_train(self.var_col)
         mean = grouped[tmp_col].transform("mean")
         var = grouped[tmp_col].transform("var")
         self.df["overdispersion"] = (var > mean).astype(int)
-        self.df.drop(columns=[tmp_col], inplace=True)
+
+        pos_col = f"{tmp_col}_pos"
+        self.df[pos_col] = np.where(self.df[tmp_col] > 0, self.df[tmp_col], np.nan)
+        pos_mean = grouped[pos_col].transform("mean")
+        pos_var = grouped[pos_col].transform("var")
+        self.df["positive_overdispersion"] = (pos_var > pos_mean).fillna(False).astype(int)
+        self.df.drop(columns=[tmp_col, pos_col], inplace=True)
 
     def _fit_distributions(
         self,
@@ -1190,9 +1216,13 @@ class DiscreteTimeSeries:
         """Extracts integer horizon offset `h` from column name `'target_t_plus_<h>'`."""
         return int(target_col.rsplit("_", 1)[-1])
 
-    def train_glm(self, train_groups: tuple[str, ...] | list[str] | None = None) -> pd.DataFrame:
-        """Convenience method delegating to `GLMForecaster(train_groups=train_groups).fit(self)`."""
-        return GLMForecaster(train_groups=train_groups).fit(self)
+    def train_glm(
+        self,
+        train_groups: tuple[str, ...] | list[str] | None = None,
+        hurdle: bool = False,
+    ) -> pd.DataFrame:
+        """Convenience method delegating to `GLMForecaster(train_groups=train_groups, hurdle=hurdle).fit(self)`."""
+        return GLMForecaster(train_groups=train_groups, hurdle=hurdle).fit(self)
 
     def predict_glm(self, model_data: pd.DataFrame) -> pd.DataFrame:
         """Convenience method delegating to `GLMForecaster().predict(self, model=model_data)`."""
@@ -1211,6 +1241,8 @@ class DiscreteTimeSeries:
         glm_alpha_cols: list[str] | None = None,
         return_distribution: bool = False,
         pred_first_day: bool = True,
+        glm_pi_cols: list[str] | None = None,
+        glm_lambda_cols: list[str] | None = None,
     ) -> pd.DataFrame:
         """Delegates single-group GLM DDLT calculation to `DDLTCalculator.from_glm_group`."""
         return DDLTCalculator(lead_time, cycle_time).from_glm_group(
@@ -1222,6 +1254,8 @@ class DiscreteTimeSeries:
             return_distribution=return_distribution,
             pred_first_day=pred_first_day,
             period_col=self.period_col,
+            glm_pi_cols=glm_pi_cols,
+            glm_lambda_cols=glm_lambda_cols,
         )
 
     def train_catboost(
@@ -1330,8 +1364,8 @@ def compute_lead_time_demand(
             period=period,
             max_service_level=max_service_level,
         )
-    if model_type == "glm":
-        return GLMForecaster().compute_ddlt(
+    if model_type in ("glm", "glm_hurdle", "hurdle_glm"):
+        return GLMForecaster(hurdle=(model_type in ("glm_hurdle", "hurdle_glm"))).compute_ddlt(
             ts,
             lead_time=lead_time,
             lead_time_keys=lead_time_keys,
@@ -1358,7 +1392,9 @@ def compute_lead_time_demand(
             model=model_data,
             max_service_level=max_service_level,
         )
-    raise ValueError(f"Unsupported model type: '{model_type}'. Supported options are 'glm', 'catboost'.")
+    raise ValueError(
+        f"Unsupported model type: '{model_type}'. Supported options are 'glm', 'glm_hurdle', 'catboost'."
+    )
 
 
 def compute_distribution_dict(

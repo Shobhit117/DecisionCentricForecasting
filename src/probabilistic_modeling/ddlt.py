@@ -1390,6 +1390,108 @@ def _count_pmf_truncated_numba(mu: float, alpha: float, tol: float) -> np.ndarra
 
 
 @njit(cache=True)
+def _hurdle_count_pmf_truncated_numba(pi: float, lam: float, alpha: float, tol: float) -> np.ndarray:
+    """
+    Build a truncated Zero-Hurdle Poisson(``pi``, ``lam``) or Zero-Hurdle Negative-Binomial
+    NB2(``pi``, ``lam``, ``alpha``) PMF on ``[0, K]`` directly in compiled Numba code.
+
+    What it does
+    ------------
+    Models a two-part hurdle count distribution where:
+    - ``P(Y = 0) = 1 - pi`` (with ``pi = P(Y > 0)`` in ``[0, 1]``), and
+    - For ``k >= 1``, ``P(Y = k) = pi * p_base(k) / (1 - p_base(0))``, where ``p_base`` is the
+      untruncated Poisson(``lam``) PMF (when ``alpha <= 0`` or ``NaN``) or NB2(``lam``, ``alpha``)
+      PMF (when ``alpha > 0``).
+    - If ``pi`` is ``NaN``, falls back to :func:`_count_pmf_truncated_numba` with mean ``lam``.
+    - If ``pi <= 0``, returns a degenerate point mass ``[1.0]`` at ``0``.
+    - If ``lam <= 1e-12`` (or ``1 - p_base(0) <= 1e-15``), all positive mass concentrates at
+      ``k = 1``, returning ``[1 - pi, pi]`` on ``{0, 1}``.
+    - Accumulates the zero-truncated conditional CDF ``cdf_pos = sum_{j=1}^k q_+(j)`` until
+      ``cdf_pos >= 1 - tol`` (guaranteeing that the unconditional truncated upper tail is at most
+      ``pi * tol <= tol`` and that the unconditional mean ``pi * lam / (1 - p_base(0))`` is
+      preserved even when ``pi`` is very small), then lumps ``pi * (1 - cdf_pos)`` into bin ``K``.
+
+    Where it is used
+    ----------------
+    Called by :func:`_ddlt_from_hurdle_glm_row_numba` inside :meth:`DDLTCalculator.from_glm_group`.
+    """
+    if math.isnan(pi):
+        return _count_pmf_truncated_numba(lam, alpha, tol)
+    if not (pi > 0.0):
+        return np.ones(1, dtype=np.float64)
+    if pi > 1.0:
+        pi = 1.0
+    if not (lam > 1e-12):
+        out_deg = np.empty(2, dtype=np.float64)
+        out_deg[0] = 1.0 - pi
+        out_deg[1] = pi
+        return out_deg
+
+    use_nb = alpha > 0.0
+    target = 1.0 - tol
+
+    n = 0.0
+    log_p_term = 0.0
+    log_q = 0.0
+    lg_n = 0.0
+    log_lam = 0.0
+    if use_nb:
+        n = 1.0 / alpha
+        p = 1.0 / (1.0 + lam * alpha)
+        log_p_term = n * math.log(p)
+        log_q = math.log1p(-p) if p < 1.0 else -np.inf
+        lg_n = math.lgamma(n)
+        sd = math.sqrt(lam * (1.0 + lam * alpha))
+        pos_mass = -math.expm1(log_p_term)
+    else:
+        log_lam = math.log(lam)
+        sd = math.sqrt(lam)
+        pos_mass = -math.expm1(-lam)
+
+    if not (pos_mass > 1e-15):
+        out_deg = np.empty(2, dtype=np.float64)
+        out_deg[0] = 1.0 - pi
+        out_deg[1] = pi
+        return out_deg
+
+    log_pos_mass = math.log(pos_mass)
+    cap = max(int(lam + 12.0 * sd + 32.0), 2)
+    pmf = np.empty(cap, dtype=np.float64)
+    pmf[0] = 1.0 - pi
+    cdf_pos = 0.0
+    k = 1
+    while True:
+        if k >= cap:
+            if cap >= _COUNT_PMF_MAX_SUPPORT:
+                k -= 1
+                break
+            new_cap = min(cap * 2, _COUNT_PMF_MAX_SUPPORT)
+            grown = np.empty(new_cap, dtype=np.float64)
+            grown[:cap] = pmf
+            pmf = grown
+            cap = new_cap
+        if use_nb:
+            lp = math.lgamma(k + n) - lg_n - math.lgamma(k + 1.0) + log_p_term + k * log_q - log_pos_mass
+        else:
+            lp = k * log_lam - lam - math.lgamma(k + 1.0) - log_pos_mass
+        qk = math.exp(lp)
+        pmf[k] = pi * qk
+        cdf_pos += qk
+        if cdf_pos >= target:
+            break
+        k += 1
+
+    out = pmf[: k + 1].copy()
+    tail_pos = 1.0 - cdf_pos
+    if tail_pos > 0.0:
+        out[k] += pi * tail_pos
+    s = np.sum(out)
+    if s > 0.0:
+        out /= s
+    return out
+
+
+@njit(cache=True)
 def _ddlt_from_glm_row_numba(
     lt_pmf: np.ndarray,
     lt_min: int,
@@ -1432,6 +1534,46 @@ def _ddlt_from_glm_row_numba(
     rv_mins = np.empty(total_days, dtype=np.int64)
     for h in range(horizon):
         rv_pmfs.append(_count_pmf_truncated_numba(mu_row[h], alpha_row[h], tol))
+        rv_mins[h] = 0
+    for h in range(horizon, total_days):
+        rv_pmfs.append(default_pmf)
+        rv_mins[h] = default_min
+
+    return _random_sum_aligned_numba(lt_pmf, lt_min, rv_pmfs, rv_mins, 1, tail_tol)
+
+
+@njit(cache=True)
+def _ddlt_from_hurdle_glm_row_numba(
+    lt_pmf: np.ndarray,
+    lt_min: int,
+    pi_row: np.ndarray,
+    lam_row: np.ndarray,
+    alpha_row: np.ndarray,
+    default_pmf: np.ndarray,
+    default_min: int,
+    tol: float = DEFAULT_SUPPORT_TOL,
+    tail_tol: float = DEFAULT_TAIL_TOL,
+) -> tuple[np.ndarray, int]:
+    """
+    Fused single-row kernel that builds per-horizon Zero-Hurdle Poisson/NB2 PMFs from
+    ``(pi_row, lam_row, alpha_row)`` and computes the random-sum DDLT distribution
+    ``(ddlt_pmf, ddlt_min)`` in one compiled call.
+
+    Where it is used
+    ----------------
+    Called per row inside :meth:`DDLTCalculator.from_glm_group` when hurdle GLM parameter
+    columns (``<target>_pi`` and ``<target>_lambda``) are present.
+    """
+    horizon = len(lam_row)
+    lt_max = lt_min + len(lt_pmf) - 1
+    if lt_max <= 0:
+        return np.ones(1, dtype=np.float64), 0
+    total_days = lt_max if lt_max > horizon else horizon
+
+    rv_pmfs = NumbaList()
+    rv_mins = np.empty(total_days, dtype=np.int64)
+    for h in range(horizon):
+        rv_pmfs.append(_hurdle_count_pmf_truncated_numba(pi_row[h], lam_row[h], alpha_row[h], tol))
         rv_mins[h] = 0
     for h in range(horizon, total_days):
         rv_pmfs.append(default_pmf)
@@ -1698,18 +1840,23 @@ class DDLTCalculator:
         return_distribution: bool = False,
         pred_first_day: bool = True,
         period_col: str = "day",
+        glm_pi_cols: list[str] | None = None,
+        glm_lambda_cols: list[str] | None = None,
     ) -> pd.DataFrame:
         """
         Compute DDLT distributions or ``target_inventory`` from GLM parameter columns
-        (``target_t_plus_<h>_mu`` and ``target_t_plus_<h>_alpha``) for a group of rows
+        (standard ``(mu, alpha)`` or hurdle ``(pi, lambda, alpha)``) for a group of rows
         sharing a single ``lead_time`` distribution.
 
         What it does
         ------------
-        1. Extracts contiguous 2D arrays ``mu_arr`` and ``alpha_arr`` of shape ``(n_rows, horizon)``.
+        1. Extracts contiguous 2D arrays ``mu_arr`` and ``alpha_arr`` (plus ``pi_arr`` and
+           ``lam_arr`` when hurdle columns ``<target>_pi`` and ``<target>_lambda`` are present)
+           of shape ``(n_rows, horizon)``.
         2. Computes the effective truncation tolerance ``tol_eff`` and caches any historical
            fallback distributions needed when ``max(L + R) > horizon``.
-        3. Calls the compiled :func:`_ddlt_from_glm_row_numba` kernel for each row and attaches
+        3. Calls the compiled :func:`_ddlt_from_glm_row_numba` (or
+           :func:`_ddlt_from_hurdle_glm_row_numba`) kernel for each row and attaches
            either ``demand_distribution`` or ``target_inventory``.
         """
         t0 = time.perf_counter()
@@ -1729,6 +1876,20 @@ class DDLTCalculator:
         if horizon == 0:
             raise ValueError("At least one GLM forecast horizon is required.")
 
+        default_pi_cols = [f"{col_name}_pi" for col_name in target_cols]
+        default_lam_cols = [f"{col_name}_lambda" for col_name in target_cols]
+        use_hurdle = (
+            (glm_pi_cols is not None and glm_lambda_cols is not None)
+            or all(c in gdf.columns for c in default_pi_cols + default_lam_cols)
+        )
+        if use_hurdle:
+            if glm_pi_cols is None:
+                glm_pi_cols = default_pi_cols
+            if glm_lambda_cols is None:
+                glm_lambda_cols = default_lam_cols
+            if len(glm_pi_cols) != horizon or len(glm_lambda_cols) != horizon:
+                raise ValueError("Number of 'pi', 'lambda', and 'mu' columns do not match.")
+
         if not return_distribution:
             service_levels_arr = gdf["service_level"].to_numpy(dtype=float)
             if np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
@@ -1737,7 +1898,8 @@ class DDLTCalculator:
         lt_with_cycle = self._shifted_lead_time(lead_time)
         needs_default = lt_with_cycle.max > horizon
         param_cols = ["best_fit", "distr_param_0", "distr_param_1", "distr_param_2"]
-        required_cols = glm_mu_cols + glm_alpha_cols + (param_cols if needs_default else [])
+        hurdle_req = (glm_pi_cols + glm_lambda_cols) if use_hurdle else []
+        required_cols = glm_mu_cols + glm_alpha_cols + hurdle_req + (param_cols if needs_default else [])
         missing_cols = [col for col in required_cols if col not in gdf.columns]
         if missing_cols:
             raise ValueError(f"Missing columns required to compute target inventory: {missing_cols}.")
@@ -1745,7 +1907,8 @@ class DDLTCalculator:
         n_terms = max(int(lt_with_cycle.max), 1)
         tol_eff = self.effective_tol(n_terms, None if return_distribution else service_levels_arr)
         logger.info(
-            "Computing DDLT from GLM parameters for %d rows (horizon=%d, L+R support=[%d, %d], tol=%.1e)...",
+            "Computing DDLT from %sGLM parameters for %d rows (horizon=%d, L+R support=[%d, %d], tol=%.1e)...",
+            "hurdle " if use_hurdle else "",
             len(gdf),
             horizon,
             lt_with_cycle.min,
@@ -1760,6 +1923,16 @@ class DDLTCalculator:
             row_num = int(np.argmax(bad.any(axis=1)))
             raise ValueError(f"Invalid GLM mean for row {row_num}: {mu_arr[row_num]}.")
 
+        if use_hurdle:
+            pi_arr = np.ascontiguousarray(gdf[glm_pi_cols].to_numpy(dtype=np.float64))
+            lam_arr = np.ascontiguousarray(gdf[glm_lambda_cols].to_numpy(dtype=np.float64))
+            bad_h = (~np.isnan(pi_arr) & ((pi_arr < 0.0) | (pi_arr > 1.0))) | ~np.isfinite(lam_arr) | (lam_arr < 0.0)
+            if np.any(bad_h):
+                row_num = int(np.argmax(bad_h.any(axis=1)))
+                raise ValueError(
+                    f"Invalid hurdle GLM parameters for row {row_num}: pi={pi_arr[row_num]}, lambda={lam_arr[row_num]}."
+                )
+
         lt_pmf = np.ascontiguousarray(lt_with_cycle.pmf, dtype=np.float64)
         lt_min = int(lt_with_cycle.min)
         defaults = self._default_demand_arrays(gdf, int(lt_with_cycle.max), horizon, tol_eff) if needs_default else None
@@ -1768,9 +1941,22 @@ class DDLTCalculator:
         results = []
         for row_num in range(len(gdf)):
             default_pmf, default_min = defaults[row_num] if defaults is not None else (dummy_pmf, 0)
-            ddlt_pmf, ddlt_min = _ddlt_from_glm_row_numba(
-                lt_pmf, lt_min, mu_arr[row_num], alpha_arr[row_num], default_pmf, default_min, tol_eff, self.tail_tol
-            )
+            if use_hurdle:
+                ddlt_pmf, ddlt_min = _ddlt_from_hurdle_glm_row_numba(
+                    lt_pmf,
+                    lt_min,
+                    pi_arr[row_num],
+                    lam_arr[row_num],
+                    alpha_arr[row_num],
+                    default_pmf,
+                    default_min,
+                    tol_eff,
+                    self.tail_tol,
+                )
+            else:
+                ddlt_pmf, ddlt_min = _ddlt_from_glm_row_numba(
+                    lt_pmf, lt_min, mu_arr[row_num], alpha_arr[row_num], default_pmf, default_min, tol_eff, self.tail_tol
+                )
             if return_distribution:
                 results.append(DiscreteDistribution(ddlt_pmf, ddlt_min, 1, truncation_tol=n_terms * tol_eff))
             else:
