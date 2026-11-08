@@ -1,6 +1,6 @@
 # Probabilistic Modeling — Architecture, Methods & Usage Guide
 
-This document explains **what** the library does, **how** it is put together, and **how to use it** for your own forecasting and inventory problems. It focuses on concepts and workflows rather than API minutiae; see the docstrings in `src/probabilistic_modeling/` for full parameter references, and the slides in `docs/slides/` for the underlying theory.
+This document explains **what** the library does, **how** it is put together, and **how to use it** for your own forecasting and inventory problems. It focuses on concepts and workflows rather than API minutiae; see [`docs/CODEBASE_GUIDE.md`](CODEBASE_GUIDE.md) for a function-by-function codebase walkthrough (what each symbol does, where it is used, why it is needed, and the mathematical/algorithmic internals of `ddlt.py`), the docstrings in `src/probabilistic_modeling/` for full parameter references, and the slides in `docs/slides/` for the underlying theory.
 
 ---
 

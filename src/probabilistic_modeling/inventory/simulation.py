@@ -1,18 +1,32 @@
 """
-Numba-accelerated multi-period retail & supply-chain inventory replenishment simulation.
+Numba-accelerated multi-period retail & supply-chain inventory replenishment simulation (`inventory/simulation.py`).
 
-Supports:
-- Optional target-inventory policies:
-  1. ``policy="quantile"``: simple service-level quantile (e.g. ``0.95``) of the DDLT distribution.
-  2. ``policy="newsvendor"``: budget-constrained multi-product newsvendor target.
-  3. ``policy="precomputed"`` / ``"auto"``: existing ``target_inventory`` column in predictions DataFrame.
-- Stochastic or deterministic lead times from ``DiscreteDistribution`` objects.
-- Order-up-to (base-stock) replenishment tracking on-hand stock and in-transit pipeline orders.
-- Lost-sales (standard retail) and backorder modes.
-- Single-trajectory detailed simulation logs and multi-trajectory Monte Carlo simulation.
-- Comprehensive operational and economic KPIs (fill rate, cycle service level, stockout frequency,
-  inventory turnover, average on-hand / in-transit inventory, revenue, purchase spend, holding cost,
-  shortage cost, and net profit).
+What this module does
+---------------------
+Evaluates the real-world operational and financial performance of probabilistic demand
+forecasts and target-inventory policies over a multi-period horizon:
+1. **Target Inventory Resolution (`resolve_target_inventory`)**: Converts DDLT distributions
+   into daily order-up-to targets (`target_inventory`) using either:
+   - `policy="quantile"` (service-level quantile `F^{-1}(alpha)` via Numba `O(1)`-memory scan),
+   - `policy="newsvendor"` (budget-constrained multi-product newsvendor via Lagrangian bisection),
+   - `policy="precomputed"` / `"auto"` (existing `target_inventory` column).
+2. **Order-Up-To (Base-Stock) Trajectory Simulation (`_simulate_inventory_trajectory_numba`)**:
+   Tracks daily opening inventory, arriving shipments from in-transit orders, inventory position
+   (`on_hand + in_transit - backlog`), periodic replenishment orders every `cycle_time` days,
+   stochastic or deterministic shipment lead times, demand fulfillment, lost sales vs. backorders,
+   closing inventory, and daily P&L (revenue, purchase spend, holding cost, shortage cost, net profit).
+3. **Monte Carlo Lead-Time Simulation (`_simulate_inventory_mc_numba`)**: Simulates `n_sims`
+   independent stochastic lead-time trajectories in parallel to quantify confidence intervals
+   (`mean`, `std`, `p05`, `p95`) on fill rate, cycle service level, stockout frequency,
+   average inventory, and total order volume.
+4. **KPI Aggregation (`compute_simulation_kpis`, `InventorySimulationResult`)**: Computes
+   overall, per-item, and per-group operational and financial KPIs.
+
+Where it is used
+----------------
+- Final evaluation stage of `scripts/run_m5_pipeline.py` (Stage 6).
+- Exported at top-level package (`InventorySimulator`, `InventorySimulationResult`,
+  `simulate_inventory`, `resolve_target_inventory`, `compute_simulation_kpis`).
 """
 from __future__ import annotations
 
@@ -42,8 +56,26 @@ def _sample_lead_times_numba(
     u_mat: np.ndarray,
 ) -> np.ndarray:
     """
-    Maps a ``(n_items, n_days)`` matrix of uniform random numbers ``u_mat`` in ``[0, 1)``
-    into integer lead times using O(1)-memory PMF quantile lookup.
+    Maps a `(n_items, n_days)` matrix of uniform random numbers `u_mat` in `[0, 1)`
+    into integer lead times using `O(1)`-memory PMF quantile inversion.
+
+    What it does
+    ------------
+    For each item `i`, looks up its lead-time distribution index `k = item_lt_idx[i]`
+    and evaluates `_pmf_quantile_scalar_numba(pmfs[k], mins[k], bin_sizes[k], u_mat[i, t])`
+    for every day `t`.
+
+    Why it is needed
+    ----------------
+    Calling `DiscreteDistribution.sample()` inside a Python loop over thousands of items
+    and days would allocate temporary CDF arrays on every call. Using `_pmf_quantile_scalar_numba`
+    over a pre-generated uniform matrix `u_mat` performs inverse-CDF sampling in compiled
+    machine code with zero heap allocations.
+
+    Where it is used
+    ----------------
+    Called by `InventorySimulator.run` when `lead_time_mode="sample"` (with random `u_mat`)
+    or `lead_time_mode="median"` (with `u_mat = 0.5`).
     """
     n_items, n_days = u_mat.shape
     out = np.empty((n_items, n_days), dtype=np.int64)
@@ -79,17 +111,38 @@ def _simulate_inventory_trajectory_numba(
 ]:
     """
     Parallel Numba kernel simulating multi-period order-up-to replenishment across
-    ``n_items`` and ``n_days``.
+    `n_items` and `n_days`.
 
-    Order of daily events for each item ``i`` on day ``t``:
-    1. Record ``opening_inv[i, t]``.
-    2. Receive orders scheduled to arrive on day ``t`` into on-hand inventory
-       and decrement in-transit inventory.
-    3. Compute ``inventory_position = on_hand + in_transit - backlog``.
-       If ``t % cycle_time == 0``, place order ``q = max(0, target_mat[i, t] - inventory_position)``
-       scheduled to arrive on day ``t + lead_times_mat[i, t]``.
-    4. Realize demand ``demand_mat[i, t]``, fulfill up to available on-hand inventory,
-       and record ``sold``, ``lost_sales``, ``closing_inv``, and ``in_transit_end``.
+    How the look-ahead arrival buffer (`arrivals_buf`) works
+    --------------------------------------------------------
+    Each item `i` maintains a 1D integer array `arrivals_buf` of length `n_days + max_lt + 2`
+    initialized to zero. When an order of size `q > 0` is placed on day `t` with realized
+    lead time `lt > 0`, we simply add `q` to `arrivals_buf[t + lt]` and increment `in_transit += q`.
+    Even if lead times are stochastic and two orders cross in time (an order placed on day `t+1`
+    with a short lead time arrives on the same day or earlier than an order placed on day `t`
+    with a long lead time), `arrivals_buf[day]` automatically sums all shipments arriving on
+    that exact day in `O(1)` time without needing a priority queue or list of open orders.
+
+    Sequence of daily events for item `i` on day `t`
+    ------------------------------------------------
+    1. **Opening Inventory**: Record `opening_inv[i, t] = on_hand` (equal to yesterday's closing stock).
+    2. **Receive Shipments**: Add `arr = arrivals_buf[t]` to `on_hand` and subtract `arr` from
+       `in_transit`. Record `on_hand_before_demand[i, t]` and `in_transit_before_order[i, t]`.
+    3. **Review & Order Placement**: Compute `inv_pos = on_hand + in_transit - backlog`.
+       If `t % cycle_time == 0` (review day), place order `q = max(0, target_mat[i, t] - inv_pos)`.
+       - If `lt <= 0` (instantaneous delivery), `q` is added immediately to `on_hand` before demand.
+       - If `lt > 0`, `q` is scheduled in `arrivals_buf[t + lt]` and added to `in_transit`.
+    4. **Demand Fulfillment**: Realize demand `d = max(0, demand_mat[i, t])`. Total quantity
+       needed is `needed = d + backlog`.
+       - If `on_hand >= needed`: fulfill all `needed`, decrement `on_hand`, set `unfulfilled = 0`
+         and `backlog = 0`.
+       - If `on_hand < needed`: sell all available `on_hand`, set `unfulfilled = needed - on_hand`,
+         set `on_hand = 0`, and if `allow_backlog=True` carry `backlog = unfulfilled` to day `t + 1`
+         (otherwise `unfulfilled` is permanently lost in lost-sales retail mode).
+
+    Where it is used
+    ----------------
+    Called by `InventorySimulator.run` to produce the detailed daily `trajectory_df`.
     """
     n_items, n_days = demand_mat.shape
     max_lt = 0
@@ -201,9 +254,27 @@ def _simulate_inventory_mc_numba(
     allow_backlog: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Parallel Monte Carlo kernel simulating ``n_sims`` stochastic lead-time trajectories
-    per item. Returns per-(sim, item) totals:
-    ``(tot_sold, tot_lost, tot_ordered, sum_closing_inv, stockout_days)``.
+    Parallel Monte Carlo kernel simulating `n_sims` independent stochastic lead-time
+    trajectories per item.
+
+    What it does
+    ------------
+    Executes the exact same daily order-up-to replenishment logic as
+    `_simulate_inventory_trajectory_numba` across `prange(n_sims)`, drawing lead times
+    on the fly from `u_cube[sim, i, t]` via `_pmf_quantile_scalar_numba`, and accumulates
+    only per-`(sim, item)` summary totals:
+    `(tot_sold, tot_lost, tot_ordered, sum_closing_inv, stockout_days)`.
+
+    Why it is needed
+    ----------------
+    Materializing full `(n_sims, n_items, n_days)` trajectory arrays for `n_sims = 100+`
+    replications would consume gigabytes of RAM. Accumulating scalar counters in registers
+    per `(sim, item)` keeps memory `O(n_sims * n_items)` and runs at native multi-core speed.
+
+    Where it is used
+    ----------------
+    Called by `InventorySimulator.run` when `n_mc_simulations > 1` to populate
+    `InventorySimulationResult.mc_summary_df`.
     """
     n_sims, n_items, n_days = u_cube.shape
     max_lt = 0
@@ -301,15 +372,22 @@ def resolve_target_inventory(
     group_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Computes or validates ``target_col`` on ``df`` according to ``policy``:
+    Computes or validates `target_col` on `df` according to `policy`:
 
-    - ``policy="quantile"``: sets ``target_col`` to the ``service_level`` quantile of
-      ``df[dist_col]`` using Numba-compiled O(1)-memory quantile lookup (no newsvendor needed).
-    - ``policy="newsvendor"``: solves the budget-constrained multi-product newsvendor problem
-      using ``budget`` and economic columns (``sell_price``, ``purchase_cost``, ``shortage_penalty``).
-    - ``policy="precomputed"``: uses the existing ``df[target_col]`` column.
-    - ``policy="auto"``: uses ``df[target_col]`` if already present; otherwise uses ``"newsvendor"``
-      if ``budget`` is provided and economic columns exist, else ``"quantile"`` at ``service_level``.
+    - `policy="quantile"`: sets `target_col` to the `service_level` quantile of
+      `df[dist_col]` using Numba-compiled `O(1)`-memory quantile lookup
+      (`_batch_pmf_quantiles_numba`, no newsvendor needed).
+    - `policy="newsvendor"`: solves the budget-constrained multi-product newsvendor problem
+      using `budget` and economic columns (`sell_price`, `purchase_cost`, `shortage_penalty`)
+      via `_solve_multi_product_newsvendor`.
+    - `policy="precomputed"`: uses the existing `df[target_col]` column.
+    - `policy="auto"`: uses `df[target_col]` if already present; otherwise uses `"newsvendor"`
+      if `budget` is provided and economic columns exist, else `"quantile"` at `service_level`.
+
+    Where it is used
+    ----------------
+    Called at the start of `InventorySimulator.run` and exported at the package root
+    for standalone target-inventory computation.
     """
     out = df.copy()
     # Normalize common economic column aliases if canonical names are absent:
@@ -386,7 +464,25 @@ def compute_simulation_kpis(
     period_col: str = "day",
 ) -> pd.DataFrame:
     """
-    Aggregates operational and economic inventory simulation KPIs overall or by ``group_cols``.
+    Aggregates operational and economic inventory simulation KPIs overall or by `group_cols`.
+
+    KPI Definitions
+    ---------------
+    - `fill_rate`: `total_sold / total_demand` (proportion of unit demand fulfilled immediately; `1.0` if `total_demand == 0`).
+    - `stockout_frequency`: fraction of item-days with `lost_sales > 0`.
+    - `cycle_service_level`: `1.0 - stockout_frequency` (fraction of item-days with zero stockout).
+    - `avg_closing_inv`: mean daily closing on-hand inventory per item-day.
+    - `avg_on_hand`: mean daily on-hand inventory after shipment arrivals and before demand.
+    - `avg_in_transit`: mean daily in-transit pipeline inventory at end of day.
+    - `inventory_turnover`: `total_sold / avg_closing_inv`.
+    - Financial KPIs (included automatically when price/cost columns exist):
+      `total_revenue`, `total_purchase_cost`, `total_holding_cost`, `total_shortage_cost`,
+      `total_profit`, and `profit_margin_pct` (`100 * total_profit / total_revenue`).
+
+    Where it is used
+    ----------------
+    Called by `InventorySimulator.run` (for `summary_df`, `item_summary_df`, `group_summary_df`)
+    and `InventorySimulationResult.summarize`.
     """
     valid_groups = [c for c in (group_cols or []) if c in trajectory_df.columns]
     id_cols = [c for c in (item_id_cols or ["item_id"]) if c in trajectory_df.columns]
@@ -464,6 +560,23 @@ def compute_simulation_kpis(
 class InventorySimulationResult:
     """
     Container for multi-period inventory simulation outputs and KPIs.
+
+    Attributes
+    ----------
+    trajectory_df : pd.DataFrame
+        Item-by-day simulation log with columns `opening_inv`, `arrivals`,
+        `on_hand_before_demand`, `in_transit_before_order`, `inventory_position`,
+        `target_inventory`, `order_placed`, `lead_time_drawn`, `demand`, `sold`,
+        `lost_sales`, `closing_inv`, `in_transit_end` (and financial columns when
+        prices/costs are provided).
+    summary_df : pd.DataFrame
+        Single-row overall KPI summary across all simulated items and days.
+    item_summary_df : pd.DataFrame
+        Per-item KPI breakdown grouped by `item_id_cols`.
+    group_summary_df : pd.DataFrame | None
+        Optional KPI breakdown grouped by user-specified `group_cols` (e.g., `store_id` or `cat_id`).
+    mc_summary_df : pd.DataFrame | None
+        Optional Monte Carlo summary table (`mean`, `std`, `p05`, `p95`) when `n_mc_simulations > 1`.
     """
     trajectory_df: pd.DataFrame
     summary_df: pd.DataFrame
@@ -474,7 +587,7 @@ class InventorySimulationResult:
     period_col: str = "day"
 
     def summarize(self, group_cols: list[str] | None = None) -> pd.DataFrame:
-        """Computes simulation KPIs grouped by any subset of columns on ``trajectory_df``."""
+        """Computes simulation KPIs grouped by any subset of columns on `trajectory_df`."""
         return compute_simulation_kpis(
             self.trajectory_df,
             group_cols=group_cols,
@@ -492,28 +605,28 @@ class InventorySimulator:
     lead_time : DiscreteDistribution | dict[Any, DiscreteDistribution] | int
         Store/item lead-time distribution(s) or a fixed integer lead time.
     lead_time_keys : list[str], optional
-        Columns mapping each item to its corresponding distribution when ``lead_time`` is a dict.
+        Columns mapping each item to its corresponding distribution when `lead_time` is a dict.
     cycle_time : int, default 1
-        Review period $R$ in days (orders are placed when ``day_idx % cycle_time == 0``).
+        Review period `R` in days (orders are placed when `day_idx % cycle_time == 0`).
     lead_time_mode : str, default "sample"
         How lead times are generated on each order day:
-        - ``"sample"``: drawn stochastically from ``lead_time`` using ``random_seed``.
-        - ``"mean"``: deterministic rounded expected value ``round(E[L])``.
-        - ``"median"``: deterministic median ``L.quantile(0.5)``.
+        - `"sample"`: drawn stochastically from `lead_time` using `random_seed`.
+        - `"mean"`: deterministic rounded expected value `round(E[L])`.
+        - `"median"`: deterministic median `L.quantile(0.5)`.
     initial_inventory : str | int | np.ndarray, default "target_day_0"
         Initial on-hand stock at the start of the first test day:
-        - ``"target_day_0"``: starts at day 0's ``target_inventory`` (steady-state backtest).
-        - ``int`` (e.g. ``0``): starts every item at that fixed integer quantity.
-        - 1D ``np.ndarray``: custom initial inventory per item.
+        - `"target_day_0"`: starts at day 0's `target_inventory` (steady-state backtest).
+        - `"zero"` or `int` (e.g. `0`): starts every item at that fixed integer quantity.
+        - 1D `np.ndarray`: custom initial inventory per item.
     allow_backlog : bool, default False
-        If ``False``, unfulfilled demand is lost (standard retail lost-sales assumption).
-        If ``True``, unfulfilled demand is backordered and fulfilled from future arrivals.
+        If `False`, unfulfilled demand is lost (standard retail lost-sales assumption).
+        If `True`, unfulfilled demand is backordered and fulfilled from future arrivals.
     holding_cost_per_unit : float | str, default 0.0
-        Daily holding cost per unit of closing inventory (or column name in ``df``, or
-        fraction of ``purchase_cost`` via ``holding_cost_rate``).
+        Daily holding cost per unit of closing inventory (or column name in `df`, or
+        fraction of `purchase_cost` via `holding_cost_rate`).
     holding_cost_rate : float, default 0.0
-        If ``> 0`` and ``purchase_cost`` is present, daily holding cost is
-        ``holding_cost_rate * purchase_cost`` per unit of closing inventory.
+        If `> 0` and `purchase_cost` is present, daily holding cost is
+        `holding_cost_rate * purchase_cost` per unit of closing inventory.
     random_seed : int, default 42
         Seed for reproducible lead-time sampling.
     """
@@ -566,6 +679,18 @@ class InventorySimulator:
         self,
         items_df: pd.DataFrame,
     ) -> tuple[NumbaList, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Packs the lead-time distribution(s) into Numba-compatible arrays `(pmfs, mins, bin_sizes)`
+        and an integer index array `item_lt_idx` mapping each item `0 .. n_items-1` to its
+        corresponding lead-time distribution.
+
+        Why it is needed
+        ----------------
+        Numba `@njit` kernels cannot access Python dictionaries of `DiscreteDistribution`
+        objects directly. Packing the unique lead-time PMFs into a `NumbaList` and resolving
+        each item's dictionary key once into `item_lt_idx[i]` lets `_sample_lead_times_numba`
+        and `_simulate_inventory_mc_numba` index lead-time distributions in `O(1)` time.
+        """
         pmfs = NumbaList()
         mins_list: list[int] = []
         bins_list: list[int] = []
@@ -626,7 +751,22 @@ class InventorySimulator:
         n_mc_simulations: int = 0,
     ) -> InventorySimulationResult:
         """
-        Runs the multi-period inventory simulation over ``predictions_df``.
+        Runs the multi-period inventory simulation over `predictions_df`.
+
+        Step-by-step execution
+        ----------------------
+        1. Resolves `target_inventory` on `predictions_df` via `resolve_target_inventory`
+           and drops the heavy `demand_distribution` object column to save memory.
+        2. Sorts `df` into deterministic `(item_id_cols, period_col)` order (pivoting onto
+           a balanced `n_items x n_days` grid if any item-day pairs are missing) and reshapes
+           `demand_mat` and `target_mat` into contiguous `(n_items, n_days)` `int64` matrices.
+        3. Initializes `init_oh` (`"target_day_0"`, `"zero"`, scalar `int`, or custom 1D array).
+        4. Generates the `(n_items, n_days)` matrix of lead times according to `lead_time_mode`
+           (`"sample"`, `"median"`, or `"mean"`).
+        5. Executes `_simulate_inventory_trajectory_numba` and attaches all 10 trajectory
+           state columns to `df` (plus daily financial P&L columns when price/cost exist).
+        6. Computes `summary_df`, `item_summary_df`, `group_summary_df`, and optional
+           Monte Carlo `mc_summary_df` (via `_simulate_inventory_mc_numba`).
         """
         t0 = time.perf_counter()
         item_id_cols = item_id_cols or ts_id_cols or self.default_item_id_cols
@@ -901,7 +1041,12 @@ def simulate_inventory(
     random_state: int | None = None,
 ) -> InventorySimulationResult:
     """
-    Convenience function to run a multi-period inventory simulation over ``predictions_df``.
+    Functional convenience wrapper around `InventorySimulator(...).run(predictions_df, ...)`.
+
+    Where it is used
+    ----------------
+    Exported at the package root (`probabilistic_modeling.simulate_inventory`) for one-line
+    inventory backtesting.
     """
     simulator = InventorySimulator(
         lead_time=lead_time,

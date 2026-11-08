@@ -23,6 +23,7 @@ Sales history + calendar / price / promo covariates
 > **Status:** active development (v0.3, alpha). The public API may still change. The M5 example uses synthetic lead-time and cost data.
 
 📖 **Full documentation (architecture, models, tutorials):** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)
+🔍 **Codebase & algorithm deep-dive guide (what/where/why for every module & `ddlt.py` internals):** [`docs/CODEBASE_GUIDE.md`](docs/CODEBASE_GUIDE.md)
 🎓 **Theory slides (LaTeX/Beamer):** [`docs/slides/prob_forecasting_main.pdf`](docs/slides/prob_forecasting_main.pdf)
 
 ---

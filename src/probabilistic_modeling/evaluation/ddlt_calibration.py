@@ -1,32 +1,34 @@
 """
 Calibration report for demand-during-lead-time (DDLT) distributions.
 
-Daily forecast metrics (pinball loss, coverage) do not tell you whether the *decision*
-distribution is right. Inventory targets are quantiles of the DDLT distribution, so the
-question that matters is:
+What this module does
+---------------------
+Evaluates whether predicted DDLT distributions ``F`` are probabilistically calibrated against
+the actual cumulative demand ``Y_L = sum_{j=0}^{L+R-1} demand[t + j]`` realized over the
+replenishment protection window.
 
-    Does the realised demand over the replenishment window fall below the τ-quantile of the
-    DDLT distribution τ of the time?
+Why this module is needed
+-------------------------
+1. **Daily calibration != DDLT calibration**: Even if each single-day forecast ``D_{t+h}`` is
+   well calibrated marginally, convolving them under independence ignores positive day-to-day
+   demand autocorrelation (e.g. momentum, multi-day promotions, stockout-induced shifts),
+   which makes the multi-day sum distribution ``F`` **too narrow** (under-dispersed) and causes
+   systematic under-stocking at high service levels (90%–99%).
+2. **Discrete PIT (Czado, Gneiting & Held, 2009)**: For discrete count data, the raw coverage
+   ``P(Y <= q_tau)`` is strictly ``>= tau`` even for a perfect model because ``F`` jumps by
+   ``P(Y = q_tau) > 0`` at the integer ``q_tau``. The non-randomized Probability Integral
+   Transform (PIT) distributes the probability mass of observation ``y`` uniformly across
+   the jump interval ``[F(y - 1), F(y)]``; its expected CDF at ``tau`` (`pit_coverage`) equals
+   ``tau`` **exactly** under a calibrated discrete model.
+3. **Random lead times in backtesting**: Since a backtest row does not have a single realized
+   physical shipment lead time, every calibration metric (`pit_coverage`, `coverage`, PIT
+   histogram bins, `crps`, `sq_err`) is computed as an exact expectation over the lead-time
+   distribution ``sum_l P(L = l) * stat(F, Y_l)``.
 
-For a decision at period ``t`` with review period ``R`` and lead time ``L``, the realised
-quantity is ``Y_L = sum(demand[t : t + L + R])``. In a backtest the lead time of a
-hypothetical order is unknown, so every statistic is computed as an exact expectation over
-the lead-time distribution, ``E_L[stat(F, Y_L)] = sum_l P(L = l) * stat(F, Y_l)``. Under a
-correct model ``Y_L ~ F`` exactly, so:
-
-- ``pit_coverage`` at level τ          → τ   (``gap_pp`` = 100 * (pit_coverage - τ))
-- non-randomised PIT histogram       → flat (Czado, Gneiting & Held, 2009)
-- dispersion ratio E[(Y-μ)²] / E[σ²] → 1   (> 1: DDLT too narrow, e.g. ignored
-  day-to-day correlation; < 1: too wide)
-- CRPS                               → lower is better (compare models)
-
-``coverage`` is the raw ``P(Y <= q_τ)``, i.e. the cycle service level actually achieved by
-ordering up to the τ-quantile. For *discrete* distributions it is ``>= τ`` even for a perfect
-model (the atom at ``q_τ`` counts as covered), which is why calibration is judged on
-``pit_coverage`` = E[P(PIT <= τ)], the discrete-correct analogue.
-
-Note: decision periods overlap in time, so effective sample sizes are smaller than the row
-counts; treat small coverage gaps (< ~1pp) with caution.
+Where this module is used
+-------------------------
+- Re-exported by ``probabilistic_modeling`` and ``probabilistic_modeling.evaluation``
+- Called by ``scripts/run_m5_pipeline.py`` when ``--evaluate-ddlt`` is passed.
 """
 from __future__ import annotations
 
@@ -46,7 +48,25 @@ DEFAULT_CALIBRATION_LEVELS = (0.5, 0.8, 0.9, 0.95, 0.99)
 
 @njit(cache=True)
 def _pit_cdf(u: float, f_lo: float, f_hi: float) -> float:
-    """CDF at ``u`` of the non-randomised PIT, uniform on ``[F(y-1), F(y)]``."""
+    """
+    Evaluate the conditional CDF at ``u`` in ``[0, 1]`` of the non-randomized discrete PIT
+    (which is Uniform on ``[f_lo, f_hi] = [F(y - 1), F(y)]``) given observation ``y``:
+
+        G(u | y) = 0                        if u <= F(y - 1)
+                 = (u - F(y-1)) / P(Y = y)  if F(y - 1) < u < F(y)
+                 = 1                        if u >= F(y)
+
+    Why it is needed
+    ----------------
+    By Czado, Gneiting & Held (2009), if ``Y ~ F`` for any discrete distribution ``F``, then
+    ``E_Y[G(u | Y)] = u`` for all ``u in [0, 1]``. This gives an exact calibration check free
+    from discrete step-function conservatism and free from Monte Carlo randomization noise.
+
+    Where it is used
+    ----------------
+    Called inside :func:`_ddlt_calibration_kernel` to compute both ``pit_coverage`` at each
+    target quantile level and the mass falling into each decile bin of the PIT histogram.
+    """
     if u <= f_lo:
         return 0.0
     if u >= f_hi:
@@ -65,11 +85,26 @@ def _ddlt_calibration_kernel(
     n_bins: int,
 ):
     """
-    Per-row lead-time-weighted calibration statistics.
+    Parallel Numba kernel computing lead-time-weighted DDLT calibration statistics for ``n`` rows.
 
-    Row ``i``'s DDLT PMF is ``pmf_flat[offsets[i]:offsets[i+1]]`` starting at ``mins[i]``.
-    ``y[i, j]`` is the realised demand if the lead time equals the ``j``-th support point of row
-    ``i``'s lead-time distribution, with probability ``w[i, j]`` (zero-padded).
+    What it does
+    ------------
+    For each decision row ``i = 0, ..., n - 1`` (in parallel via ``prange``):
+    1. Slices row ``i``'s DDLT PMF ``p = pmf_flat[offsets[i] : offsets[i + 1]]`` starting at
+       ``mn = mins[i]``, and computes its predictive mean ``mu``, variance ``v``, and target
+       quantiles ``q_out[i, a] = F_i^{-1}(levels[a])``.
+    2. Loops over each support point ``j`` of the lead-time distribution with weight ``wj = w[i, j]``
+       and realized ``(L_j + R)``-day demand ``yy = y[i, j]``:
+       - Accumulates expected realized demand ``ym += wj * yy``, expected CRPS, and expected
+         squared error ``se += wj * (yy - mu)^2``.
+       - Computes ``f_lo = F_i(yy - 1)`` and ``f_hi = F_i(yy)``.
+       - Accumulates raw coverage ``1{yy <= q_out[i, a]}`` and discrete-correct PIT coverage
+         ``_pit_cdf(levels[a], f_lo, f_hi)``.
+       - Accumulates the PIT mass ``G((b+1)/n_bins) - G(b/n_bins)`` in each histogram bin ``b``.
+
+    Where it is used
+    ----------------
+    Called by :func:`evaluate_ddlt_calibration`.
     """
     n = len(mins)
     n_lv = len(levels)
@@ -142,7 +177,26 @@ def _ddlt_calibration_kernel(
 
 @dataclass
 class DDLTCalibrationResult:
-    """Outputs of :func:`evaluate_ddlt_calibration`."""
+    """
+    Container for the outputs of :func:`evaluate_ddlt_calibration`.
+
+    Attributes
+    ----------
+    row_df : pd.DataFrame
+        Per-(series, decision period) statistics (`pred_mean`, `pred_std`, `realized_mean`,
+        `crps`, `sq_err`, `pred_var`, `cov_<lv>`, `pitcov_<lv>`, `q_<lv>`, `pit_0..pit_{B-1}`).
+    summary_df : pd.DataFrame
+        Overall and per-group summary metrics (`n_rows`, `mean_pred`, `mean_realized`,
+        `bias_pct`, `crps`, `dispersion_ratio`, `pit_tail_upper`, `pit_tail_lower`).
+    coverage_df : pd.DataFrame
+        Overall and per-group quantile calibration table (`level`, `coverage`, `pit_coverage`, `gap_pp`).
+    pit_df : pd.DataFrame
+        Overall and per-group non-randomized PIT histogram (`bin`, `lower`, `upper`, `mass`, `density`).
+    levels : tuple[float, ...]
+        Quantile levels evaluated.
+    n_dropped : int
+        Number of decision rows dropped because ``t + max(L) + R`` extended past the end of ``history``.
+    """
 
     row_df: pd.DataFrame
     summary_df: pd.DataFrame
@@ -152,7 +206,7 @@ class DDLTCalibrationResult:
     n_dropped: int = 0
 
     def report(self) -> str:
-        """Compact human-readable report (overall rows only)."""
+        """Format a compact human-readable text report of the overall calibration tables."""
         overall = self.summary_df[self.summary_df["group"] == "overall"]
         cov = self.coverage_df[self.coverage_df["group"] == "overall"]
         pit = self.pit_df[self.pit_df["group"] == "overall"]
@@ -175,7 +229,15 @@ def _lead_time_terms(
     lead_time_keys: list[str] | None,
     cycle_time: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row ``(m_values, weights)`` matrices with ``m = L + R`` (zero-padded)."""
+    """
+    Build zero-padded 2D arrays ``(m_mat, w_mat)`` of shape ``(len(rows), max_lt_support)``
+    where ``m_mat[i, j] = l_j + cycle_time`` is the protection window length (in periods) and
+    ``w_mat[i, j] = P(L = l_j)`` is its probability weight for row ``i``.
+
+    Where it is used
+    ----------------
+    Called by :func:`evaluate_ddlt_calibration`.
+    """
 
     def terms(lt: DiscreteDistribution) -> tuple[np.ndarray, np.ndarray]:
         lt1 = lt.split_bins(inplace=False) if lt.bin_size != 1 else lt
@@ -221,20 +283,32 @@ def evaluate_ddlt_calibration(
     n_pit_bins: int = 10,
 ) -> DDLTCalibrationResult:
     """
-    Evaluates DDLT distributions against realised demand over the replenishment window.
+    Evaluate predicted DDLT distributions against realized demand over the replenishment window.
+
+    What it does
+    ------------
+    1. Builds a :class:`DenseHistory` prefix-sum matrix from ``history`` and locates each row
+       of ``ddlt_df``.
+    2. Filters out decision rows near the end of the test set whose worst-case protection window
+       ``t + max(L) + R`` extends past the last observed period in ``history`` (recorded in
+       ``result.n_dropped``).
+    3. Computes the realized cumulative demand ``y[i, j] = sum_{t}^{t + L_j + R - 1} demand``
+       in ``O(1)`` per entry via ``hist.prefix[r, c + m] - hist.prefix[r, c]``.
+    4. Packs all DDLT PMFs into a flat contiguous array and runs :func:`_ddlt_calibration_kernel`.
+    5. Aggregates ``summary_df``, ``coverage_df``, and ``pit_df`` overall and by ``group_cols``.
 
     Parameters
     ----------
-    ddlt_df :
+    ddlt_df : pd.DataFrame
         One row per ``(series, decision period)`` with a :class:`DiscreteDistribution` in
-        ``dist_col`` (e.g. the output of ``compute_lead_time_demand(..., return_distribution=True,
+        ``dist_col`` (e.g. output of ``compute_lead_time_demand(..., return_distribution=True,
         pred_first_day=False)``).
-    history :
+    history : pd.DataFrame
         Long demand panel ``(ts_id_cols, period_col, var_col)`` covering the decision periods
         *and* the following ``max(L) + R`` periods.
     lead_time, lead_time_keys, cycle_time :
         The same lead-time specification used to build the DDLT distributions.
-    group_cols :
+    group_cols : list[str], optional
         Optional breakdown columns present in ``ddlt_df`` (e.g. ``["cat_id"]``).
     """
     levels_arr = np.asarray(sorted(levels), dtype=np.float64)

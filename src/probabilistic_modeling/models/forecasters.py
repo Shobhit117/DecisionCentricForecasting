@@ -1,8 +1,22 @@
 """
-Clean, composable probabilistic forecaster abstractions (`GLMForecaster` and
-`CatBoostQuantileForecaster`) with a shared interface for training, reusable
-multi-time prediction, persistence (`save` / `load` / `load_forecaster`),
-evaluation, and DDLT propagation.
+Unified probabilistic forecaster abstractions (`models/forecasters.py`).
+
+What this module does
+---------------------
+Provides a shared, stateful object-oriented interface (`ProbabilisticForecaster`) and
+concrete implementations (`GLMForecaster` and `CatBoostQuantileForecaster`) for:
+1. Multi-horizon model training (`fit`),
+2. Reusable multi-time prediction on engineered panels, specific period slices, or raw
+   sales + covariate tables (`predict`, `transform`, `predict_from_raw`),
+3. Complete bundle persistence (`save`, `load`, and universal `load_forecaster`),
+4. Multi-horizon point & quantile forecast evaluation (`compute_forecasting_metrics`,
+   `evaluate_quantile_forecasts`), and
+5. Compound Demand During Lead Time propagation (`compute_ddlt` via `DDLTCalculator`).
+
+Where it is used
+----------------
+- Primary model training, scoring, and DDLT interface used by `scripts/run_m5_pipeline.py`,
+  `DiscreteTimeSeries` delegation methods, and `EmpiricalQuantileForecaster` in `models/baseline.py`.
 """
 from __future__ import annotations
 
@@ -41,11 +55,35 @@ def compute_forecasting_metrics(
     pred_columns: list[str],
 ) -> pd.DataFrame:
     """
-    Computes multi-horizon point forecast error columns (``actual``, ``pred``,
-    ``under_diff``, ``over_diff``, ``abs_diff``) in-place on ``pred_df``.
+    Computes multi-horizon cumulative point forecast error columns (`actual`, `pred`,
+    `under_diff`, `over_diff`, `abs_diff`) in-place on `pred_df`.
 
-    Works both in backtesting (where ``target_cols`` contain realized demand)
-    and in production inference (where ``target_cols`` may be ``NaN`` or absent).
+    What it does
+    ------------
+    - Pairs each horizon target column (`target_t_plus_h`) with its corresponding expected-value
+      prediction column (`target_t_plus_h_mu`).
+    - In **production mode** (when `target_cols` are absent or all `NaN`), sets `pred` to the
+      sum of predicted horizon means across the forecast window and sets `actual`, `under_diff`,
+      `over_diff`, and `abs_diff` to `NaN`.
+    - In **backtesting mode**, sums realized demand across all non-missing horizons on each row
+      (`actual`), sums the corresponding predicted means over those exact same non-missing
+      horizons (`pred`, masking out any horizon where `target_t_plus_h` is `NaN` near the end
+      of the panel), and computes:
+      - `under_diff = max(actual - pred, 0)` (under-forecasting error),
+      - `over_diff = max(pred - actual, 0)` (over-forecasting error),
+      - `abs_diff = under_diff + over_diff = |actual - pred|`.
+
+    Why it is needed
+    ----------------
+    Near the end of a backtest panel, row `t` may have realized observations for `target_t_plus_0`
+    and `target_t_plus_1`, while `target_t_plus_2 .. target_t_plus_6` lie beyond the end of the
+    dataset (`NaN`). Masking `pred` to zero on horizons where `target_col` is `NaN` ensures
+    `actual` and `pred` always compare the exact same set of realized horizons.
+
+    Where it is used
+    ----------------
+    Called automatically at the end of `GLMForecaster.predict`, `CatBoostQuantileForecaster.predict`,
+    and `EmpiricalQuantileForecaster.predict`.
     """
     if len(target_cols) != len(pred_columns):
         raise ValueError(
@@ -87,8 +125,24 @@ def evaluate_quantile_forecasts(
     group_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Computes pinball loss, empirical coverage P(y <= q_hat), and quantile-approximated
-    CRPS per horizon and quantile level.
+    Evaluates multi-horizon quantile forecasts by computing pinball loss, empirical
+    coverage `P(y <= q_hat)`, and quantile-approximated CRPS per horizon and quantile level.
+
+    What it does
+    ------------
+    For each optional group in `group_cols` and each horizon `target` in `target_cols`:
+    1. Extracts non-missing realizations `y` and the `(n_obs, K)` matrix of predicted
+       quantiles `q_mat` (using column naming `quantile_col_name(target, q)`).
+    2. Computes the mean Continuous Ranked Probability Score (`crps_mean`) across all
+       observations via `quantile_crps(y, q_mat, levels)`.
+    3. For each quantile level `q_j`, computes mean `pinball_loss(y, q_hat_j, q_j)` and
+       empirical coverage `mean(y <= q_hat_j)` (which should be close to `q_j` for a
+       well-calibrated forecaster).
+
+    Where it is used
+    ----------------
+    Called by `DiscreteTimeSeries.evaluate_quantile_forecasts`, `scripts/run_m5_pipeline.py`,
+    and quantile evaluation tests.
     """
     from probabilistic_modeling.models.catboost_quantile import quantile_col_name
 
@@ -131,10 +185,31 @@ def train_single_glm(
     l1_wt: float = 0.0,
 ) -> tuple[dict[str, Any], Any]:
     """
-    Trains a single Poisson or Negative Binomial GLM for one group and horizon.
+    Trains a single log-link Poisson or Negative Binomial GLM for one group and one horizon.
 
-    Separates the dispersion parameter ``alpha`` from regression ``coefficients``
-    so ``coefficients`` strictly maps ``Intercept`` and covariates to their weights.
+    What it does
+    ------------
+    1. Filters `df` to training rows (`is_test == 0`) where `target_col` is not `NaN`.
+    2. Builds the Statsmodels formula `target_col ~ feature_1 + feature_2 + ...` and
+       instantiates either `smf.negativebinomial` (`model_type="nbinom"`) or `smf.poisson`
+       (`model_type="poisson"`).
+    3. Fits via maximum likelihood (`.fit(maxiter=100)`) or L1/L2 penalized likelihood
+       (`.fit_regularized(alpha=..., L1_wt=...)` when `regularization_alpha > 0`).
+    4. Separates the Negative Binomial dispersion parameter `"alpha"` from the regression
+       `"coefficients"` dictionary so `"coefficients"` strictly maps `"Intercept"` and
+       covariate names to their linear weights.
+
+    Why separating `alpha` from `coefficients` is needed
+    ----------------------------------------------------
+    Statsmodels' `smf.negativebinomial` appends the estimated dispersion parameter `alpha`
+    directly onto `result.params` alongside `"Intercept"` and the regression covariates.
+    Popping `"alpha"` out of `raw_params` into its own top-level key ensures that if a
+    dataset ever had a covariate or nothing named `alpha`, linear predictor dot products
+    (`X.dot(coefs)`) only multiply actual regression coefficients.
+
+    Where it is used
+    ----------------
+    Called by `GLMForecaster.fit` and `time_series.train_glm`.
     """
     train_df = df[~df[target_col].isna()]
     if "is_test" in train_df.columns:
@@ -170,9 +245,20 @@ class GLMModel:
     """
     Serializable container for grouped, multi-horizon Poisson / Negative-Binomial GLMs.
 
-    Provides the same persistence ergonomics (`.save()`, `.load()`, `.coefficients_table()`)
-    as :class:`CatBoostQuantileModel` while remaining 100% compatible with the tabular
-    DataFrame representation (`to_dataframe` / `from_dataframe`).
+    What it does
+    ------------
+    Stores fitted per-group, per-horizon GLM parameter dictionaries (`model_type`,
+    `coefficients`, `alpha`) along with feature and target metadata, and provides:
+    - `.to_dataframe()` / `.from_dataframe()` for round-tripping with the tabular
+      DataFrame representation (`GLMForecaster.model_data`),
+    - `.coefficients_table()` for inspecting a tidy long-format DataFrame of all
+      regression weights across groups and horizons, and
+    - `.save()` / `.load()` for clean JSON persistence (`glm_meta.json`).
+
+    Where it is used
+    ----------------
+    Created by `GLMForecaster.fit`, persisted by `GLMForecaster.save`, and used by
+    `GLMForecaster.predict`.
     """
     target_cols: list[str]
     feature_cols: list[str]
@@ -182,11 +268,13 @@ class GLMModel:
 
     @staticmethod
     def group_key(values: Any) -> tuple[str, ...]:
+        """Normalizes a scalar or tuple of group column values into a tuple of strings."""
         if not isinstance(values, tuple):
             values = (values,)
         return tuple(str(v) for v in values)
 
     def to_dataframe(self) -> pd.DataFrame:
+        """Converts the nested `models` dictionary into a wide DataFrame with one row per group and one column per horizon."""
         rows = []
         for group_key, horizon_dict in self.models.items():
             row: dict[str, Any] = {}
@@ -211,6 +299,7 @@ class GLMModel:
         target_cols: list[str] | None = None,
         feature_cols: list[str] | None = None,
     ) -> "GLMModel":
+        """Reconstructs a `GLMModel` from a wide DataFrame (such as `GLMForecaster.model_data` or `load_glm_model_data`)."""
         from probabilistic_modeling.time_series import _parse_serialized_dict
 
         if target_cols is None:
@@ -241,7 +330,7 @@ class GLMModel:
         )
 
     def coefficients_table(self) -> pd.DataFrame:
-        """Returns a tidy DataFrame of fitted GLM coefficients across groups and horizons."""
+        """Returns a tidy long-format DataFrame of fitted GLM coefficients across groups and horizons."""
         rows = []
         for group_key, horizon_dict in self.models.items():
             group_info = dict(zip(self.train_groups, group_key))
@@ -260,6 +349,7 @@ class GLMModel:
         return pd.DataFrame(rows)
 
     def save(self, out_dir: Path | str, prefix: str = "glm") -> None:
+        """Saves all group/horizon GLM parameters and feature metadata to `<out_dir>/<prefix>_meta.json`."""
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -277,6 +367,7 @@ class GLMModel:
 
     @classmethod
     def load(cls, out_dir: Path | str, prefix: str = "glm") -> "GLMModel":
+        """Loads a `GLMModel` from `<out_dir>/<prefix>_meta.json`."""
         out_dir = Path(out_dir)
         with open(out_dir / f"{prefix}_meta.json", encoding="utf-8") as f:
             meta = json.load(f)
@@ -295,15 +386,25 @@ class ProbabilisticForecaster(ABC):
     """
     Abstract base class for multi-horizon probabilistic demand forecasters.
 
-    Supports reusable multi-prediction workflows:
-    - Fit once via ``forecaster.fit(ts)``;
-    - Save/load the complete forecaster state (weights + feature specification +
-      per-series training metadata) via ``forecaster.save(dir)`` and
-      ``load_forecaster(dir)``;
-    - Predict repeatedly on ``ts``, on specific ``period`` slices, on pre-engineered
-      DataFrames ``forecaster.predict(df)``, or on new raw sales data via
-      ``forecaster.predict_from_raw(sales_df, ...)`` without needing the original
-      training ``DiscreteTimeSeries`` object.
+    What it does
+    ------------
+    Defines the common lifecycle and state management shared by `GLMForecaster`,
+    `CatBoostQuantileForecaster`, and `EmpiricalQuantileForecaster`:
+    - **Fit once**: `forecaster.fit(ts)` binds the training panel's feature specification
+      (`feature_spec_`), per-series metadata (`series_metadata_`), and column names via
+      `_bind_training_context(ts)`.
+    - **Flexible inference input resolution**: `_resolve_inference_inputs(...)` allows
+      `predict()` and `compute_ddlt()` to accept a `DiscreteTimeSeries`, a pre-engineered
+      `pd.DataFrame` (passed either as `df=` or positionally as `ts`), and an optional
+      `period` filter, automatically merging missing training `series_metadata_` onto
+      standalone DataFrames.
+    - **Raw-data inference**: `transform(sales_df, ...)` and `predict_from_raw(sales_df, ...)`
+      replay the saved `TimeSeriesFeatureSpec` on brand-new raw sales and covariate tables
+      without needing the original training `DiscreteTimeSeries` object.
+    - **Self-contained persistence**: `_save_base_context` and `_load_base_context` persist
+      `forecaster_meta.json`, `feature_spec.json`, and `series_metadata.csv` alongside the
+      subclass's model weights so `load_forecaster(dir)` restores a complete, ready-to-score
+      pipeline.
     """
 
     forecaster_type: str = "base"
@@ -319,6 +420,7 @@ class ProbabilisticForecaster(ABC):
         self.series_metadata_: pd.DataFrame | None = None
 
     def _bind_training_context(self, ts: "DiscreteTimeSeries") -> None:
+        """Captures column lists, `feature_spec`, and `series_metadata` from `ts` during `fit()`."""
         self.target_cols_ = list(ts.target_cols)
         self.feature_cols_ = list(ts.feature_cols)
         self.cat_feature_cols_ = list(ts.categorical_feature_cols)
@@ -338,9 +440,16 @@ class ProbabilisticForecaster(ABC):
     ) -> tuple[pd.DataFrame, list[str], list[str], str]:
         """
         Resolves the inference DataFrame, target columns, feature columns, and period column
-        whether the caller passed a ``DiscreteTimeSeries``, a standalone ``pd.DataFrame``, or both.
-        Also attaches training ``series_metadata_`` (``overdispersion``, ``best_fit``, etc.)
-        if missing from a standalone inference DataFrame.
+        whether the caller passed a `DiscreteTimeSeries`, a standalone `pd.DataFrame`, or both.
+
+        Why it is needed
+        ----------------
+        Callers may invoke `forecaster.predict(ts)`, `forecaster.predict(ts, period=1914)`,
+        `forecaster.predict(df=custom_df)`, or `forecaster.predict(custom_df)`. Furthermore,
+        when a standalone `df` is passed (or after loading a saved forecaster), per-series
+        training metadata (`overdispersion`, `best_fit`, `distr_param_0..2`) might not be
+        present on `df` yet. This helper normalizes all calling conventions and left-joins
+        any missing `series_metadata_` columns onto `test_data`.
         """
         if isinstance(ts, pd.DataFrame):
             if df is None:
@@ -399,8 +508,8 @@ class ProbabilisticForecaster(ABC):
         num_test_days: int = 0,
     ) -> pd.DataFrame:
         """
-        Transforms raw ``sales_df`` and external feature tables into an inference-ready
-        feature DataFrame using the ``feature_spec_`` and ``series_metadata_`` captured
+        Transforms raw `sales_df` and external feature tables into an inference-ready
+        feature DataFrame using the `feature_spec_` and `series_metadata_` captured
         during training.
         """
         if self.feature_spec_ is None:
@@ -422,8 +531,8 @@ class ProbabilisticForecaster(ABC):
         period: Any = None,
     ) -> pd.DataFrame:
         """
-        End-to-end reusable inference from raw ``sales_df`` + covariates without
-        requiring the original training ``DiscreteTimeSeries``.
+        End-to-end reusable inference from raw `sales_df` + covariates without
+        requiring the original training `DiscreteTimeSeries`.
         """
         inf_df = self.transform(
             sales_df=sales_df,
@@ -435,6 +544,7 @@ class ProbabilisticForecaster(ABC):
         return self.predict(df=inf_df)
 
     def _save_base_context(self, out_dir: Path, extra_meta: dict[str, Any] | None = None) -> None:
+        """Writes `forecaster_meta.json`, `feature_spec.json`, and `series_metadata.csv` to `out_dir`."""
         out_dir.mkdir(parents=True, exist_ok=True)
         meta = {
             "forecaster_type": self.forecaster_type,
@@ -454,6 +564,7 @@ class ProbabilisticForecaster(ABC):
             self.series_metadata_.to_csv(out_dir / "series_metadata.csv", index=False)
 
     def _load_base_context(self, out_dir: Path, meta: dict[str, Any]) -> None:
+        """Restores `target_cols_`, `feature_cols_`, `feature_spec_`, and `series_metadata_` from `out_dir`."""
         from probabilistic_modeling.time_series import TimeSeriesFeatureSpec
 
         self.target_cols_ = list(meta.get("target_cols", []))
@@ -482,8 +593,8 @@ class ProbabilisticForecaster(ABC):
         period: Any = None,
     ) -> pd.DataFrame:
         """
-        Predicts every forecast horizon. ``model`` optionally overrides the fitted model
-        container (``GLMModel`` / coefficient table for GLMs, ``CatBoostQuantileModel`` for CatBoost).
+        Predicts every forecast horizon. `model` optionally overrides the fitted model
+        container (`GLMModel` / coefficient table for GLMs, `CatBoostQuantileModel` for CatBoost).
         """
         ...
 
@@ -502,7 +613,7 @@ class ProbabilisticForecaster(ABC):
         period: Any = None,
         max_service_level: float | None = None,
     ) -> pd.DataFrame:
-        """Shared signature for all forecasters (``model`` has the same meaning as in ``predict``)."""
+        """Shared signature for all forecasters (`model` has the same meaning as in `predict`)."""
         ...
 
     @abstractmethod
@@ -518,6 +629,19 @@ class ProbabilisticForecaster(ABC):
 class GLMForecaster(ProbabilisticForecaster):
     """
     Grouped Poisson / Negative-Binomial GLM forecaster across multiple horizons.
+
+    What it does
+    ------------
+    - **Training (`fit`)**: Partitions the training panel by `train_groups + ["overdispersion"]`.
+      For each partition, automatically fits a Negative Binomial GLM (`model_type="nbinom"`)
+      if `overdispersion == 1` or a Poisson GLM (`model_type="poisson"`) if `overdispersion == 0`
+      independently for each horizon `target_t_plus_0 .. target_t_plus_{H-1}`.
+    - **Prediction (`predict`)**: Evaluates `target_t_plus_h_mu = exp(X @ beta)` and attaches
+      `target_t_plus_h_alpha` for every horizon using vectorized matrix multiplication per group.
+    - **DDLT (`compute_ddlt`)**: Passes the predicted `(mu, alpha)` columns to
+      `DDLTCalculator.from_glm_group`, which constructs truncated Poisson/NB2 PMFs in
+      compiled Numba log-space (`_count_pmf_truncated_numba`) and convolves them over the
+      lead-time distribution.
     """
 
     forecaster_type = "glm"
@@ -538,6 +662,10 @@ class GLMForecaster(ProbabilisticForecaster):
         self.model: GLMModel | None = None
 
     def fit(self, ts: "DiscreteTimeSeries") -> pd.DataFrame:
+        """
+        Fits grouped multi-horizon Poisson / Negative Binomial GLMs on `ts` and returns
+        the wide `model_data` DataFrame (while also storing `self.model: GLMModel`).
+        """
         t0 = time.perf_counter()
         self._bind_training_context(ts)
         partition_cols = list(self.train_groups)
@@ -618,6 +746,17 @@ class GLMForecaster(ProbabilisticForecaster):
         period: Any = None,
         model_data: pd.DataFrame | GLMModel | None = None,
     ) -> pd.DataFrame:
+        """
+        Generates `<target>_mu` and `<target>_alpha` predictions for every horizon in `target_cols`.
+
+        Why string-keyed fallback lookup is included
+        --------------------------------------------
+        When a `GLMModel` is loaded from JSON (`glm_meta.json`), its group keys are tuples of
+        strings (e.g., `('CA_1', '1')`), whereas an in-memory DataFrame may have integer or
+        categorical group keys (e.g., `('CA_1', 1)`). Maintaining both `model_dict_map` and
+        `str_model_dict_map` guarantees seamless group matching regardless of whether the
+        model was just fitted in memory or loaded from disk.
+        """
         t0 = time.perf_counter()
         if model is None:
             model = model_data  # backward-compatible alias
@@ -705,6 +844,10 @@ class GLMForecaster(ProbabilisticForecaster):
         max_service_level: float | None = None,
         model_data: pd.DataFrame | GLMModel | None = None,
     ) -> pd.DataFrame:
+        """
+        Generates GLM predictions and propagates them through `DDLTCalculator.from_glm_group`
+        across all `lead_time_keys` groups.
+        """
         if lead_time is None:
             raise ValueError("'lead_time' distribution must be provided.")
         predictions = self.predict(ts, df=df, model=model if model is not None else model_data, period=period)
@@ -732,6 +875,7 @@ class GLMForecaster(ProbabilisticForecaster):
         )
 
     def save(self, out_dir: Path | str, prefix: str = "glm") -> Path:
+        """Persists the fitted `GLMForecaster` bundle (`forecaster_meta.json`, `feature_spec.json`, `series_metadata.csv`, and `glm_meta.json`) to `out_dir`."""
         if self.model is None and self.model_data is not None:
             self.model = GLMModel.from_dataframe(self.model_data, self.target_cols_, self.feature_cols_)
         if self.model is None:
@@ -752,6 +896,7 @@ class GLMForecaster(ProbabilisticForecaster):
 
     @classmethod
     def load(cls, out_dir: Path | str, prefix: str = "glm") -> "GLMForecaster":
+        """Restores a fitted `GLMForecaster` from `out_dir`."""
         out_path = Path(out_dir)
         meta_file = out_path / "forecaster_meta.json"
         meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
@@ -775,8 +920,22 @@ class GLMForecaster(ProbabilisticForecaster):
 
 class CatBoostQuantileForecaster(ProbabilisticForecaster):
     """
-    Multi-horizon CatBoost ``MultiQuantile`` forecaster with Numba-accelerated
+    Multi-horizon CatBoost `MultiQuantile` forecaster with Numba-accelerated
     quantile-to-distribution reconstruction and DDLT calculation.
+
+    What it does
+    ------------
+    - **Training (`fit`)**: For each partition in `train_groups` and each horizon
+      `target_t_plus_h`, trains a joint `CatBoostRegressor(loss_function='MultiQuantile:alpha=...')`
+      using a leak-free temporal validation split (`num_valid_days` immediately prior to
+      `test_start_period`).
+    - **Prediction (`predict`)**: Predicts all `K` quantiles simultaneously per horizon,
+      applies non-crossing rearrangement and non-negativity clipping (`predict_catboost_quantile`),
+      and computes the implied discrete expected value `<target>_mu` via `quantiles_to_mean`.
+    - **DDLT (`compute_ddlt`)**: Passes predicted quantile columns to
+      `DDLTCalculator.from_quantiles_group`, which converts each row's quantiles into a
+      `DiscreteDistribution` via `_quantiles_to_pmf_numba` and convolves them over the
+      lead-time distribution.
     """
 
     forecaster_type = "catboost"
@@ -804,6 +963,23 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         self.model: "CatBoostQuantileModel | None" = None
 
     def fit(self, ts: "DiscreteTimeSeries") -> "CatBoostQuantileModel":
+        """
+        Trains one `CatBoostRegressor` per `(group, horizon)` pair and returns the
+        fitted `CatBoostQuantileModel` container.
+
+        How the temporal validation split works (lines 869-872)
+        -------------------------------------------------------
+        For a row at period position `group_pos` and a horizon `target_t_plus_h` with offset
+        `h = ts._target_offset(target)`:
+        - The target realization occurs at period position `target_pos = group_pos + h`.
+        - To prevent any look-ahead into the test set, `has_target` requires `target_pos < test_start_pos`.
+        - The validation set (`valid_mask`) consists of rows whose realization date `target_pos`
+          falls in the last `num_valid_days` before `test_start_period`
+          (`test_start_pos - num_valid_days <= target_pos < test_start_pos`).
+        - The training set (`fit_mask`) consists of all earlier rows (`target_pos < test_start_pos - num_valid_days`),
+          optionally bounded by `max_train_days` so training on multi-year panels stays fast
+          and focused on recent regime dynamics.
+        """
         from probabilistic_modeling.models.catboost_quantile import CatBoostQuantileModel, train_catboost_quantile
 
         t0 = time.perf_counter()
@@ -908,6 +1084,10 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         model: "CatBoostQuantileModel | None" = None,
         period: Any = None,
     ) -> pd.DataFrame:
+        """
+        Generates quantile forecast columns (`<target>_q_<level>`) and implied discrete
+        mean columns (`<target>_mu`) across all horizons, plus cumulative error metrics.
+        """
         from probabilistic_modeling.models.catboost_quantile import predict_catboost_quantile
 
         t0 = time.perf_counter()
@@ -978,6 +1158,10 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         period: Any = None,
         max_service_level: float | None = None,
     ) -> pd.DataFrame:
+        """
+        Generates CatBoost quantile predictions and propagates them through
+        `DDLTCalculator.from_quantiles_group` across all `lead_time_keys` groups.
+        """
         if lead_time is None:
             raise ValueError("'lead_time' distribution must be provided.")
         cb_container = model if model is not None else self.model
@@ -1010,6 +1194,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         )
 
     def save(self, out_dir: Path | str, prefix: str = "catboost") -> Path:
+        """Persists the fitted `CatBoostQuantileForecaster` bundle (`forecaster_meta.json`, `feature_spec.json`, `series_metadata.csv`, `catboost_meta.json`, and `.cbm` model files) to `out_dir`."""
         if self.model is None:
             raise ValueError("CatBoostQuantileForecaster has not been fitted yet.")
         out_path = Path(out_dir)
@@ -1032,6 +1217,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
 
     @classmethod
     def load(cls, out_dir: Path | str, prefix: str = "catboost") -> "CatBoostQuantileForecaster":
+        """Restores a fitted `CatBoostQuantileForecaster` from `out_dir`."""
         from probabilistic_modeling.models.catboost_quantile import CatBoostQuantileModel
 
         out_path = Path(out_dir)
@@ -1061,9 +1247,22 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
 
 def load_forecaster(out_dir: Path | str) -> ProbabilisticForecaster:
     """
-    Universal loader that inspects ``out_dir`` and reconstructs the appropriate
-    fitted :class:`ProbabilisticForecaster` (``GLMForecaster`` or ``CatBoostQuantileForecaster``),
-    complete with its feature specification and series metadata.
+    Universal loader that inspects `out_dir` and reconstructs the appropriate
+    fitted `ProbabilisticForecaster` (`GLMForecaster`, `CatBoostQuantileForecaster`, or
+    `EmpiricalQuantileForecaster`), complete with its feature specification and series metadata.
+
+    What it does
+    ------------
+    1. Checks `<out_dir>/forecaster_meta.json` for `"forecaster_type"` (`"empirical"`,
+       `"glm"`, or `"catboost"`) and dispatches to the corresponding `.load(out_path)`.
+    2. Falls back to checking `<out_dir>/catboost_meta.json` or `<out_dir>/glm_meta.json`
+       so directories saved directly via `CatBoostQuantileModel.save` or `GLMModel.save`
+       are also loaded seamlessly.
+
+    Where it is used
+    ----------------
+    Exported at the top-level package (`probabilistic_modeling.load_forecaster`) for
+    reloading any saved model artifact directory without hardcoding the model class.
     """
     out_path = Path(out_dir)
     meta_file = out_path / "forecaster_meta.json"
@@ -1094,6 +1293,17 @@ def _apply_ddlt_across_groups(
     return_distribution: bool,
     group_fn,
 ) -> pd.DataFrame:
+    """
+    Internal helper that attaches optional per-item/group `service_levels` and applies
+    `group_fn(gdf, lt_distr)` either to the entire `predictions` DataFrame (when `lead_time`
+    is a single `DiscreteDistribution`) or per `lead_time_keys` group (when `lead_time`
+    is a dictionary mapping group keys to `DiscreteDistribution` objects).
+
+    Where it is used
+    ----------------
+    Shared by `GLMForecaster.compute_ddlt`, `CatBoostQuantileForecaster.compute_ddlt`,
+    and `EmpiricalQuantileForecaster.compute_ddlt`.
+    """
     if not return_distribution:
         if service_levels is not None:
             join_cols = [col for col in service_levels.columns if col != "service_level"]

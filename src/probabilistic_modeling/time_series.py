@@ -1,3 +1,31 @@
+"""
+Panel time-series construction and leak-free feature engineering pipeline (`time_series.py`).
+
+What this module does
+---------------------
+Transforms raw transactional or daily demand data into a balanced `(series x period)`
+panel with:
+1. Optional pre-launch zero trimming (`_trim_pre_launch_zeros`),
+2. Leak-free historical statistics (`overdispersion` flag and method-of-moments
+   `best_fit` fallback distribution parameters computed strictly on training periods),
+3. Autoregressive lag features (`lag_1`, `lag_7`, ...) and Cython-vectorized rolling
+   window means/standard deviations (`rolling_mean_7`, `rolling_std_7`, ...) computed
+   on 1-step-shifted series (`shift(1)`) so day `t`'s features never include day `t`'s
+   realized demand,
+4. Multi-horizon targets (`target_t_plus_0`, ..., `target_t_plus_{H-1}`) with boundary
+   masking so training rows never see test-period realizations as targets,
+5. Calendar features (`add_calendar_features`) and external covariates (`add_feature`)
+   supporting negative lags (`-h`) for future-known covariates at `t + h`,
+6. Serializable feature replay (`TimeSeriesFeatureSpec`) so fitted forecasters can
+   transform new raw data at inference time without rebuilding the training dataset.
+
+Where it is used
+----------------
+- Primary data preparation entry point before calling `GLMForecaster.fit`,
+  `CatBoostQuantileForecaster.fit`, or `EmpiricalQuantileForecaster.fit`.
+- Replayed automatically inside `ProbabilisticForecaster.transform` and
+  `ProbabilisticForecaster.predict_from_raw`.
+"""
 import ast
 from dataclasses import asdict, dataclass, field
 import json
@@ -29,6 +57,27 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_serialized_dict(val: Any) -> Any:
+    """
+    Parses a dictionary that was serialized to CSV either as JSON or as a Python literal string.
+
+    What it does
+    ------------
+    Returns `val` unchanged if it is already a `dict` or non-string; otherwise attempts
+    `json.loads(val)` first and falls back to `ast.literal_eval(val)`.
+
+    Why it is needed
+    ----------------
+    When a DataFrame containing dictionary cells (such as GLM coefficient dictionaries
+    per horizon in `GLMForecaster.model_data`) is saved to CSV via `df.to_csv()`, Pandas
+    formats each dictionary using Python's `repr()` (single quotes) rather than strict JSON
+    (double quotes). Supporting both JSON and `ast.literal_eval` makes CSV round-tripping
+    reliable.
+
+    Where it is used
+    ----------------
+    - `load_glm_model_data` in this module.
+    - `GLMModel.from_dataframe` in `models/forecasters.py`.
+    """
     if isinstance(val, dict):
         return val
     if not isinstance(val, str):
@@ -41,7 +90,19 @@ def _parse_serialized_dict(val: Any) -> Any:
 
 @dataclass
 class CalendarFeatureSpec:
-    """Serializable specification for calendar features attached to a time-series panel."""
+    """
+    Serializable specification for calendar features attached to a `DiscreteTimeSeries` panel.
+
+    What it does
+    ------------
+    Records the arguments passed to `DiscreteTimeSeries.add_calendar_features` so the exact
+    same calendar feature transformation can be replayed on new data during inference.
+
+    Where it is used
+    ----------------
+    Stored in `TimeSeriesFeatureSpec.calendar_specs` and replayed inside
+    `TimeSeriesFeatureSpec.transform`.
+    """
     day_of_week_col: str | None = None
     use_week_end_feature: bool = False
     use_day_of_week_features: bool = True
@@ -51,7 +112,21 @@ class CalendarFeatureSpec:
 
 @dataclass
 class ExternalFeatureSpec:
-    """Serializable specification for an external covariate merged onto a time-series panel."""
+    """
+    Serializable specification for an external covariate merged onto a `DiscreteTimeSeries` panel.
+
+    What it does
+    ------------
+    Records the arguments passed to `DiscreteTimeSeries.add_feature` (`feature_name`,
+    `join_on`, `is_cat_feature`, `default_value`, `lags`, `rolling_windows`) so external
+    covariates (such as prices, promotions, or SNAP indicators) can be merged and lagged
+    identically at inference time.
+
+    Where it is used
+    ----------------
+    Stored in `TimeSeriesFeatureSpec.external_specs` and replayed inside
+    `TimeSeriesFeatureSpec.transform`.
+    """
     feature_name: str
     join_on: list[str]
     is_cat_feature: bool = False
@@ -64,11 +139,34 @@ class ExternalFeatureSpec:
 class TimeSeriesFeatureSpec:
     """
     Serializable feature-engineering specification learned from a training
-    :class:`DiscreteTimeSeries` panel.
+    `DiscreteTimeSeries` panel.
 
-    Enables transforming new raw sales and covariate tables at inference time
-    with the exact same lag, rolling, calendar, one-hot, and series-level metadata
-    configuration without rebuilding or re-fitting the original training dataset.
+    What it does
+    ------------
+    Captures every hyperparameter and column list produced during training panel construction:
+    - Series identifier, period, and target variable column names (`ts_id_cols`, `period_col`, `var_col`),
+    - Lag and rolling window configurations (`lags`, `rolling_windows`, `include_std_dev`,
+      `apply_log_transformation`),
+    - Series-level metadata flags (`use_best_fit_feature`, `use_one_hot_encoding`, `trim_leading_zeros`),
+    - Ordered history of `add_calendar_features` (`calendar_specs`) and `add_feature` (`external_specs`) calls,
+    - Exact resulting `feature_cols`, `categorical_feature_cols`, `target_cols`, and
+      `future_lead_horizon_map` (mapping future-known lead features to their lead offset `h`).
+
+    Why it is needed
+    ----------------
+    In production, a trained forecaster is saved to disk and later loaded in a separate
+    process to score newly arrived raw sales and covariate tables. Without `TimeSeriesFeatureSpec`,
+    callers would have to manually reconstruct the entire `DiscreteTimeSeries` pipeline and risk
+    feature-column mismatches (e.g., missing one-hot dummy levels or re-estimating historical
+    distributions on a short inference window).
+
+    Where it is used
+    ----------------
+    - Created and updated automatically on `DiscreteTimeSeries.feature_spec`.
+    - Saved and loaded alongside forecaster weights in `ProbabilisticForecaster._save_base_context`
+      and `_load_base_context` (`feature_spec.json`).
+    - Invoked by `DiscreteTimeSeries.transform`, `ProbabilisticForecaster.transform`, and
+      `ProbabilisticForecaster.predict_from_raw`.
     """
     ts_id_cols: list[str]
     period_col: str
@@ -91,6 +189,7 @@ class TimeSeriesFeatureSpec:
     future_lead_horizon_map: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Converts this specification into a JSON-serializable dictionary (replacing `NaN` defaults with `None`)."""
         d = asdict(self)
         for ext in d.get("external_specs", []):
             val = ext.get("default_value")
@@ -100,6 +199,7 @@ class TimeSeriesFeatureSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TimeSeriesFeatureSpec":
+        """Reconstructs a `TimeSeriesFeatureSpec` from a dictionary parsed from JSON."""
         cal_specs = [CalendarFeatureSpec(**c) for c in data.get("calendar_specs", [])]
         ext_specs = []
         for e in data.get("external_specs", []):
@@ -130,6 +230,7 @@ class TimeSeriesFeatureSpec:
         )
 
     def save(self, path: str | Path) -> None:
+        """Writes this feature specification to a JSON file at `path`."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
@@ -137,6 +238,7 @@ class TimeSeriesFeatureSpec:
 
     @classmethod
     def load(cls, path: str | Path) -> "TimeSeriesFeatureSpec":
+        """Loads a `TimeSeriesFeatureSpec` from a JSON file at `path`."""
         with open(Path(path), encoding="utf-8") as f:
             return cls.from_dict(json.load(f))
 
@@ -147,9 +249,26 @@ class TimeSeriesFeatureSpec:
         exclude_cols: set[str] | None = None,
     ) -> list[str]:
         """
-        Returns the feature list for a specific horizon ``target_t_plus_<h>``.
-        When ``restrict_future_leads=True``, future-known lead covariates at ``t + k``
-        with ``k > h`` are excluded from horizon ``h``'s feature set.
+        Returns the numerical feature list for a specific forecast horizon `target_t_plus_<h>`.
+
+        What it does
+        ------------
+        Filters `self.feature_cols` to exclude any columns in `exclude_cols`. When
+        `restrict_future_leads=True`, also excludes any future-known lead covariate
+        (created via negative lags `-k`, representing period `t + k`) whose future offset
+        `k` exceeds the target horizon `h`.
+
+        Why it is needed
+        ----------------
+        When future-known covariates (such as future day-of-week or scheduled promotions at
+        `t + 1, ..., t + H - 1`) are added to the panel, a model for horizon `target_t_plus_h`
+        may optionally be restricted (`restrict_future_leads=True`) so it only conditions on
+        covariates up to period `t + h` rather than covariates after `t + h`.
+
+        Where it is used
+        ----------------
+        - `DiscreteTimeSeries.get_features_for_horizon`
+        - `GLMForecaster.fit` and `CatBoostQuantileForecaster.fit` in `models/forecasters.py`
         """
         excl = exclude_cols or set()
         if not restrict_future_leads or not self.future_lead_horizon_map:
@@ -171,8 +290,27 @@ class TimeSeriesFeatureSpec:
         num_test_days: int = 0,
     ) -> pd.DataFrame:
         """
-        Reconstructs the feature panel on a new ``sales_df`` using this specification
-        and pre-fitted ``series_metadata`` (without re-estimating training distributions).
+        Reconstructs the engineered feature panel on a new `sales_df` using this specification
+        and pre-fitted `series_metadata` (without re-estimating training distributions).
+
+        What it does
+        ------------
+        1. Instantiates a `DiscreteTimeSeries` with `fit_historical_distributions=False`,
+           `downsample_zeros_frac=None`, and `pretrained_series_metadata=series_metadata`.
+        2. Replays every `CalendarFeatureSpec` in `self.calendar_specs`.
+        3. Replays every `ExternalFeatureSpec` in `self.external_specs` (matching each
+           feature from `external_features` or `calendar_df`).
+        4. Guarantees schema alignment with training: any expected numerical column (e.g.,
+           a one-hot dummy category that did not appear in the new inference slice) is added
+           with value `0`, and any expected categorical column is ensured to have `"category"`
+           dtype.
+        5. Returns either the full engineered panel (`period="all"`) or the requested
+           inference slice via `ts_new.get_inference_data(period=period)`.
+
+        Where it is used
+        ----------------
+        - `DiscreteTimeSeries.transform`
+        - `ProbabilisticForecaster.transform` and `ProbabilisticForecaster.predict_from_raw`
         """
         ts_new = DiscreteTimeSeries(
             sales_df,
@@ -244,7 +382,18 @@ def train_glm(
     target_col: str,
     model_type: str = "nbinom",
 ) -> tuple[dict, Any]:
-    """Trains a Generalized Linear Model (GLM) on the provided DataFrame."""
+    """
+    Trains a Generalized Linear Model (GLM) on the provided DataFrame.
+
+    What it does
+    ------------
+    Thin convenience wrapper around `train_single_glm` in `models/forecasters.py` that fits
+    a log-link Poisson or Negative Binomial GLM (`target_col ~ feature_cols`) on non-test rows.
+
+    Where it is used
+    ----------------
+    Exported at package root for standalone single-horizon GLM fitting and backward compatibility.
+    """
     return train_single_glm(df, feature_cols, target_col, model_type)
 
 
@@ -253,8 +402,19 @@ def predict_glm(
     feature_dict: dict[str, Any] | pd.Series,
 ) -> tuple[float, float | None]:
     """
-    Computes the expected value (mu) and dispersion parameter (alpha)
-    for a given feature set using trained GLM coefficients.
+    Computes the expected value (`mu`) and dispersion parameter (`alpha`) for a single
+    observation using trained GLM coefficients.
+
+    What it does
+    ------------
+    Evaluates the linear predictor `z = Intercept + sum_j x_j * beta_j`, applies the
+    inverse log-link `mu = exp(z)`, and extracts `alpha = model_data.get("alpha", np.nan)`.
+
+    Where it is used
+    ----------------
+    Single-row GLM scoring helper and unit tests (`tests/test_glm.py`). Note that bulk
+    multi-row scoring in `GLMForecaster.predict` uses vectorized matrix multiplication
+    (`X_aligned.dot(coef_series)`) instead.
     """
     coefficients = model_data["coefficients"]
     z = coefficients.get("Intercept", 0.0)
@@ -267,6 +427,19 @@ def predict_glm(
 
 
 def load_glm_model_data(file_name: str | Path) -> pd.DataFrame:
+    """
+    Loads a saved GLM model DataFrame from CSV and parses serialized horizon dictionaries.
+
+    What it does
+    ------------
+    Reads `file_name` via `pd.read_csv` and applies `_parse_serialized_dict` to every
+    `target*` column so the cells are restored to Python `dict` objects.
+
+    Where it is used
+    ----------------
+    Used when loading legacy CSV exports of `GLMForecaster.model_data` (modern code
+    can also use `GLMForecaster.save` / `GLMForecaster.load` or `load_forecaster`).
+    """
     df = pd.read_csv(file_name)
     for col in df.columns:
         if col.startswith("target"):
@@ -278,10 +451,39 @@ class DiscreteTimeSeries:
     """
     Panel time-series builder and feature engineering pipeline for discrete demand.
 
-    Supports both historical backtesting (``num_test_days > 0``) and production
-    inference (``num_test_days = 0``), where future target actuals are unavailable
-    at the latest decision date(s) but future-known covariates (calendar, events,
-    scheduled prices) can still be attached across the forecast horizon.
+    What it does
+    ------------
+    Given a raw demand DataFrame `df` with series identifiers `ts_id_cols`, timestamp/day
+    index `period_col`, and demand column `var_col`, constructs a balanced panel and
+    engineers lag, rolling, target, and series-metadata columns:
+
+    1. **Cross-Join Panel Balancing**: Builds the full Cartesian product of unique
+       `ts_id_cols` and sorted unique `periods`, filling missing `(series, period)` pairs
+       with `default_value` (typically `0`).
+    2. **Pre-Launch Zero Trimming** (optional, `trim_leading_zeros=True`): Drops leading
+       zero-demand rows before each series' first positive demand observation so pre-launch
+       structural zeros do not bias mean/variance or autoregressive features.
+    3. **Train / Test Split Flagging**: Marks the last `num_test_days` periods with
+       `is_test = 1` (backtesting mode) or sets `is_test = 0` everywhere when
+       `num_test_days = 0` (production mode).
+    4. **Leak-Free Series Metadata**: Computes per-series `overdispersion` (`var > mean`
+       on training rows) and optionally fits historical method-of-moments fallback
+       distributions (`best_fit`, `distr_param_0..2`) strictly on training rows (`is_test == 0`).
+       When transforming new data at inference time, attaches `pretrained_series_metadata`
+       from training instead of re-estimating.
+    5. **Autoregressive & Rolling Features**: Computes `lag_<k>` and 1-step-shifted rolling
+       statistics (`rolling_mean_<w>`, `rolling_std_<w>`) with `np.log1p` scaling.
+    6. **Multi-Horizon Targets**: Creates `target_t_plus_0, ..., target_t_plus_{H-1}` and
+       masks out any target on a training row (`is_test == 0`) whose future realization
+       date `t + i` falls inside the test window (`is_test == 1`).
+    7. **All-Zero Row Downsampling** (optional, `downsample_zeros_frac`): Randomly subsamples
+       training rows where all features and targets are zero to speed up model fitting on
+       intermittent retail panels.
+
+    Where it is used
+    ----------------
+    Instantiated directly by users and pipelines (`scripts/run_m5_pipeline.py`) and
+    internally by `TimeSeriesFeatureSpec.transform`.
     """
 
     def __init__(
@@ -346,7 +548,7 @@ class DiscreteTimeSeries:
         )
         self.logger = logger
 
-        # Compute all ts_id x period combinations:
+        # Step 1: Compute all ts_id x period combinations to form a complete balanced grid:
         unique_ts_id = self.df[self.ts_id_cols].drop_duplicates()
         self.num_ts = len(unique_ts_id)
         self.logger.info(
@@ -363,9 +565,11 @@ class DiscreteTimeSeries:
             unique_ts_id_period, self.df, on=self.ts_id_cols + [period_col], how="left"
         ).fillna({var_col: default_value})
 
+        # Step 2: Optionally drop pre-launch leading zeros for each series:
         if self.trim_leading_zeros:
             self._trim_pre_launch_zeros()
 
+        # Step 3: Flag test periods and compute/attach series-level metadata:
         self._add_test_flag(self.num_test_days)
         if pretrained_series_metadata is not None and not pretrained_series_metadata.empty:
             self._attach_pretrained_series_metadata(
@@ -378,6 +582,7 @@ class DiscreteTimeSeries:
                 self._fit_distributions(grouped, use_best_fit_feature, use_one_hot_encoding)
             self._extract_series_metadata()
 
+        # Step 4: Engineer lags, rolling windows, and multi-horizon targets:
         self._engineer_features(lags, rolling_windows, num_future_targets, include_std_dev)
         self._sync_feature_spec()
         self.logger.info(
@@ -390,7 +595,17 @@ class DiscreteTimeSeries:
         )
 
     def _trim_pre_launch_zeros(self):
-        """Removes leading zero-demand periods prior to each series' first active (> 0) period."""
+        """
+        Removes leading zero-demand periods prior to each series' first active (`> 0`) period.
+
+        Why it is needed
+        ----------------
+        In retail datasets (such as M5), many items are launched mid-way through the multi-year
+        calendar. Prior to launch, their recorded sales are `0` for hundreds of consecutive days.
+        Including pre-launch zeros artificially inflates zero-mass and depresses rolling means
+        and parametric distribution fits. If a series is `0` across the entire history, all rows
+        for that series are retained so the series is not dropped from the panel.
+        """
         self.df.sort_values(by=self.ts_id_cols + [self.period_col], inplace=True)
         active = (self.df[self.var_col] > 0).astype(int)
         cum_active = active.groupby([self.df[c] for c in self.ts_id_cols], observed=True).cumsum()
@@ -399,6 +614,16 @@ class DiscreteTimeSeries:
         self.df = self.df[(cum_active > 0) | (~has_any_positive)].copy()
 
     def _extract_series_metadata(self):
+        """
+        Extracts one row per series containing static training metadata (`overdispersion`,
+        `best_fit`, `distr_param_0..2`) into `self.series_metadata`.
+
+        Why it is needed
+        ----------------
+        Persisting `self.series_metadata` allows `TimeSeriesFeatureSpec.transform` and
+        `ProbabilisticForecaster` to attach training-time overdispersion flags and fallback
+        distribution parameters to new inference data without re-fitting on test periods.
+        """
         meta_cols = list(self.ts_id_cols)
         for c in ("overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2"):
             if c in self.df.columns:
@@ -411,6 +636,15 @@ class DiscreteTimeSeries:
         use_best_fit_feature: bool,
         one_hot: bool,
     ):
+        """
+        Merges pre-fitted `series_metadata` from training onto `self.df` during `transform()`.
+
+        Why it is needed
+        ----------------
+        Ensures that at inference time every series uses the exact same `overdispersion`
+        routing (Poisson vs. Negative Binomial) and `best_fit` fallback parameters learned
+        during training.
+        """
         meta = pretrained_meta.copy()
         for col in self.ts_id_cols:
             if col in meta.columns and col in self.df.columns:
@@ -442,12 +676,25 @@ class DiscreteTimeSeries:
         self.series_metadata = meta.copy()
 
     def _sync_feature_spec(self):
+        """Synchronizes `self.feature_spec` lists with the current panel feature and target columns."""
         self.feature_spec.feature_cols = list(self.feature_cols)
         self.feature_spec.categorical_feature_cols = list(self.categorical_feature_cols)
         self.feature_spec.target_cols = list(self.target_cols)
         self.feature_spec.future_lead_horizon_map = dict(self.future_lead_horizon_map)
 
     def _add_test_flag(self, num_test_days: int):
+        """
+        Adds the binary `is_test` indicator column to `self.df`.
+
+        What it does
+        ------------
+        - When `num_test_days > 0` (backtesting mode): sets `self.test_start_period` to the
+          `num_test_days`-th period from the end of `self.periods` and marks rows with
+          `period >= test_start_period` as `is_test = 1` (else `0`).
+        - When `num_test_days == 0` (production mode): sets `self.test_start_period = None`
+          and marks all rows as `is_test = 0` so the entire observed history is available
+          for training.
+        """
         if num_test_days is not None and num_test_days > 0:
             self.test_start_period = self.periods[-num_test_days]
             self.df["is_test"] = np.where(self.df[self.period_col] >= self.test_start_period, 1, 0)
@@ -458,11 +705,16 @@ class DiscreteTimeSeries:
 
     def get_inference_data(self, period: Any = None) -> pd.DataFrame:
         """
-        Returns the rows to forecast on:
-        - If ``period`` is a scalar or collection of periods, returns rows matching ``period``.
-        - In backtesting mode (``num_test_days > 0``), returns rows with ``is_test == 1``.
-        - In production mode (``num_test_days == 0``), returns rows at the latest observed
-          period (``self.end_period``) so future demand ``t, ..., t+H-1`` can be predicted.
+        Returns the subset of rows in `self.df` to generate forecasts for:
+        - If `period` is a scalar or collection of periods, returns rows matching `period`.
+        - In backtesting mode (`num_test_days > 0`), returns rows with `is_test == 1`.
+        - In production mode (`num_test_days == 0`), returns rows at the latest observed
+          period (`self.end_period`) so future demand `t, ..., t+H-1` can be predicted.
+
+        Where it is used
+        ----------------
+        Called by `ProbabilisticForecaster._resolve_inference_inputs` and
+        `TimeSeriesFeatureSpec.transform`.
         """
         if period is not None:
             if isinstance(period, (list, tuple, set, np.ndarray, pd.Series, pd.Index)):
@@ -478,6 +730,7 @@ class DiscreteTimeSeries:
         restrict_future_leads: bool = False,
         exclude_cols: set[str] | None = None,
     ) -> list[str]:
+        """Delegates to `self.feature_spec.get_features_for_horizon`."""
         return self.feature_spec.get_features_for_horizon(
             target_col, restrict_future_leads=restrict_future_leads, exclude_cols=exclude_cols
         )
@@ -491,8 +744,8 @@ class DiscreteTimeSeries:
         num_test_days: int = 0,
     ) -> pd.DataFrame:
         """
-        Applies this panel's learned feature specification and training ``series_metadata``
-        to a new ``sales_df`` for repeated inference without retraining.
+        Applies this panel's learned feature specification and training `series_metadata`
+        to a new `sales_df` for repeated inference without retraining.
         """
         return self.feature_spec.transform(
             sales_df=sales_df,
@@ -511,6 +764,20 @@ class DiscreteTimeSeries:
         include_std_dev: bool,
         apply_log_transformation: bool = True,
     ):
+        """
+        Computes lag features, 1-step-shifted rolling window statistics, and multi-horizon
+        target columns on `self.df`.
+
+        How look-ahead leakage is prevented
+        -----------------------------------
+        1. **Autoregressive features**: Because `target_t_plus_0` is the demand on day `t`
+           itself, all lags (`lag >= 1`) and rolling windows (`shifted_var = shift(1)`)
+           strictly use observations up to day `t - 1`.
+        2. **Cross-boundary targets**: For a training row at day `t` (`is_test == 0`), if
+           future target `target_t_plus_i` (`i > 0`) lands on a day `t + i >= test_start_period`
+           (`target_in_test == True`), that cell is masked to `NaN` (lines 557-559) so no
+           model trained on `is_test == 0` rows can ever observe a test-window realization.
+        """
         t0 = time.perf_counter()
         self.logger.info(
             "Engineering time-series features (lags=%s, rolling_windows=%s, include_std_dev=%s, horizons=%d)...",
@@ -522,14 +789,14 @@ class DiscreteTimeSeries:
         feature_df = self.df.copy().sort_values(by=self.ts_id_cols + [self.period_col])
         grouped_df = feature_df.groupby(self.ts_id_cols, observed=True)
 
-        # Create Lag Features:
+        # Create Lag Features (log1p-transformed when apply_log_transformation=True):
         for lag in lags:
             col_name = f"lag_{lag}"
             shifted_val = grouped_df[self.var_col].shift(lag)
             feature_df[col_name] = np.log1p(shifted_val) if apply_log_transformation else shifted_val
             self.feature_cols.append(col_name)
 
-        # Create Rolling Window Features (vectorized Cython groupby rolling on shifted series):
+        # Create Rolling Window Features (vectorized Cython groupby rolling on 1-step-shifted series):
         shifted_var = grouped_df[self.var_col].shift(1)
         group_keys = [feature_df[c] for c in self.ts_id_cols]
         for window in rolling_windows:
@@ -549,17 +816,18 @@ class DiscreteTimeSeries:
                 feature_df[col_name] = np.log1p(rstd) if apply_log_transformation else rstd
                 self.feature_cols.append(col_name)
 
-        # Future Targets:
+        # Create Future Target Columns (target_t_plus_0 .. target_t_plus_{H-1}):
         self.target_cols = []
         for i in range(0, num_future_targets):
             col_name = f"target_t_plus_{i}"
             feature_df[col_name] = grouped_df[self.var_col].shift(-i)
+            # Prevent training rows (is_test == 0) from seeing targets that fall into the test window:
             if self.test_start_period is not None and i > 0:
                 target_in_test = grouped_df["is_test"].shift(-i) == 1
                 feature_df.loc[(feature_df["is_test"] == 0) & target_in_test, col_name] = np.nan
             self.target_cols.append(col_name)
 
-        # Remove rows with missing features:
+        # Remove warm-up rows at the start of each series where lag features are NaN:
         feature_df = feature_df[feature_df[self.feature_cols].isna().sum(axis=1) == 0]
 
         # Optionally downsample rows where both features and targets are all 0s in training data:
@@ -586,6 +854,16 @@ class DiscreteTimeSeries:
         self.df = feature_df
 
     def _create_tmp_col_for_train(self, col_name: str) -> str:
+        """
+        Creates a temporary column `tmp_<col_name>` on `self.df` whose values are masked
+        to `NaN` on all test rows (`period >= test_start_period`).
+
+        Why it is needed
+        ----------------
+        Allows Pandas `.groupby().transform("mean")` / `.transform("var")` and distribution
+        fitting (`_fit_distributions`) to operate on the full panel while strictly ignoring
+        test-period observations.
+        """
         tmp_col = f"tmp_{col_name}"
         if self.test_start_period is not None:
             self.df[tmp_col] = np.where(
@@ -596,6 +874,15 @@ class DiscreteTimeSeries:
         return tmp_col
 
     def _add_overdispersion_flag(self, grouped: DataFrameGroupBy):
+        """
+        Computes a per-series binary indicator `overdispersion = 1` iff the training-window
+        sample variance exceeds the training-window sample mean (`var > mean`).
+
+        Where it is used
+        ----------------
+        Used by `GLMForecaster.fit` to automatically select a Negative Binomial GLM
+        (`overdispersion == 1`) vs. a Poisson GLM (`overdispersion == 0`) for each group.
+        """
         tmp_col = self._create_tmp_col_for_train(self.var_col)
         mean = grouped[tmp_col].transform("mean")
         var = grouped[tmp_col].transform("var")
@@ -608,6 +895,20 @@ class DiscreteTimeSeries:
         use_best_fit_feature: bool = False,
         one_hot: bool = True,
     ):
+        """
+        Fits the best-fitting discrete parametric family (`nbinom`, `binom`, `poisson`,
+        `geom`, `uniform`) to each series' training observations via `compute_best_fit_distribution`.
+
+        Why it is needed
+        ----------------
+        1. Populates `best_fit`, `distr_param_0`, `distr_param_1`, and `distr_param_2` on
+           each row. During `DDLTCalculator` execution, if a lead-time support point `l`
+           exceeds the number of explicitly forecasted horizons `H`, DDLT uses this series'
+           historical `best_fit` distribution as the stationary fallback distribution for
+           horizons `>= H`.
+        2. Optionally exposes `best_fit` as a one-hot or categorical model feature when
+           `use_best_fit_feature=True`.
+        """
         t0 = time.perf_counter()
         tmp_col = self._create_tmp_col_for_train(self.var_col)
         self.logger.info("Fitting historical parametric distributions across %d series...", self.num_ts)
@@ -658,17 +959,18 @@ class DiscreteTimeSeries:
         Parameters
         ----------
         df_calendar : pd.DataFrame
-            Calendar table containing ``self.period_col`` and ``day_of_week_col``.
-            In production, ``df_calendar`` may extend into future periods beyond
-            ``self.end_period`` so ``future_horizons`` leads can be attached.
+            Calendar table containing `self.period_col` and `day_of_week_col`.
+            In production, `df_calendar` may extend into future periods beyond
+            `self.end_period` so `future_horizons` leads can be attached.
         weekend_values : set, optional
-            Values in ``day_of_week_col`` that represent weekend days. Defaults to
-            ``{1, 2}`` when ``day_of_week_col`` is provided (M5 convention) or
-            ``{5, 6}`` when inferred from a datetime ``period_col``.
+            Values in `day_of_week_col` that represent weekend days. Defaults to
+            `{1, 2}` when `day_of_week_col` is provided (M5 convention where `wday=1` is
+            Saturday and `wday=2` is Sunday) or `{5, 6}` when inferred from a datetime
+            `period_col` (Pandas Monday=0 .. Sunday=6 convention).
         future_horizons : tuple[int, ...], optional
-            Future offsets ``(1, 2, ...)`` for which future calendar features from
-            ``df_calendar`` are attached to origin period ``t`` (works even when
-            ``t + h > self.end_period``).
+            Future offsets `(1, 2, ...)` for which future calendar features from
+            `df_calendar` are attached to origin period `t` via negative lags `(-1, -2, ...)`
+            on `add_feature` (works even when `t + h > self.end_period`).
         """
         if use_week_end_feature and use_day_of_week_features:
             raise ValueError("Only one of 'use_week_end_feature' or 'use_day_of_week_features' can be True")
@@ -712,6 +1014,7 @@ class DiscreteTimeSeries:
         self._sync_feature_spec()
 
     def _add_weekend_feature(self, day_of_week_col: str | None = None, weekend_values: set[Any] | None = None):
+        """Creates binary `is_weekend` feature column and appends it to `self.feature_cols`."""
         if day_of_week_col is None:
             wknd = weekend_values if weekend_values is not None else {5, 6}
             self.df["is_weekend"] = np.where(
@@ -724,6 +1027,7 @@ class DiscreteTimeSeries:
         self.feature_cols.append("is_weekend")
 
     def _add_day_of_week_features(self, day_of_week_col: str | None, one_hot: bool = True):
+        """Encodes `day_of_week_col` either as `drop_first=True` one-hot dummies or as a categorical feature."""
         if day_of_week_col is None:
             day_of_week_col = "wday"
             self.df["wday"] = pd.to_datetime(self.df[self.period_col]).dt.dayofweek
@@ -747,13 +1051,20 @@ class DiscreteTimeSeries:
         rolling_windows: tuple[int, ...] | None = None,
     ):
         """
-        Merges an external numerical or categorical feature onto the panel, with optional
-        lags (including negative lags ``-h`` for future-known covariates at ``t + h``)
+        Merges an external numerical or categorical covariate onto the panel, with optional
+        lags (including negative lags `-h` for future-known covariates at `t + h`)
         and rolling windows.
 
-        When ``df_feature`` contains future periods beyond ``self.end_period`` and negative
-        lags are requested, those leads are computed on ``df_feature`` before merging so
-        that the final historical periods still receive future covariate values in production.
+        Why negative lags are precomputed before merging
+        ------------------------------------------------
+        In production mode (`num_test_days = 0`), `self.df` only contains periods up to the
+        latest observed sales date `self.end_period`. However, `df_feature` (such as a future
+        calendar, SNAP schedule, or planned price table) often contains rows for future periods
+        `self.end_period + 1, ..., self.end_period + H`. If we merged `df_feature` onto `self.df`
+        first and then shifted by `-h`, those future rows would be lost during the left join!
+        By shifting negative lags (`lag < 0`, named `<feature>_lag_minus_<h>`) on `df_feature`
+        *before* merging onto `self.df`, the row at `self.end_period` receives the future
+        covariate values from `self.end_period + h`.
         """
         t0 = time.perf_counter()
         self.logger.info(
@@ -861,7 +1172,14 @@ class DiscreteTimeSeries:
     # Delegation methods to GLMForecaster, CatBoostQuantileForecaster, and DDLTCalculator
     # ------------------------------------------------------------------
     def _period_positions(self, df: pd.DataFrame) -> pd.Series:
-        """Position (0-based index into self.periods) of every row's period."""
+        """
+        Returns the 0-based integer index into `self.periods` for every row's period in `df`.
+
+        Where it is used
+        ----------------
+        Used by `CatBoostQuantileForecaster.fit` to compute exact period offsets (`target_pos =
+        group_pos + h`) when partitioning training and validation windows without look-ahead leakage.
+        """
         values = df[self.period_col]
         if isinstance(values.dtype, pd.CategoricalDtype):
             values = values.astype(values.cat.categories.dtype)
@@ -869,15 +1187,19 @@ class DiscreteTimeSeries:
         return pd.Series(positions, index=df.index)
 
     def _target_offset(self, target_col: str) -> int:
+        """Extracts integer horizon offset `h` from column name `'target_t_plus_<h>'`."""
         return int(target_col.rsplit("_", 1)[-1])
 
     def train_glm(self, train_groups: tuple[str, ...] | list[str] | None = None) -> pd.DataFrame:
+        """Convenience method delegating to `GLMForecaster(train_groups=train_groups).fit(self)`."""
         return GLMForecaster(train_groups=train_groups).fit(self)
 
     def predict_glm(self, model_data: pd.DataFrame) -> pd.DataFrame:
+        """Convenience method delegating to `GLMForecaster().predict(self, model=model_data)`."""
         return GLMForecaster().predict(self, model=model_data)
 
     def _compute_forecasting_metrics(self, pred_df: pd.DataFrame, pred_columns: list[str]):
+        """Delegates to `compute_forecasting_metrics`."""
         compute_forecasting_metrics(pred_df, self.target_cols, pred_columns)
 
     def compute_lead_time_demand_glm(
@@ -890,6 +1212,7 @@ class DiscreteTimeSeries:
         return_distribution: bool = False,
         pred_first_day: bool = True,
     ) -> pd.DataFrame:
+        """Delegates single-group GLM DDLT calculation to `DDLTCalculator.from_glm_group`."""
         return DDLTCalculator(lead_time, cycle_time).from_glm_group(
             gdf,
             lead_time,
@@ -910,6 +1233,7 @@ class DiscreteTimeSeries:
         max_train_days: int | None = None,
         catboost_params: dict[str, Any] | None = None,
     ) -> "CatBoostQuantileModel":
+        """Convenience method delegating to `CatBoostQuantileForecaster(...).fit(self)`."""
         forecaster = CatBoostQuantileForecaster(
             quantiles=quantiles,
             train_groups=train_groups,
@@ -921,6 +1245,7 @@ class DiscreteTimeSeries:
         return forecaster.fit(self)
 
     def predict_catboost(self, model: "CatBoostQuantileModel", tol: float = 1e-4) -> pd.DataFrame:
+        """Convenience method delegating to `CatBoostQuantileForecaster(...).predict(self, model=model)`."""
         return CatBoostQuantileForecaster(quantiles=model.quantiles, tol=tol).predict(self, model=model)
 
     def evaluate_quantile_forecasts(
@@ -929,6 +1254,7 @@ class DiscreteTimeSeries:
         quantiles: tuple[float, ...],
         group_cols: list[str] | None = None,
     ) -> pd.DataFrame:
+        """Delegates to `evaluate_quantile_forecasts`."""
         return evaluate_quantile_forecasts(pred_df, self.target_cols, quantiles, group_cols)
 
     def compute_lead_time_demand_catboost(
@@ -941,6 +1267,7 @@ class DiscreteTimeSeries:
         pred_first_day: bool = True,
         tol: float = 1e-4,
     ) -> pd.DataFrame:
+        """Delegates single-group CatBoost quantile DDLT calculation to `DDLTCalculator.from_quantiles_group`."""
         return DDLTCalculator(lead_time, cycle_time, tol=tol).from_quantiles_group(
             gdf,
             lead_time,
@@ -967,11 +1294,28 @@ def compute_lead_time_demand(
     max_service_level: float | None = None,
 ) -> pd.DataFrame:
     """
-    Computes DDLT distributions (``return_distribution=True``) or service-level targets.
+    Unified functional dispatcher that computes Demand During Lead Time (DDLT) distributions
+    (`return_distribution=True`) or service-level target inventories (`return_distribution=False`).
 
-    ``max_service_level`` (e.g. ``0.9999``) tightens the support truncation of the daily
-    distributions so that downstream quantiles up to that level are not biased low. When
-    targets are computed directly, the ``service_level`` column is used automatically.
+    What it does
+    ------------
+    Routes the request to `model_data.compute_ddlt(...)` if `model_data` is already a
+    `ProbabilisticForecaster` instance, or wraps raw `model_data` in a `GLMForecaster`
+    (`model_type="glm"`) or `CatBoostQuantileForecaster` (`model_type="catboost"`).
+
+    Why `max_service_level` matters
+    -------------------------------
+    `max_service_level` (e.g. `0.9999` when solving a high-margin newsvendor problem)
+    tightens the support truncation tolerance of the daily demand distributions via
+    `support_tol_for_service_level(max_service_level, max_days)` so that downstream
+    quantiles up to that critical ratio do not land on a truncated upper-tail bin.
+    When `return_distribution=False`, the maximum value in the `service_level` column is
+    used automatically.
+
+    Where it is used
+    ----------------
+    Exported at the top-level package (`probabilistic_modeling.compute_lead_time_demand`)
+    and used across scripts and tests.
     """
     if isinstance(model_data, ProbabilisticForecaster):
         return model_data.compute_ddlt(
@@ -1023,6 +1367,22 @@ def compute_distribution_dict(
     keys: list[str] | None = None,
     method: str = "actual",
 ) -> tuple[dict[Any, DiscreteDistribution], list[str]]:
+    """
+    Builds a dictionary mapping group keys (e.g., `store_id` or `(store_id, dept_id)`)
+    to empirical or parametric `DiscreteDistribution` objects estimated from `df[value]`.
+
+    What it does
+    ------------
+    Groups `df` by `keys` (defaulting to all columns except `value`) and fits
+    `DiscreteDistribution.from_data(x, method)` on each group's `value` observations.
+    Returns `(distr_dict, keys)`.
+
+    Where it is used
+    ----------------
+    Used in `scripts/run_m5_pipeline.py` and user workflows to construct store-level
+    or supplier-level lead-time distribution dictionaries from historical shipment logs
+    before calling `forecaster.compute_ddlt(..., lead_time=distr_dict, lead_time_keys=keys)`.
+    """
     if keys is None:
         keys = [col for col in df.columns if col != value]
     distr = df.groupby(keys, observed=True)[value].apply(lambda x: DiscreteDistribution.from_data(x, method)).to_dict()

@@ -1,3 +1,39 @@
+"""
+Budget-constrained multi-product newsvendor optimization via Lagrangian shadow-price bisection.
+
+What this module does
+---------------------
+Given a portfolio of ``N`` products with DDLT distributions ``F_i``, selling prices ``p_i``,
+purchase costs ``c_i``, shortage penalties ``b_i``, salvage values ``v_i``, and a shared
+purchasing budget ``B``, computes the integer target inventory vector ``q = (q_1, ..., q_N)``
+that maximizes total expected profit subject to ``sum_i c_i * q_i <= B``.
+
+Mathematical formulation
+------------------------
+For a single product ``i`` without a budget constraint, the classical newsvendor underage cost
+is ``C_u = p_i - c_i + b_i`` and overage cost is ``C_o = c_i - v_i``, giving the unconstrained
+critical fractile:
+
+    alpha_i(0) = C_u / (C_u + C_o) = (p_i - c_i + b_i) / (p_i - v_i + b_i)
+
+When a shared budget ``sum_i c_i * q_i <= B`` binds, introducing a Lagrange multiplier
+(shadow price of capital) ``k >= 0`` inflates each unit's effective purchase cost from ``c_i``
+to ``c_i * (1 + k)``, yielding the shadow-price-adjusted critical fractile:
+
+    alpha_i(k) = clip((p_i - c_i * (1 + k) + b_i) / (p_i - v_i + b_i), 0, 1)
+    q_i(k)     = F_i^{-1}(alpha_i(k))
+
+Because ``alpha_i(k)`` and ``q_i(k)`` are monotonically non-increasing in ``k``, total spend
+``S(k) = sum_i c_i * q_i(k)`` is monotonically non-increasing in ``k``. We first check if
+``k = 0`` satisfies ``S(0) <= B``; if not, we binary-search ``k`` on
+``[0, max_i((p_i + b_i) / c_i - 1)]`` (where the upper bound forces every ``alpha_i(k_ub) = 0``)
+using the compiled Numba batch quantile kernel :func:`_batch_pmf_quantiles_numba`.
+
+Where this module is used
+-------------------------
+Called by :func:`probabilistic_modeling.inventory.simulation.resolve_target_inventory` when
+``policy="newsvendor"`` (and by ``scripts/run_m5_pipeline.py``).
+"""
 import logging
 import time
 import numpy as np
@@ -19,6 +55,33 @@ def solve_multi_product_newsvendor(
     max_iters: int = 200,
     tol: float = 1e-4,
 ) -> np.ndarray:
+    """
+    Solve a single budget-constrained multi-product newsvendor problem over ``num_products`` items.
+
+    Parameters
+    ----------
+    demand_distributions : sequence of DiscreteDistribution
+        Per-product DDLT distributions ``F_i``.
+    selling_price : array-like of float
+        Per-unit selling price ``p_i > 0``.
+    purchase_cost : array-like of float
+        Per-unit purchase/procurement cost ``c_i > 0``.
+    shortage_penalty : array-like of float
+        Per-unit lost-goodwill / stockout penalty ``b_i >= 0``.
+    available_budget : float
+        Maximum total procurement spend ``B >= 0`` across all products.
+    salvage_value : array-like of float, optional
+        Per-unit salvage value ``v_i < c_i`` for leftover inventory (defaults to ``0.0``).
+    max_iters : int, default 200
+        Maximum binary-search iterations over the shadow price ``k``.
+    tol : float, default 1e-4
+        Stopping tolerance on the bracket width ``k_ub - k_lb``.
+
+    Returns
+    -------
+    np.ndarray (1D int64)
+        Optimal integer target inventory quantities ``q_i`` satisfying ``sum(q_i * c_i) <= available_budget``.
+    """
     demand_list = list(demand_distributions)
     num_products = len(demand_list)
 
@@ -63,13 +126,16 @@ def solve_multi_product_newsvendor(
     for distr in demand_list:
         pmfs.append(distr.pmf)
 
+    # Denominator of the critical fractile: C_u + C_o = (p - c + b) + (c - v) = p - v + b
     denom = selling_price - salvage_value + shortage_penalty
     base_num = selling_price + shortage_penalty
 
     def opt_inventory(k: float) -> np.ndarray:
+        # Evaluate shadow-price-adjusted critical fractiles and look up each product's quantile in O(1) memory:
         alpha = np.clip((base_num - purchase_cost * (1.0 + k)) / denom, 0.0, 1.0)
         return _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alpha)
 
+    # 1. Check whether the unconstrained newsvendor solution (k = 0) already fits within the budget:
     x = opt_inventory(0.0)
     unconstrained_spend = float(np.sum(x * purchase_cost))
     if unconstrained_spend <= available_budget:
@@ -81,11 +147,11 @@ def solve_multi_product_newsvendor(
         return x
     logger.debug("Iteration 0 (unconstrained): budget used = %.2f > %.2f", unconstrained_spend, available_budget)
 
-    # Find upper bound on k large enough to force low inventory.
+    # 2. Bracket the shadow price k: at k_ub = max_i((p_i + b_i)/c_i - 1), every alpha_i(k_ub) == 0.
     k_lb = 0.0
     k_ub = float(np.max(base_num / purchase_cost - 1.0))
 
-    # Initiate binary search on k:
+    # 3. Bisection search on k:
     for i in range(max_iters):
         k_mid = 0.5 * (k_lb + k_ub)
         x = opt_inventory(k_mid)
@@ -99,7 +165,8 @@ def solve_multi_product_newsvendor(
 
         if (k_ub - k_lb < tol):
             break
-    x = opt_inventory(k_ub)  # k_ub always satisfies the budget constraint (the last k_mid may not)
+    # Evaluate at k_ub (which is guaranteed to satisfy budget_used <= available_budget):
+    x = opt_inventory(k_ub)
     return x
 
 
@@ -110,11 +177,19 @@ def _solve_multi_product_newsvendor(
     group_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Solves the budget-constrained multi-product newsvendor problem.
+    DataFrame wrapper around :func:`solve_multi_product_newsvendor`.
 
-    When ``group_cols`` is provided (e.g. ``['store_id', 'day']``), an independent
-    newsvendor problem with ``total_budget`` is solved for each group (Option A:
-    one budget per store per decision day).
+    What it does
+    ------------
+    - When ``group_cols`` is provided (e.g. ``['store_id', 'day']``), solves an independent
+      newsvendor problem with budget ``total_budget`` for each group (so each store gets
+      ``total_budget`` per decision day rather than sharing a single budget across 28 days).
+    - Drops the heavy ``demand_distribution`` object column from the returned copy and writes
+      the integer solution into ``out_col_name`` (default ``'target_inventory'``).
+
+    Where it is used
+    ----------------
+    Called by :func:`probabilistic_modeling.inventory.simulation.resolve_target_inventory`.
     """
     t0 = time.perf_counter()
     has_salvage = 'salvage_value' in df.columns

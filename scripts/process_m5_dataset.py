@@ -117,6 +117,15 @@ def download_m5_dataset(
 
 
 def load_dataset(m5_dir: Path) -> pl.DataFrame:
+    """
+    Unpivots the wide M5 `sales_train_evaluation.csv` table (`d_1 .. d_1941`) into a
+    long-format Polars DataFrame with columns `['id', 'item_id', 'dept_id', 'cat_id',
+    'store_id', 'state_id', 'day', 'demand']`, converting `'d_<n>'` into integer `day`.
+
+    Where it is used
+    ----------------
+    Called by `process_m5_data` before partitioning the sales panel by `store_id`.
+    """
     path_to_sales_train = m5_dir / 'sales_train_evaluation.csv'
     ts_id_cols = ['id', 'item_id', 'dept_id', 'cat_id', 'store_id', 'state_id']
     return (
@@ -128,6 +137,15 @@ def load_dataset(m5_dir: Path) -> pl.DataFrame:
 
 
 def load_calendar_and_prices(m5_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Loads `calendar.csv` and `sell_prices.csv`, parses integer `day` from `'d_<n>'`,
+    and joins weekly sell prices (`wm_yr_wk`) onto the daily calendar so every
+    `(store_id, item_id, day)` has an aligned daily `sell_price`.
+
+    Where it is used
+    ----------------
+    Called by `process_m5_data` to produce `calendar.parquet` and `price.parquet`.
+    """
     path_to_calendar = m5_dir / 'calendar.csv'
     path_to_sell_prices = m5_dir / 'sell_prices.csv'
 
@@ -155,6 +173,17 @@ def generate_synthetic_lead_times(
     seed: int = 0,
     num_shipments: int = 1000,
 ) -> pl.DataFrame:
+    """
+    Generates synthetic historical shipment lead-time observations (`store_id`,
+    `consignment_id`, `lead_time`) for each M5 store.
+
+    Why it is needed
+    ----------------
+    The raw M5 competition dataset only includes retail customer demand, not supplier
+    replenishment lead times. Generating `num_shipments` integer lead-time realizations
+    per store allows `compute_distribution_dict` in `scripts/run_m5_pipeline.py` to fit
+    store-specific `DiscreteDistribution` lead-time models for DDLT propagation.
+    """
     rng = np.random.default_rng(seed)
     stores = dataset['store_id'].unique().to_numpy()
     n_stores = len(stores)
@@ -177,6 +206,17 @@ def generate_synthetic_lead_times(
 
 
 def generate_synthetic_newsvendor_data(price_df: pl.DataFrame, seed: int = 0) -> pl.DataFrame:
+    """
+    Generates unit economics (`sell_price`, `purchase_cost`, `shortage_penalty`) per
+    `(item_id, store_id)` from the latest observed M5 selling price.
+
+    Why it is needed
+    ----------------
+    Budget-constrained multi-product newsvendor optimization (`solve_multi_product_newsvendor`)
+    and financial P&L simulation (`InventorySimulator`) require unit purchase cost and
+    shortage penalty alongside selling price. This function samples `purchase_cost ~
+    Uniform(0.3 * sell_price, 0.8 * sell_price)` and sets `shortage_penalty = 0.25 * sell_price`.
+    """
     rng = np.random.default_rng(seed)
 
     filtered_df = (
@@ -198,6 +238,11 @@ def generate_synthetic_newsvendor_data(price_df: pl.DataFrame, seed: int = 0) ->
 
 
 def process_m5_data(m5_dir: Path, synthetic_dir: Path, partitioned_dir: Path):
+    """
+    End-to-end M5 preprocessing pipeline: loads raw CSVs, writes `lead_time.parquet`,
+    `newsvendor.parquet`, `calendar.parquet`, `price.parquet`, and store-partitioned
+    `sales_data_<store_id>.parquet` files while aggressively freeing intermediate memory.
+    """
     t0 = time.perf_counter()
     logger.info("Loading raw M5 datasets from %s...", m5_dir)
     dataset = load_dataset(m5_dir)

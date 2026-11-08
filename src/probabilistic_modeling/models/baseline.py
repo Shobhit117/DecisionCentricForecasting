@@ -1,19 +1,31 @@
 """
 Naive empirical-quantile baseline forecaster.
 
-Predicts each horizon's demand quantiles directly from the series' own recent history,
-with no covariates and no model fitting:
+What this module does
+---------------------
+Predicts each horizon's demand quantiles directly from each series' own historical demand
+using a dense matrix lookup (:class:`DenseHistory`), with **no covariates and no regression model**:
 
-- ``method="trailing"``: quantiles of the last ``window`` observed days (same for every horizon);
-- ``method="seasonal"``: quantiles of the same weekday over the last ``n_weeks`` weeks
-  (horizon-specific, captures day-of-week patterns).
+- ``method="trailing"``: empirical quantiles of the last ``window`` observed days ``[t - window, t)``
+  strictly before decision day ``t`` (identical across all horizons ``h = 0..H-1``);
+- ``method="seasonal"``: empirical quantiles of the last ``n_weeks`` observations falling on the
+  **same weekday** as ``t + h`` strictly before decision day ``t`` (horizon-specific; captures
+  day-of-week seasonality).
 
-Its output has exactly the same columns as :class:`CatBoostQuantileForecaster`
-(``target_t_plus_<h>_q<tau>`` and ``target_t_plus_<h>_mu``), so it runs through the same
-DDLT, target-inventory, simulation and calibration code. Use it as the yardstick a real
-model must beat on decision KPIs.
+Why this module is needed
+-------------------------
+A complex ML/GLM model is only valuable if its inventory decisions beat a zero-training,
+per-SKU historical empirical quantile rule on downstream KPIs (fill rate for a given stock
+investment, or net profit). Because :class:`EmpiricalQuantileForecaster` outputs the exact
+same columns as :class:`CatBoostQuantileForecaster` (``target_t_plus_<h>_q<tau>`` and
+``target_t_plus_<h>_mu``), it plugs directly into the same DDLT convolution, newsvendor/quantile
+target policy, inventory simulator, and DDLT calibration report.
 
-Only demand observed strictly *before* the decision period is used (no look-ahead).
+Where this module is used
+-------------------------
+- Re-exported by ``probabilistic_modeling`` and ``probabilistic_modeling.models``
+- Loaded by :func:`probabilistic_modeling.models.forecasters.load_forecaster` when ``forecaster_type == "empirical"``
+- Used in ``scripts/run_m5_pipeline.py`` when ``--baseline trailing`` or ``--baseline seasonal`` is passed.
 """
 from __future__ import annotations
 
@@ -38,23 +50,26 @@ logger = logging.getLogger(__name__)
 
 class EmpiricalQuantileForecaster(ProbabilisticForecaster):
     """
-    Covariate-free baseline: per-series empirical quantiles of recent demand.
+    Covariate-free baseline forecaster using per-series empirical quantiles of recent demand.
 
     Parameters
     ----------
-    quantiles : sequence of float
-        Quantile levels to predict (same convention as the CatBoost forecaster).
-    method : {"trailing", "seasonal"}
-        Window definition (see module docstring).
-    window : int
-        Trailing window length in periods (``method="trailing"``).
-    n_weeks : int
-        Number of same-weekday observations (``method="seasonal"``); assumes daily periods.
-    horizon : int
-        Number of forecast horizons ``target_t_plus_0 .. target_t_plus_{horizon-1}``. When fitted
-        on a ``DiscreteTimeSeries`` its ``target_cols`` are used instead.
+    quantiles : sequence of float, default DEFAULT_QUANTILES
+        Quantile levels to predict (same convention as :class:`CatBoostQuantileForecaster`).
+    method : {"trailing", "seasonal"}, default "trailing"
+        - ``"trailing"``: last ``window`` periods ``[t - window, t)``.
+        - ``"seasonal"``: last ``n_weeks`` same-weekday observations ``t + h - 7 * k`` before ``t``.
+    window : int, default 56
+        Trailing window length in periods (used when ``method="trailing"``).
+    n_weeks : int, default 8
+        Number of same-weekday historical observations (used when ``method="seasonal"``).
+    horizon : int, default 7
+        Number of forecast horizons ``target_t_plus_0 .. target_t_plus_{horizon-1}`` (overridden
+        automatically when fitted on a :class:`DiscreteTimeSeries`).
     ts_id_cols, period_col, var_col :
-        Panel column names when fitting on a plain DataFrame.
+        Panel column names when fitting directly on a long DataFrame rather than a ``DiscreteTimeSeries``.
+    tol : float, default DEFAULT_SUPPORT_TOL
+        Upper-tail truncation tolerance passed to :class:`DDLTCalculator` during :meth:`compute_ddlt`.
     """
 
     forecaster_type = "empirical"
@@ -91,11 +106,13 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
     # ------------------------------------------------------------------ fitting
     def fit(self, ts: Any, history: pd.DataFrame | None = None) -> "EmpiricalQuantileForecaster":
         """
-        Stores the demand history. ``ts`` may be a ``DiscreteTimeSeries`` (its target columns and
-        id columns are adopted) or a long DataFrame ``(ts_id_cols, period_col, var_col)``.
+        Index the demand history into a :class:`DenseHistory` matrix.
 
-        Pass the complete raw panel as ``history`` when the time series was built with zero
-        down-sampling, so the empirical windows see every observed day.
+        ``ts`` may be either a :class:`DiscreteTimeSeries` (from which ``ts_id_cols``, ``period_col``,
+        ``var_col``, ``target_cols``, and ``series_metadata`` are adopted) or a raw long DataFrame.
+        When ``ts`` is a :class:`DiscreteTimeSeries` that was built with zero-row down-sampling
+        (`downsample_zeros_frac`), pass the complete raw sales DataFrame as ``history`` so that
+        the empirical windows contain all historical zero-demand days.
         """
         if isinstance(ts, pd.DataFrame):
             hist = ts
@@ -111,13 +128,21 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
         return self
 
     def update_history(self, history: pd.DataFrame) -> "EmpiricalQuantileForecaster":
-        """Replaces the stored history (e.g. with newly observed sales) without other changes."""
+        """Replace the stored :class:`DenseHistory` with newly observed sales data (e.g. after ``load()``)."""
         self.history_ = DenseHistory.from_frame(history, self.ts_id_cols_, self.period_col_, self.var_col_)
         return self
 
     # --------------------------------------------------------------- prediction
     def _window_values(self, r: np.ndarray, c: np.ndarray, h: int) -> np.ndarray:
-        """``(n_rows, n_obs)`` matrix of history values used for horizon ``h`` (NaN = unavailable)."""
+        """
+        Extract the ``(n_rows, n_obs)`` matrix of historical demand values strictly before
+        column index ``c`` for horizon ``h = 0, ..., H - 1`` (`NaN` where out of bounds).
+
+        - ``method="trailing"``: column offsets ``[-window, ..., -1]`` relative to ``c``.
+        - ``method="seasonal"``: column offsets ``h - 7 * k`` for ``k = k0, ..., k0 + n_weeks - 1``
+          where ``k0 = h // 7 + 1`` is the smallest integer number of weeks that places ``h - 7 * k0 < 0``
+          (strictly before decision period ``c``, preventing any look-ahead leakage).
+        """
         hist = self.history_.matrix
         if self.method == "trailing":
             offsets = np.arange(-self.window, 0)
@@ -136,6 +161,14 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
         model: Any = None,
         period: Any = None,
     ) -> pd.DataFrame:
+        """
+        Predict empirical quantiles (``target_t_plus_<h>_q<tau>``) and sample means
+        (``target_t_plus_<h>_mu``) for every inference row and horizon.
+
+        Note: For ``method="trailing"``, the trailing window ``[c - window, c)`` does not depend
+        on ``h``, so ``q_mat`` and ``mu`` are computed once at ``h = 0`` and reused across all
+        horizons via ``trailing_cache``.
+        """
         if self.history_ is None:
             raise ValueError("EmpiricalQuantileForecaster needs a history: call fit() or update_history() first.")
         t0 = time.perf_counter()
@@ -194,6 +227,10 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
         period: Any = None,
         max_service_level: float | None = None,
     ) -> pd.DataFrame:
+        """
+        Predict empirical quantiles and propagate them into DDLT distributions or target
+        inventories via :meth:`DDLTCalculator.from_quantiles_group`.
+        """
         if lead_time is None:
             raise ValueError("'lead_time' distribution must be provided.")
         predictions = self.predict(ts, df=df, period=period)
@@ -219,7 +256,7 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
 
     # -------------------------------------------------------------- persistence
     def save(self, out_dir: Path | str) -> Path:
-        """Saves the configuration (the history is data, not a model: re-attach it with ``update_history``)."""
+        """Save the baseline configuration to ``out_dir`` (re-attach sales history after loading via ``update_history``)."""
         out_path = Path(out_dir)
         self._save_base_context(
             out_path,
@@ -236,6 +273,7 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
 
     @classmethod
     def load(cls, out_dir: Path | str) -> "EmpiricalQuantileForecaster":
+        """Load an :class:`EmpiricalQuantileForecaster` configuration from ``out_dir``."""
         out_path = Path(out_dir)
         meta = json.loads((out_path / "forecaster_meta.json").read_text(encoding="utf-8"))
         forecaster = cls(
@@ -251,4 +289,3 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
         )
         forecaster._load_base_context(out_path, meta)
         return forecaster
-

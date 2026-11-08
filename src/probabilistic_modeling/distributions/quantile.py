@@ -1,28 +1,36 @@
 """
-Reconstruction of discrete demand distributions from a grid of predicted quantiles.
+Reconstruction of discrete and continuous predictive distributions from a grid of quantiles,
+plus proper quantile scoring rules (pinball loss and quantile-grid CRPS).
 
-A quantile regression model (e.g. CatBoost with the ``MultiQuantile`` loss) returns,
-for every observation, a vector of predicted quantiles ``q_1 <= ... <= q_K`` at the
-levels ``tau_1 < ... < tau_K``. This module turns such a vector into a
-:class:`DiscreteDistribution` over non-negative integer demand, without any
-parametric assumption inside the fitted quantile range:
+What this module does
+---------------------
+A quantile regression model (e.g. :class:`CatBoostQuantileForecaster` or
+:class:`EmpiricalQuantileForecaster`) predicts a vector of quantiles ``q_1 <= ... <= q_K``
+at probability levels ``0 < tau_1 < ... < tau_K < 1`` for each ``(series, period, horizon)``.
+This module bridges those quantile vectors to full probability distributions:
 
-1. **Quantile crossing** is removed by monotone rearrangement (sorting), and the
-   quantiles are clipped at zero (demand is non-negative).
-2. A **continuous quantile function** ``Q(tau)`` is built by linear interpolation
-   between the knots ``(tau_k, q_k)``.
-3. **Tails** outside ``[tau_1, tau_K]``:
+1. **Quantile crossing removal** (:func:`rearrange_quantiles`): sorts raw predictions along the
+   quantile axis (Chernozhukov et al., 2010 monotone rearrangement) and clips at ``lower_bound`` (0).
+2. **Interior interpolation**: linear interpolation between the knots ``(tau_k, q_k)``.
+3. **Tail extrapolation**:
+   - *Lower tail* (`[0, tau_1]`): linear extrapolation of the first segment down to ``tau = 0``,
+     clipped at ``lower_bound``.
+   - *Upper tail* (`[tau_K, 1 - tol]`): exponential tail
+     ``Q(tau) = q_K + theta * ln((1 - tau_K) / (1 - tau))`` with scale ``theta`` matched to the
+     last two knots ``(tau_{K-1}, q_{K-1})`` and ``(tau_K, q_K)``, truncated at ``1 - tol``.
+4. **Discretization** (:func:`quantiles_to_pmf`, :func:`quantiles_to_distribution`):
+   Defines integer demand ``D = round(Q(U))`` for ``U ~ Uniform(0, 1)``, so
+   ``P(D <= y) = P(Q(U) < y + 0.5)``, delegated to the compiled Numba kernel
+   :func:`probabilistic_modeling.ddlt._quantiles_to_pmf_numba`.
+5. **Continuous counterpart** (:class:`ContinuousQuantileDistribution`):
+   Preserves the continuous piecewise-linear + exponential-tail quantile function without
+   integer rounding (for continuous domains like weight, volume, energy, cashflow).
 
-   * lower tail: linear extrapolation of the first segment down to ``tau = 0``,
-     clipped at zero;
-   * upper tail: exponential tail ``Q(tau) = q_K + theta * ln((1 - tau_K) / (1 - tau))``,
-     with ``theta`` chosen so that the tail passes through the last two knots. The tail
-     is truncated at ``tau = 1 - tol`` (consistent with ``DiscreteDistribution.from_parametric``).
-
-4. **Discretisation**: integer demand is defined as ``D = round(Q(U))`` with
-   ``U ~ Uniform(0, 1)``, i.e. ``P(D <= y) = P(Q(U) < y + 0.5)``. When the predicted
-   quantiles are integers (which is what the pinball loss favours on count data), this
-   places ``F(y)`` midway between the bounds implied by the discrete quantile definition.
+Where this module is used
+-------------------------
+- ``models/catboost_quantile.py`` & ``models/forecasters.py`` (training, prediction, evaluation)
+- ``models/baseline.py`` (default quantile grid and validation)
+- ``ddlt.py`` (validating quantile levels in :meth:`DDLTCalculator.from_quantiles_group`)
 """
 from __future__ import annotations
 
@@ -31,6 +39,7 @@ import numpy as np
 from probabilistic_modeling.distributions.discrete import DiscreteDistribution, PredictiveDistribution
 from probabilistic_modeling.ddlt import _quantiles_to_pmf_numba, _quantiles_to_mean_batch_numba
 
+# Default 12-level quantile grid spanning the body (0.05..0.90) and upper safety-stock tail (0.95, 0.99).
 DEFAULT_QUANTILES: tuple[float, ...] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
 
 # Small offset used to evaluate the left limit P(Q(U) < x) instead of P(Q(U) <= x).
@@ -38,6 +47,15 @@ _LEFT_LIMIT_EPS = 1e-9
 
 
 def validate_quantile_levels(levels: list[float] | tuple[float, ...] | np.ndarray) -> np.ndarray:
+    """
+    Validate that ``levels`` is a 1D strictly increasing array of at least 2 probabilities in ``(0, 1)``.
+
+    Why it is needed
+    ----------------
+    At least two quantile knots are required to estimate both the lower-tail slope and the
+    upper-tail exponential scale ``theta``. Used across ``quantile.py``, ``catboost_quantile.py``,
+    ``forecasters.py``, ``baseline.py``, and ``ddlt.py``.
+    """
     levels = np.asarray(levels, dtype=float)
     if levels.ndim != 1 or len(levels) < 2:
         raise ValueError("At least two quantile levels are required.")
@@ -50,10 +68,20 @@ def validate_quantile_levels(levels: list[float] | tuple[float, ...] | np.ndarra
 
 def rearrange_quantiles(values: np.ndarray, lower_bound: float | None = 0.0) -> np.ndarray:
     """
-    Removes quantile crossing by monotone rearrangement (sorting along the last axis)
-    and optionally enforces a lower bound on the support (pass ``lower_bound=None``
-    for unbounded continuous domains). Works on a single vector or on a
-    ``(n_obs, n_quantiles)`` matrix.
+    Remove quantile crossing by monotone rearrangement (sorting along the last axis) and
+    optionally clip below ``lower_bound`` (`0.0` by default for non-negative demand).
+
+    Why it is needed
+    ----------------
+    Even with CatBoost's joint ``MultiQuantile`` loss, unconstrained tree predictions can
+    occasionally violate ``q(tau_1) <= q(tau_2)`` for ``tau_1 < tau_2``. Sorting along the
+    quantile axis restores monotonicity and is guaranteed by theory (Chernozhukov et al., 2010)
+    to weakly improve pinball loss.
+
+    Where it is used
+    ----------------
+    - :func:`probabilistic_modeling.models.catboost_quantile.predict_catboost_quantile`
+    - :class:`ContinuousQuantileDistribution`
     """
     values = np.sort(np.asarray(values, dtype=float), axis=-1)
     if lower_bound is not None and np.isfinite(lower_bound):
@@ -63,8 +91,12 @@ def rearrange_quantiles(values: np.ndarray, lower_bound: float | None = 0.0) -> 
 
 def quantiles_to_pmf(levels: np.ndarray, values: np.ndarray, tol: float = 1e-4, max_support: int | None = None) -> tuple[np.ndarray, int]:
     """
-    Converts one vector of predicted quantiles into the PMF of a non-negative integer
-    random variable using the Numba-compiled kernel.
+    Convert one 1D vector of predicted quantiles ``values`` at ``levels`` into ``(pmf, min_value)``
+    of a non-negative integer distribution via the compiled Numba kernel :func:`_quantiles_to_pmf_numba`.
+
+    Where it is used
+    ----------------
+    Called by :func:`quantiles_to_distribution`.
     """
     levels_arr = np.ascontiguousarray(levels, dtype=np.float64)
     values_arr = np.ascontiguousarray(values, dtype=np.float64)
@@ -75,10 +107,16 @@ def quantiles_to_pmf(levels: np.ndarray, values: np.ndarray, tol: float = 1e-4, 
 
 def quantiles_to_distribution(levels: list[float] | np.ndarray, values: list[float] | np.ndarray, tol: float = 1e-4, max_support: int | None = None) -> DiscreteDistribution:
     """
-    Builds a :class:`DiscreteDistribution` from a vector of predicted quantiles.
+    Build a :class:`DiscreteDistribution` from a 1D vector of predicted quantiles ``values`` at ``levels``.
 
-    The extrapolated upper tail is cut at ``1 - tol``; pass a smaller ``tol`` (e.g. via
-    ``support_tol_for_service_level``) when quantiles very close to 1 are needed.
+    The extrapolated upper exponential tail is truncated at ``1 - tol`` (recorded as
+    ``truncation_tol=tol`` on the returned distribution unless an explicit ``max_support`` cap
+    is applied).
+
+    Where it is used
+    ----------------
+    - :meth:`ContinuousQuantileDistribution.to_discrete`
+    - Public API for converting custom quantile forecasts into :class:`DiscreteDistribution` objects.
     """
     levels = validate_quantile_levels(levels)
     values = np.asarray(values, dtype=float)
@@ -92,12 +130,21 @@ def quantiles_to_distribution(levels: list[float] | np.ndarray, values: list[flo
 
 
 def distribution_mean(distr: DiscreteDistribution) -> float:
+    """Return the expected value ``E[X]`` of a :class:`DiscreteDistribution`."""
     support = distr.min + distr.bin_size * np.arange(len(distr.pmf))
     return float(np.dot(support, distr.pmf))
 
 
 def quantiles_to_mean(levels: np.ndarray, values_matrix: np.ndarray, tol: float = 1e-4, max_support: int | None = None) -> np.ndarray:
-    """Mean of the reconstructed distribution for every row of a ``(n_obs, n_quantiles)`` matrix."""
+    """
+    Compute the expected value ``E[D]`` of the reconstructed discrete distribution for every row
+    of a ``(n_obs, n_quantiles)`` matrix using the parallel Numba kernel :func:`_quantiles_to_mean_batch_numba`.
+
+    Where it is used
+    ----------------
+    Called by :meth:`CatBoostQuantileForecaster.predict` to populate the point-forecast column
+    ``target_t_plus_<h>_mu`` from the predicted quantile grid.
+    """
     levels_arr = np.ascontiguousarray(validate_quantile_levels(levels), dtype=np.float64)
     values_arr = np.ascontiguousarray(np.atleast_2d(np.asarray(values_matrix, dtype=np.float64)))
     cap = -1 if max_support is None else int(max_support)
@@ -105,24 +152,38 @@ def quantiles_to_mean(levels: np.ndarray, values_matrix: np.ndarray, tol: float 
 
 
 def pinball_loss(y: np.ndarray, q_pred: np.ndarray, level: float) -> np.ndarray:
-    """Element-wise pinball (quantile) loss."""
+    """
+    Element-wise pinball (check / quantile) loss at probability level ``level`` (`tau` in `(0, 1)`):
+
+        rho_tau(y - q) = max(tau * (y - q), (tau - 1) * (y - q))
+
+    Why it is needed
+    ----------------
+    The unique proper scoring rule whose expected value is minimized by the true ``tau``-quantile
+    of ``Y``. Used by :func:`evaluate_quantile_forecasts`.
+    """
     diff = np.asarray(y, dtype=float) - np.asarray(q_pred, dtype=float)
     return np.maximum(level * diff, (level - 1.0) * diff)
 
 
 def quantile_crps(y: np.ndarray | float, q_pred: np.ndarray, levels: list[float] | tuple[float, ...] | np.ndarray) -> np.ndarray:
     """
-    Computes the Continuous Ranked Probability Score (CRPS) approximated from a
-    grid of predicted quantiles via the identity ``CRPS(F, y) = 2 * int_0^1 rho_tau(y - Q(tau)) d_tau``.
+    Compute the Continuous Ranked Probability Score (CRPS) from a grid of predicted quantiles
+    using the Gneiting & Ranjan (2011) integral identity:
 
-    Parameters
-    ----------
-    y : array-like or float
-        Realized observations of shape ``(n_obs,)`` or scalar.
-    q_pred : np.ndarray
-        Predicted quantiles of shape ``(n_obs, n_quantiles)`` or ``(n_quantiles,)``.
-    levels : array-like
-        Strictly increasing quantile levels in ``(0, 1)`` of length ``n_quantiles``.
+        CRPS(F, y) = 2 * int_0^1 rho_tau(y - Q(tau)) d_tau
+
+    What it does
+    ------------
+    Evaluates the pinball loss ``rho_tau(y - q_pred)`` at each grid knot ``tau_k`` and integrates
+    over ``[0, 1]`` using the composite trapezoidal rule on ``[tau_0, tau_{K-1}]`` plus linear
+    boundary triangles on ``[0, tau_0]`` and ``[tau_{K-1}, 1]`` (where pinball loss vanishes at
+    the endpoints ``tau = 0`` and ``tau = 1``).
+
+    Where it is used
+    ----------------
+    - :func:`probabilistic_modeling.models.forecasters.evaluate_quantile_forecasts`
+    - :meth:`ContinuousQuantileDistribution.crps`
     """
     tau = validate_quantile_levels(levels)
     q_arr = np.asarray(q_pred, dtype=float)
@@ -145,11 +206,20 @@ def quantile_crps(y: np.ndarray | float, q_pred: np.ndarray, levels: list[float]
 
 class ContinuousQuantileDistribution(PredictiveDistribution):
     """
-    Continuous predictive distribution reconstructed from a grid of quantiles
-    ``(levels, values)`` without integer discretization.
+    Continuous predictive distribution reconstructed from a quantile grid ``(levels, values)``
+    without integer discretization.
 
-    Useful for continuous domains (energy load, weight, volume, financial cashflows)
-    while sharing the ``PredictiveDistribution`` interface with ``DiscreteDistribution``.
+    What it does
+    ------------
+    Models ``Q(tau)`` as piecewise-linear across ``[0, tau_0, ..., tau_{K-1}]`` and exponential
+    on ``(tau_{K-1}, 1 - tol]`` with scale parameter ``theta``. Implements the full
+    :class:`PredictiveDistribution` interface (`mean`, `variance`, `std`, `quantile`, `cdf_at`,
+    `crps`, `sample`) and can be discretized onto non-negative integers via :meth:`to_discrete`.
+
+    Why it is needed
+    ----------------
+    Allows using the same quantile-reconstruction math for continuous quantities (e.g. weight,
+    volume, energy load, revenue) as for discrete unit counts.
     """
 
     def __init__(
@@ -190,6 +260,7 @@ class ContinuousQuantileDistribution(PredictiveDistribution):
         self._knots_q = np.concatenate(([self.q_zero], self.values))
 
     def quantile(self, q: list | np.ndarray | float) -> np.ndarray:
+        """Evaluate the continuous quantile function ``Q(q)`` at probability level(s) ``q`` in ``[0, 1]``."""
         q_arr = np.atleast_1d(np.asarray(q, dtype=np.float64))
         if np.any((q_arr < 0.0) | (q_arr > 1.0)):
             raise ValueError("Quantiles must be between 0 and 1.")
@@ -203,6 +274,7 @@ class ContinuousQuantileDistribution(PredictiveDistribution):
         return out
 
     def cdf_at(self, x: list | np.ndarray | float) -> np.ndarray:
+        """Evaluate the continuous CDF ``F(x) = P(X <= x)`` at one or more values ``x``."""
         x_arr = np.atleast_1d(np.asarray(x, dtype=np.float64))
         cdf = np.interp(x_arr, self._knots_q, self._knots_tau, left=0.0, right=1.0)
         upper = x_arr > self.values[-1]
@@ -215,7 +287,11 @@ class ContinuousQuantileDistribution(PredictiveDistribution):
         return np.clip(cdf, 0.0, 1.0)
 
     def mean(self) -> float:
-        # Analytical piecewise-linear integral on [0, tau_K] + truncated exponential tail on [tau_K, 1 - tol]:
+        """
+        Analytical expected value ``E[X] = (1 / (1 - tol)) * int_0^{1-tol} Q(tau) d_tau``,
+        combining trapezoidal integration on ``[0, tau_{K-1}]`` with the closed-form integral
+        of the exponential tail on ``[tau_{K-1}, 1 - tol]``.
+        """
         dtau = np.diff(self._knots_tau)
         mid_q = 0.5 * (self._knots_q[:-1] + self._knots_q[1:])
         interior = float(np.dot(dtau, mid_q))
@@ -230,19 +306,22 @@ class ContinuousQuantileDistribution(PredictiveDistribution):
         return float(interior / tau_last)
 
     def variance(self) -> float:
+        """Numerical variance ``Var(X) = int_0^1 (Q(u) - E[X])^2 du`` over a 512-point grid."""
         u = np.linspace(0.5 * self.tol, 1.0 - self.tol, 512)
         q_vals = self.quantile(u)
         mu = float(np.mean(q_vals))
         return float(np.mean((q_vals - mu) ** 2))
 
     def crps(self, y: float | list | np.ndarray) -> float | np.ndarray:
+        """Evaluate CRPS against observation(s) ``y`` via :func:`quantile_crps`."""
         return quantile_crps(y, self.values, self.levels)
 
     def sample(self, size: int = 1, rng: np.random.Generator | int | None = None) -> np.ndarray:
+        """Draw ``size`` continuous random samples via inverse-CDF sampling ``Q(U)``."""
         gen = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
         u = gen.uniform(0.0, 1.0 - self.tol, size=size)
         return self.quantile(u)
 
     def to_discrete(self, max_support: int | None = None) -> DiscreteDistribution:
-        """Discretizes this continuous quantile distribution onto non-negative integers."""
+        """Discretize this continuous quantile distribution onto non-negative integers."""
         return quantiles_to_distribution(self.levels, np.maximum(self.values, 0.0), tol=self.tol, max_support=max_support)
