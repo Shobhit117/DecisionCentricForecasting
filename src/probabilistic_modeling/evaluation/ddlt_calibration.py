@@ -113,8 +113,12 @@ def _ddlt_calibration_kernel(
     y_mean = np.empty(n)
     crps = np.empty(n)
     sq_err = np.empty(n)
+    u_mean = np.empty(n)
+    u_sq = np.empty(n)
     coverage = np.zeros((n, n_lv))
     pit_cov = np.zeros((n, n_lv))
+    under_diff = np.zeros((n, n_lv))
+    over_diff = np.zeros((n, n_lv))
     q_out = np.empty((n, n_lv))
     pit = np.zeros((n, n_bins))
     for i in prange(n):
@@ -136,6 +140,8 @@ def _ddlt_calibration_kernel(
         ym = 0.0
         cr = 0.0
         se = 0.0
+        um = 0.0
+        usq = 0.0
         for j in range(y.shape[1]):
             wj = w[i, j]
             if wj <= 0.0:
@@ -157,9 +163,15 @@ def _ddlt_calibration_kernel(
                     c += p[k]
                 f_lo = min(c, 1.0)
                 f_hi = min(c + p[iy], 1.0)
+            um += wj * 0.5 * (f_lo + f_hi)
+            usq += wj * (f_lo * f_lo + f_lo * f_hi + f_hi * f_hi) / 3.0
             for a in range(n_lv):
-                if yy <= q_out[i, a]:
+                qa = q_out[i, a]
+                if yy <= qa:
                     coverage[i, a] += wj
+                    over_diff[i, a] += wj * (qa - yy)
+                else:
+                    under_diff[i, a] += wj * (yy - qa)
                 pit_cov[i, a] += wj * _pit_cdf(levels[a], f_lo, f_hi)
             prev = 0.0
             for b in range(n_bins):
@@ -172,7 +184,9 @@ def _ddlt_calibration_kernel(
         y_mean[i] = ym
         crps[i] = cr
         sq_err[i] = se
-    return mean, var, y_mean, crps, sq_err, coverage, pit_cov, q_out, pit
+        u_mean[i] = um
+        u_sq[i] = usq
+    return mean, var, y_mean, crps, sq_err, u_mean, u_sq, coverage, pit_cov, under_diff, over_diff, q_out, pit
 
 
 @dataclass
@@ -341,7 +355,21 @@ def evaluate_ddlt_calibration(
     np.cumsum([len(p) for p in pmf_list], out=offsets[1:])
     pmf_flat = np.ascontiguousarray(np.concatenate(pmf_list), dtype=np.float64)
 
-    mean, var, y_mean, crps, sq_err, coverage, pit_cov, q_out, pit = _ddlt_calibration_kernel(
+    (
+        mean,
+        var,
+        y_mean,
+        crps,
+        sq_err,
+        u_mean,
+        u_sq,
+        coverage,
+        pit_cov,
+        under_diff,
+        over_diff,
+        q_out,
+        pit,
+    ) = _ddlt_calibration_kernel(
         pmf_flat, offsets, mins, np.ascontiguousarray(y), np.ascontiguousarray(w_mat), levels_arr, int(n_pit_bins)
     )
 
@@ -353,35 +381,73 @@ def evaluate_ddlt_calibration(
     row_df["crps"] = crps
     row_df["sq_err"] = sq_err
     row_df["pred_var"] = var
+    row_df["pit_u_mean"] = u_mean
+    row_df["pit_u_sq"] = u_sq
     for a, lv in enumerate(levels_arr):
         row_df[f"cov_{lv:g}"] = coverage[:, a]
         row_df[f"pitcov_{lv:g}"] = pit_cov[:, a]
+        row_df[f"under_{lv:g}"] = under_diff[:, a]
+        row_df[f"over_{lv:g}"] = over_diff[:, a]
         row_df[f"q_{lv:g}"] = q_out[:, a]
     pit_cols = [f"pit_{b}" for b in range(n_pit_bins)]
     row_df[pit_cols] = pit
 
     def summarize(sub: pd.DataFrame, label: str, keys: dict) -> tuple[dict, list[dict], list[dict]]:
+        n_sub = int(len(sub))
         mp, mr = float(sub["pred_mean"].mean()), float(sub["realized_mean"].mean())
         pit_mass = sub[pit_cols].mean().to_numpy()
+        density = pit_mass * n_pit_bins
+        pit_mae = float(np.mean(np.abs(density - 1.0)))
+        pit_rmse = float(np.sqrt(np.mean((density - 1.0) ** 2)))
+        cdf_emp = np.cumsum(pit_mass)
+        cdf_uni = np.arange(1, n_pit_bins + 1, dtype=np.float64) / n_pit_bins
+        pit_ks = float(np.max(np.abs(cdf_emp - cdf_uni)))
+        um_val = float(sub["pit_u_mean"].mean())
+        usq_val = float(sub["pit_u_sq"].mean())
+        pit_std = float(np.sqrt(max(usq_val - um_val * um_val, 0.0)))
         summ = {
             "group": label, **keys,
-            "n_rows": int(len(sub)),
+            "n_rows": n_sub,
             "mean_pred": mp,
             "mean_realized": mr,
             "bias_pct": 100.0 * (mp - mr) / mr if mr > 0 else np.nan,
             "crps": float(sub["crps"].mean()),
             "dispersion_ratio": float(sub["sq_err"].sum() / sub["pred_var"].sum()) if sub["pred_var"].sum() > 0 else np.nan,
+            "pit_mean": um_val,
+            "pit_std": pit_std,
+            "pit_mae": pit_mae,
+            "pit_rmse": pit_rmse,
+            "pit_ks": pit_ks,
             # mass in the top / bottom PIT bin relative to the calibrated 1 / n_bins
-            "pit_tail_upper": float(pit_mass[-1] * n_pit_bins),
-            "pit_tail_lower": float(pit_mass[0] * n_pit_bins),
+            "pit_tail_upper": float(density[-1]),
+            "pit_tail_lower": float(density[0]),
         }
+        actual_sum = float(sub["realized_mean"].sum())
         cov_rows = []
         for lv in levels_arr:
+            tau = float(lv)
             cv = float(sub[f"cov_{lv:g}"].mean())
             pcv = float(sub[f"pitcov_{lv:g}"].mean())
-            cov_rows.append({"group": label, **keys, "level": float(lv),
-                             "coverage": cv, "pit_coverage": pcv,
-                             "gap_pp": 100.0 * (pcv - lv), "n_rows": int(len(sub))})
+            pred_sum = float(sub[f"q_{lv:g}"].sum())
+            u_sum = float(sub[f"under_{lv:g}"].sum())
+            o_sum = float(sub[f"over_{lv:g}"].sum())
+            a_sum = u_sum + o_sum
+            pinball_sum = tau * u_sum + (1.0 - tau) * o_sum
+            cov_rows.append({
+                "group": label, **keys, "level": tau,
+                "coverage": cv, "pit_coverage": pcv,
+                "gap_pp": 100.0 * (pcv - tau), "n_rows": n_sub,
+                "actual": actual_sum,
+                "pred": pred_sum,
+                "under_diff": u_sum,
+                "over_diff": o_sum,
+                "abs_diff": a_sum,
+                "wmape": 100.0 * a_sum / actual_sum if actual_sum > 0 else np.nan,
+                "under_wmape": 100.0 * u_sum / actual_sum if actual_sum > 0 else np.nan,
+                "over_wmape": 100.0 * o_sum / actual_sum if actual_sum > 0 else np.nan,
+                "pinball_loss": pinball_sum / n_sub if n_sub > 0 else np.nan,
+                "pinball_wmape": 100.0 * 2.0 * pinball_sum / actual_sum if actual_sum > 0 else np.nan,
+            })
         pit_rows = [{"group": label, **keys, "bin": b, "lower": b / n_pit_bins, "upper": (b + 1) / n_pit_bins,
                      "mass": float(pit_mass[b]), "density": float(pit_mass[b] * n_pit_bins)}
                     for b in range(n_pit_bins)]

@@ -157,6 +157,23 @@ python scripts/run_m5_pipeline.py --model glm --stores CA_1 --target-policy quan
 | `ddlt_calibration_{summary,coverage,pit}*.csv` | DDLT calibration report (`--evaluate-ddlt`) |
 | `decision_benchmark*.csv`, `predictions_empirical_*_<STORE>.csv` | Model vs. baseline decision KPIs (`--baseline`) |
 
+### Multi-section M5 forecasting & PIT calibration benchmark (`run_m5_experiments.py`)
+
+Trains all 5 implemented models (`glm`, `glm_hurdle`, `catboost`, `empirical_trailing`, `empirical_seasonal`) across multiple 1-year training + 14-day test sections of the M5 dataset and evaluates:
+1. **Multi-quantile WMAPE & Pinball WMAPE** (`evaluate_quantile_wmape`) across all quantiles (`q0.05 .. q0.99` and `mean`) at individual horizons, pooled across horizons (`all_horizons`), and summed across the 14-day horizon (`horizon_sum`).
+2. **Probability Integral Transform (PIT) distributions** (`evaluate_forecast_pit` & `evaluate_ddlt_calibration`) at both the daily horizon level and the convolved DDLT level (`pit_mean`, `pit_std`, `pit_mae`, `pit_rmse`, `pit_ks`, decile histograms, and discrete-corrected PIT coverage).
+
+```bash
+# Run all 5 models across all 1-year sections (5 sections across 1,941 days) on store CA_1
+python scripts/run_m5_experiments.py --stores CA_1
+
+# Overlapping 6-month stride (step_days=180) across multiple stores
+python scripts/run_m5_experiments.py --stores CA_1 TX_1 WI_1 --train-days 365 --test-days 14 --step-days 180
+
+# Quick smoke run on 100 SKUs and 2 sections
+python scripts/run_m5_experiments.py --stores CA_1 --max-sections 2 --sample-skus 100
+```
+
 ---
 
 ## Repository layout

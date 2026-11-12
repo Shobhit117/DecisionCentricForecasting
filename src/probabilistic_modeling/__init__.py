@@ -55,6 +55,13 @@ _LAZY_EXPORTS: dict[str, str] = {
     # evaluation
     "evaluate_ddlt_calibration": "evaluation.ddlt_calibration",
     "DDLTCalibrationResult": "evaluation.ddlt_calibration",
+    "M5Section": "evaluation.forecast_evaluation",
+    "build_m5_sections": "evaluation.forecast_evaluation",
+    "populate_model_quantiles": "evaluation.forecast_evaluation",
+    "evaluate_quantile_wmape": "evaluation.forecast_evaluation",
+    "ForecastPITResult": "evaluation.forecast_evaluation",
+    "evaluate_forecast_pit": "evaluation.forecast_evaluation",
+    "compute_pit_uniformity_metrics": "evaluation.forecast_evaluation",
     # inventory
     "InventorySimulator": "inventory.simulation",
     "InventorySimulationResult": "inventory.simulation",

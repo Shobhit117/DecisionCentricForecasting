@@ -422,30 +422,81 @@ def train_single_glm(
         }
         return prod_model, count_summary if count_summary is not None else hurdle_summary
 
-    formula = f"{target_col} ~ {' + '.join(feature_cols)}"
-    if model_type == "nbinom":
-        model = smf.negativebinomial(formula=formula, data=train_df)
-    elif model_type == "poisson":
-        model = smf.poisson(formula=formula, data=train_df)
-    else:
+    if model_type not in ("nbinom", "poisson"):
         raise ValueError(
             f"Unsupported distribution: '{model_type}'. Supported options are "
             "'nbinom', 'poisson', 'hurdle_nbinom', 'hurdle_poisson'."
         )
 
-    if regularization_alpha is not None and regularization_alpha > 0.0:
-        result = model.fit_regularized(alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False)
-        summary = None
-    else:
-        result = model.fit(maxiter=100, disp=False)
-        summary = result.summary()
+    zero_coefs = {str(f): 0.0 for f in feature_cols}
+    if len(train_df) == 0 or float(train_df[target_col].max()) <= 0.0:
+        return {
+            "model_type": model_type,
+            "horizon": target_col,
+            "coefficients": {"Intercept": -20.0, **zero_coefs},
+            "alpha": None,
+        }, None
 
-    raw_params = {str(k): float(v) for k, v in result.params.to_dict().items()}
-    alpha_val = raw_params.pop("alpha", None)
+    active_features = [
+        f for f in feature_cols if f in train_df.columns and train_df[f].nunique(dropna=True) > 1
+    ]
+    if len(train_df) <= len(active_features) + 1:
+        active_features = []
+    formula = f"{target_col} ~ {' + '.join(active_features)}" if active_features else f"{target_col} ~ 1"
+
+    def _try_glm_fit(dist_name: str, f_str: str) -> tuple[dict[str, float] | None, float | None, Any]:
+        try:
+            mod = (
+                smf.negativebinomial(formula=f_str, data=train_df)
+                if dist_name == "nbinom"
+                else smf.poisson(formula=f_str, data=train_df)
+            )
+            if regularization_alpha is not None and regularization_alpha > 0.0:
+                res = mod.fit_regularized(
+                    alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
+                )
+                summ = None
+            else:
+                try:
+                    res = mod.fit(maxiter=100, disp=False)
+                    summ = res.summary()
+                except Exception:
+                    res = mod.fit(method="bfgs", maxiter=100, disp=False)
+                    summ = None
+            raw = {str(k): float(v) for k, v in res.params.to_dict().items()}
+            a_val = raw.pop("alpha", None)
+            if not all(np.isfinite(v) and abs(v) < 50.0 for v in raw.values()):
+                return None, None, None
+            if dist_name == "nbinom":
+                if a_val is None or not np.isfinite(a_val) or a_val <= 0.0 or a_val > 1e4:
+                    return None, None, None
+                return raw, float(a_val), summ
+            return raw, None, summ
+        except Exception:
+            return None, None, None
+
+    raw_params, alpha_val, summary = _try_glm_fit(model_type, formula)
+    if raw_params is None and active_features:
+        raw_params, alpha_val, summary = _try_glm_fit(model_type, f"{target_col} ~ 1")
+    if raw_params is None and model_type == "nbinom":
+        raw_params, alpha_val, summary = _try_glm_fit("poisson", formula)
+        if raw_params is None and active_features:
+            raw_params, alpha_val, summary = _try_glm_fit("poisson", f"{target_col} ~ 1")
+
+    if raw_params is None:
+        mu_bar = max(float(train_df[target_col].mean()), 1e-6)
+        coef_dict = {"Intercept": float(np.log(mu_bar)), **zero_coefs}
+        alpha_val = None
+    else:
+        coef_dict = {
+            "Intercept": float(raw_params.get("Intercept", 0.0)),
+            **{str(f): float(raw_params.get(f, 0.0)) for f in feature_cols},
+        }
+
     prod_model = {
         "model_type": model_type,
         "horizon": target_col,
-        "coefficients": raw_params,
+        "coefficients": coef_dict,
         "alpha": float(alpha_val) if alpha_val is not None and np.isfinite(alpha_val) else None,
     }
     return prod_model, summary
@@ -1091,6 +1142,16 @@ class GLMForecaster(ProbabilisticForecaster):
                 if isinstance(str_key, tuple) and len(str_key) == 1:
                     str_key = str_key[0]
                 row_models = str_model_dict_map.get(str_key)
+            if row_models is None and train_groups and train_groups[-1] in ("overdispersion", "positive_overdispersion"):
+                if isinstance(group_keys, tuple) and len(group_keys) >= 2:
+                    try:
+                        alt_flag = 1 - int(group_keys[-1])
+                        alt_key = (*group_keys[:-1], alt_flag)
+                        row_models = model_dict_map.get(alt_key)
+                        if row_models is None:
+                            row_models = str_model_dict_map.get(tuple(str(x) for x in alt_key))
+                    except (ValueError, TypeError):
+                        pass
             if row_models is None:
                 logger.warning("No trained GLM found for group %s; skipping %d rows", lookup_key, len(group_df))
                 continue

@@ -43,7 +43,11 @@ from probabilistic_modeling.ddlt import DEFAULT_SUPPORT_TOL, DDLTCalculator
 from probabilistic_modeling.distributions.discrete import DiscreteDistribution
 from probabilistic_modeling.distributions.quantile import DEFAULT_QUANTILES, validate_quantile_levels
 from probabilistic_modeling.models.catboost_quantile import quantile_col_name
-from probabilistic_modeling.models.forecasters import ProbabilisticForecaster, _apply_ddlt_across_groups
+from probabilistic_modeling.models.forecasters import (
+    ProbabilisticForecaster,
+    _apply_ddlt_across_groups,
+    compute_forecasting_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +211,8 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
             new_cols[f"{target}_mu"] = mu
 
         out = pd.concat([test_data.reset_index(drop=True), pd.DataFrame(new_cols)], axis=1)
+        if all(t in out.columns for t in self.target_cols_):
+            compute_forecasting_metrics(out, list(self.target_cols_), [f"{t}_mu" for t in self.target_cols_])
         logger.info(
             "Empirical %s baseline predicted %d rows x %d horizons in %.2fs",
             self.method, len(out), len(self.target_cols_), time.perf_counter() - t0,
