@@ -52,10 +52,10 @@ from probabilistic_modeling.ddlt import (
     _pmf_crps_scalar_numba,
     _pmf_quantile_scalar_numba,
     _pmf_quantiles_numba,
+    _quantiles_to_pmf_numba,
 )
 from probabilistic_modeling.distributions.quantile import (
     DEFAULT_QUANTILES,
-    _quantile_Row_pmf_numba,
     validate_quantile_levels,
 )
 from probabilistic_modeling.evaluation.ddlt_calibration import (
@@ -667,11 +667,12 @@ def _quantile_pit_kernel(
     q_levels: np.ndarray,
     levels: np.ndarray,
     n_bins: int,
+    tol: float,
 ):
     """
     Parallel Numba PIT evaluation kernel for quantile-regression forecasters
     (:class:`CatBoostQuantileForecaster` and :class:`EmpiricalQuantileForecaster`), converting
-    each row's quantile grid into a discrete PMF via :func:`_quantile_Row_pmf_numba`.
+    each row's quantile grid into a discrete PMF via :func:`_quantiles_to_pmf_numba`.
     """
     n = len(y)
     n_lv = len(levels)
@@ -690,9 +691,9 @@ def _quantile_pit_kernel(
         yy = y[i]
         if np.isnan(yy) or np.isnan(q_mat[i, 0]):
             continue
-        p = _quantile_Row_pmf_numba(q_levels, q_mat[i])
+        p, mn = _quantiles_to_pmf_numba(q_levels, q_mat[i], tol, -1)
         m_i, v_i, cr_i, se_i, um_i, usq_i = _eval_pmf_pit_point(
-            p, 0, yy, levels, n_bins, coverage[i], pit_cov[i], q_out[i], pit[i]
+            p, mn, yy, levels, n_bins, coverage[i], pit_cov[i], q_out[i], pit[i]
         )
         mean[i] = m_i
         var[i] = v_i
@@ -920,7 +921,7 @@ def evaluate_forecast_pit(
                 q_3d[:, h, k] = pred_df[quantile_col_name(t, float(q))].to_numpy(dtype=np.float64)
         q_flat = np.ascontiguousarray(q_3d.reshape(n_rows * n_horizons, len(q_arr)), dtype=np.float64)
         mean_f, var_f, crps_f, sq_f, um_f, usq_f, cov_f, pitcov_f, _, pit_f = _quantile_pit_kernel(
-            y_flat, q_flat, np.ascontiguousarray(q_arr, dtype=np.float64), levels_arr, n_bins
+            y_flat, q_flat, np.ascontiguousarray(q_arr, dtype=np.float64), levels_arr, n_bins, float(tol)
         )
 
     # Reshape back to (n_rows, n_horizons, ...)

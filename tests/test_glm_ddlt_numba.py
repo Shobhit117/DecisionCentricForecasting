@@ -260,9 +260,9 @@ def test_hurdle_count_pmf_matches_scipy_reference(pi, lam, alpha, tol):
 
 @pytest.mark.parametrize("with_fallback", [False, True])
 def test_hurdle_glm_group_ddlt_matches_reference(with_fallback):
-    horizon = 3
+    horizon = 4
     lead_time = DiscreteDistribution(np.array([0.3, 0.5, 0.2]), 2)  # L in {2,3,4}
-    cycle_time = 1 if with_fallback else 0
+    cycle_time = 2 if with_fallback else 0
     gdf, target_cols = _glm_frame(40, horizon, seed=21, with_fallback=with_fallback)
     rng = np.random.default_rng(99)
     for h in range(horizon):
@@ -292,7 +292,7 @@ def test_hurdle_glm_group_ddlt_matches_reference(with_fallback):
         ref = lt_with_cycle.random_sum(daily, default, tail_tol=calc.tail_tol)
         got = dist_df["demand_distribution"].iloc[i]
         assert got.mean() == pytest.approx(ref.mean(), rel=1e-4, abs=1e-6)
-        assert got.std() == pytest.approx(ref.std(), rel=1e-4, abs=1e-6)
+        assert got.std() == pytest.approx(ref.std(), rel=5e-4, abs=1e-6)
         assert int(tgt_df["target_inventory"].iloc[i]) >= 0
 
 

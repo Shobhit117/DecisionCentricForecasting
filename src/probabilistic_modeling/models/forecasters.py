@@ -21,15 +21,21 @@ Where it is used
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
 import logging
+import math
+import os
 from pathlib import Path
 import time
 from typing import Any, TYPE_CHECKING
 
+from numba import njit
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
+import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
 from probabilistic_modeling.ddlt import DDLTCalculator
@@ -206,6 +212,157 @@ def _hurdle_conditional_mean(lam: np.ndarray | float, alpha: float | None) -> np
     return float(cond_mu) if is_scalar else cond_mu
 
 
+@njit(nogil=True, cache=True)
+def _digamma_scalar(x: float) -> float:
+    """Fast scalar digamma function psi(x) = d/dx ln(Gamma(x)) for x > 0."""
+    res = 0.0
+    while x < 8.0:
+        res -= 1.0 / x
+        x += 1.0
+    inv_x = 1.0 / x
+    inv_x2 = inv_x * inv_x
+    res += math.log(x) - 0.5 * inv_x
+    res -= inv_x2 * (
+        (1.0 / 12.0)
+        - inv_x2 * (
+            (1.0 / 120.0)
+            - inv_x2 * ((1.0 / 252.0) - inv_x2 * ((1.0 / 240.0) - inv_x2 * (5.0 / 660.0)))
+        )
+    )
+    return res
+
+
+@njit(nogil=True, cache=True)
+def _ztp_nll_and_grad_eta(y: np.ndarray, eta: np.ndarray) -> tuple[float, np.ndarray]:
+    """
+    Analytical average negative log-likelihood and linear-predictor gradient for
+    Zero-Truncated Poisson (`Y | Y > 0`, `y >= 1`).
+    """
+    n = y.shape[0]
+    grad_eta = np.empty(n, dtype=np.float64)
+    nll = 0.0
+    inv_n = 1.0 / n
+    for i in range(n):
+        yi = y[i]
+        ei = eta[i]
+        if ei < -30.0:
+            ei = -30.0
+        elif ei > 30.0:
+            ei = 30.0
+        lam = math.exp(ei)
+        if lam < 1e-12:
+            log_pos = ei - 0.5 * lam
+            cond_mu = 1.0 + 0.5 * lam
+        else:
+            pos_mass = -math.expm1(-lam)
+            log_pos = math.log(pos_mass)
+            cond_mu = lam / pos_mass
+        ll_i = yi * ei - lam - math.lgamma(yi + 1.0) - log_pos
+        nll -= ll_i
+        grad_eta[i] = (cond_mu - yi) * inv_n
+    return nll * inv_n, grad_eta
+
+
+@njit(nogil=True, cache=True)
+def _ztnb2_nll_and_grad_eta(
+    y: np.ndarray, eta: np.ndarray, log_alpha: float
+) -> tuple[float, np.ndarray, float]:
+    """
+    Analytical average negative log-likelihood and gradients w.r.t. linear predictor `eta`
+    and `log_alpha = ln(alpha)` for Zero-Truncated Negative Binomial NB2 (`Y | Y > 0`, `y >= 1`).
+    """
+    n = y.shape[0]
+    grad_eta = np.empty(n, dtype=np.float64)
+    if log_alpha < -15.0:
+        log_alpha = -15.0
+    elif log_alpha > 10.0:
+        log_alpha = 10.0
+    alpha = math.exp(log_alpha)
+    r = math.exp(-log_alpha)
+    lgamma_r = math.lgamma(r)
+    digamma_r = _digamma_scalar(r)
+    r_log_r = -r * log_alpha
+
+    nll = 0.0
+    grad_tau = 0.0
+    inv_n = 1.0 / n
+
+    for i in range(n):
+        yi = y[i]
+        ei = eta[i]
+        if ei < -30.0:
+            ei = -30.0
+        elif ei > 30.0:
+            ei = 30.0
+        lam = math.exp(ei)
+        u = alpha * lam
+        denom = 1.0 + u
+        log1p_u = math.log1p(u)
+        log_p0 = -r * log1p_u
+
+        if log_p0 > -1e-12:
+            pos_mass = max(-log_p0, 1e-15)
+            log_pos = math.log(pos_mass)
+            p0_over_pos = (1.0 + log_p0) / pos_mass
+            cond_mu = 1.0 + 0.5 * (1.0 + alpha) * lam
+        else:
+            pos_mass = -math.expm1(log_p0)
+            log_pos = math.log(pos_mass)
+            p0 = math.exp(log_p0)
+            p0_over_pos = p0 / pos_mass
+            cond_mu = lam / pos_mass
+
+        ll_i = (
+            math.lgamma(yi + r)
+            - lgamma_r
+            - math.lgamma(yi + 1.0)
+            + r_log_r
+            + yi * ei
+            - (yi + r) * math.log(r + lam)
+            - log_pos
+        )
+        nll -= ll_i
+        grad_eta[i] = ((cond_mu - yi) / denom) * inv_n
+
+        d_logp0_dr = -log1p_u + (u / denom)
+        d_ll_dr = (
+            _digamma_scalar(yi + r)
+            - digamma_r
+            - log1p_u
+            + (lam - yi) / (r + lam)
+            + p0_over_pos * d_logp0_dr
+        )
+        # Since r = exp(-log_alpha), dr / d(log_alpha) = -r, so d(-ll_i)/d(log_alpha) = r * d_ll_dr
+        grad_tau += (r * d_ll_dr) * inv_n
+
+    return nll * inv_n, grad_eta, grad_tau
+
+
+def _build_design_matrix(df: pd.DataFrame, feature_cols: list[str]) -> tuple[np.ndarray, list[str]]:
+    """
+    Constructs a contiguous `float64` design matrix `X` with column 0 = `1.0` (`Intercept`)
+    followed by all non-constant active columns in `feature_cols`, bypassing Patsy formula parsing.
+    """
+    n_rows = len(df)
+    present = [f for f in feature_cols if f in df.columns]
+    if not present or n_rows <= 2:
+        return np.ones((n_rows, 1), dtype=np.float64), []
+
+    raw_X = df[present].to_numpy(dtype=np.float64, copy=False)
+    col_min = np.nanmin(raw_X, axis=0)
+    col_max = np.nanmax(raw_X, axis=0)
+    keep_mask = np.isfinite(col_min) & np.isfinite(col_max) & (col_max > col_min)
+    active_idx = np.flatnonzero(keep_mask)
+    if len(active_idx) == 0 or n_rows <= len(active_idx) + 1:
+        return np.ones((n_rows, 1), dtype=np.float64), []
+
+    active_features = [present[i] for i in active_idx]
+    X = np.empty((n_rows, 1 + len(active_idx)), dtype=np.float64)
+    X[:, 0] = 1.0
+    X[:, 1:] = raw_X[:, active_idx]
+    return X, active_features
+
+
 def _fit_hurdle_binary_stage(
     train_df: pd.DataFrame,
     feature_cols: list[str],
@@ -214,7 +371,7 @@ def _fit_hurdle_binary_stage(
     l1_wt: float = 0.0,
 ) -> tuple[dict[str, float], Any]:
     """
-    Fits the binary hurdle stage `P(Y > 0 | X)` using a logistic regression GLM (`smf.logit`),
+    Fits the binary hurdle stage `P(Y > 0 | X)` using a logistic regression GLM (`sm.Logit`),
     with graceful fallback when a group's target is all-zero, all-positive, or exhibits
     perfect separation / constant covariates.
     """
@@ -222,24 +379,21 @@ def _fit_hurdle_binary_stage(
     if len(train_df) == 0:
         return {"Intercept": -30.0, **zero_coefs}, None
 
-    is_pos = (train_df[target_col] > 0).astype(int)
-    n_pos = int(is_pos.sum())
+    y_bin = (train_df[target_col].to_numpy(dtype=np.float64, copy=False) > 0.0).astype(np.float64)
+    n_pos = int(y_bin.sum())
     if n_pos == 0:
         return {"Intercept": -30.0, **zero_coefs}, None
     if n_pos == len(train_df):
         return {"Intercept": 30.0, **zero_coefs}, None
 
-    active_features = [
-        f for f in feature_cols if f in train_df.columns and train_df[f].nunique(dropna=True) > 1
-    ]
-    work_df = train_df[active_features].copy() if active_features else pd.DataFrame(index=train_df.index)
-    work_df["_hurdle_y"] = is_pos.to_numpy()
-    formula = f"_hurdle_y ~ {' + '.join(active_features)}" if active_features else "_hurdle_y ~ 1"
+    X, active_features = _build_design_matrix(train_df, feature_cols)
+    col_names = ["Intercept", *active_features]
+    want_summary = logger.isEnabledFor(logging.DEBUG)
 
     summary = None
     params_dict: dict[str, float] | None = None
     try:
-        logit_model = smf.logit(formula=formula, data=work_df)
+        logit_model = sm.Logit(y_bin, X)
         if regularization_alpha is not None and regularization_alpha > 0.0:
             res = logit_model.fit_regularized(
                 alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
@@ -247,22 +401,26 @@ def _fit_hurdle_binary_stage(
         else:
             try:
                 res = logit_model.fit(maxiter=100, disp=False)
-                summary = res.summary()
+                if want_summary:
+                    summary = res.summary()
             except Exception:
-                res = logit_model.fit(method="bfgs", maxiter=100, disp=False)
-        cand = {str(k): float(v) for k, v in res.params.to_dict().items()}
-        if all(np.isfinite(v) and abs(v) < 50.0 for v in cand.values()):
-            params_dict = cand
+                res = logit_model.fit(method="lbfgs", maxiter=100, disp=False)
+        raw_vals = np.asarray(res.params, dtype=np.float64)
+        if np.all(np.isfinite(raw_vals) & (np.abs(raw_vals) < 50.0)):
+            params_dict = {col_names[i]: float(raw_vals[i]) for i in range(len(col_names))}
         else:
             res_reg = logit_model.fit_regularized(alpha=1e-4, L1_wt=0.0, maxiter=100, disp=False)
-            cand_reg = {str(k): float(v) for k, v in res_reg.params.to_dict().items()}
-            if all(np.isfinite(v) for v in cand_reg.values()):
-                params_dict = {k: float(np.clip(v, -30.0, 30.0)) for k, v in cand_reg.items()}
+            reg_vals = np.asarray(res_reg.params, dtype=np.float64)
+            if np.all(np.isfinite(reg_vals)):
+                params_dict = {
+                    col_names[i]: float(np.clip(reg_vals[i], -30.0, 30.0))
+                    for i in range(len(col_names))
+                }
     except Exception:
         params_dict = None
 
     if params_dict is None:
-        p_bar = float(np.clip(is_pos.mean(), 1e-6, 1.0 - 1e-6))
+        p_bar = float(np.clip(y_bin.mean(), 1e-6, 1.0 - 1e-6))
         return {"Intercept": float(np.log(p_bar / (1.0 - p_bar))), **zero_coefs}, None
 
     hurdle_params = {
@@ -270,6 +428,81 @@ def _fit_hurdle_binary_stage(
         **{str(f): float(params_dict.get(f, 0.0)) for f in feature_cols},
     }
     return hurdle_params, summary
+
+
+def _fit_ztp_fast(
+    y: np.ndarray,
+    X: np.ndarray,
+    reg_alpha: float = 0.0,
+    l1_wt: float = 0.0,
+) -> np.ndarray | None:
+    """Fits Zero-Truncated Poisson via L-BFGS-B using compiled analytical gradients."""
+    k = X.shape[1]
+    mu0 = max(float(y.mean()) - 1.0, 0.1)
+    beta0 = np.zeros(k, dtype=np.float64)
+    beta0[0] = math.log(mu0)
+    l2_pen = float(reg_alpha) * (1.0 - float(l1_wt)) if reg_alpha > 0.0 else 0.0
+
+    def _obj(beta: np.ndarray) -> tuple[float, np.ndarray]:
+        eta = X @ beta
+        nll, grad_eta = _ztp_nll_and_grad_eta(y, eta)
+        grad_beta = X.T @ grad_eta
+        if l2_pen > 0.0:
+            nll += 0.5 * l2_pen * float(np.dot(beta[1:], beta[1:]))
+            grad_beta[1:] += l2_pen * beta[1:]
+        return float(nll), grad_beta
+
+    bounds = [(-30.0, 30.0)] * k
+    res = minimize(_obj, beta0, method="L-BFGS-B", jac=True, bounds=bounds, options={"maxiter": 150, "ftol": 1e-9})
+    if res.x is not None and np.all(np.isfinite(res.x)) and np.all(np.abs(res.x) < 50.0):
+        return res.x
+    return None
+
+
+def _fit_ztnb2_fast(
+    y: np.ndarray,
+    X: np.ndarray,
+    reg_alpha: float = 0.0,
+    l1_wt: float = 0.0,
+    init_beta: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, float | None]:
+    """Fits Zero-Truncated Negative Binomial (NB2) via L-BFGS-B using compiled analytical gradients."""
+    k = X.shape[1]
+    y_mean = float(y.mean())
+    y_var = float(y.var()) if len(y) > 1 else y_mean
+    alpha0 = max((y_var - y_mean) / max(y_mean * y_mean, 1e-2), 0.1)
+    alpha0 = float(np.clip(alpha0, 1e-3, 50.0))
+
+    theta0 = np.zeros(k + 1, dtype=np.float64)
+    if init_beta is not None and len(init_beta) == k:
+        theta0[:k] = np.clip(init_beta, -25.0, 25.0)
+    else:
+        theta0[0] = math.log(max(y_mean - 1.0, 0.1))
+    theta0[k] = math.log(alpha0)
+    l2_pen = float(reg_alpha) * (1.0 - float(l1_wt)) if reg_alpha > 0.0 else 0.0
+
+    def _obj(theta: np.ndarray) -> tuple[float, np.ndarray]:
+        beta = theta[:k]
+        log_alpha = float(theta[k])
+        eta = X @ beta
+        nll, grad_eta, grad_tau = _ztnb2_nll_and_grad_eta(y, eta, log_alpha)
+        grad = np.empty(k + 1, dtype=np.float64)
+        grad[:k] = X.T @ grad_eta
+        grad[k] = grad_tau
+        if l2_pen > 0.0:
+            nll += 0.5 * l2_pen * float(np.dot(beta[1:], beta[1:]))
+            grad[1:k] += l2_pen * beta[1:]
+        return float(nll), grad
+
+    bounds = [*([(-30.0, 30.0)] * k), (-11.5, 9.2)]
+    res = minimize(_obj, theta0, method="L-BFGS-B", jac=True, bounds=bounds, options={"maxiter": 200, "ftol": 1e-9})
+    if res.x is None or not np.all(np.isfinite(res.x)):
+        return None, None
+    beta_hat = res.x[:k]
+    alpha_hat = float(math.exp(float(res.x[k])))
+    if not np.all(np.abs(beta_hat) < 50.0) or not (1e-5 < alpha_hat < 1e4):
+        return None, None
+    return beta_hat, alpha_hat
 
 
 def _fit_hurdle_count_stage(
@@ -282,76 +515,81 @@ def _fit_hurdle_count_stage(
 ) -> tuple[dict[str, float], float | None, Any]:
     """
     Fits the zero-truncated count stage `P(Y = k | Y > 0, X)` (`k >= 1`) on positive rows
-    using `TruncatedLFNegativeBinomialP` (`base_type="nbinom"`) or `TruncatedLFPoisson`
-    (`base_type="poisson"`), with automatic fallback if positive observations are all `1`
-    or if Newton optimization encounters a singular Hessian on sparse subsets.
+    using compiled Numba analytical gradients + L-BFGS-B (`_fit_ztnb2_fast` for `base_type="nbinom"`
+    or `_fit_ztp_fast` for `base_type="poisson"`), with automatic fallback if positive observations
+    are all `1` or if optimization encounters degenerate subsets.
     """
-    from statsmodels.discrete.truncated_model import TruncatedLFNegativeBinomialP, TruncatedLFPoisson
-
     zero_coefs = {str(f): 0.0 for f in feature_cols}
-    pos_df = train_df[train_df[target_col] > 0]
-    if len(pos_df) == 0 or float(pos_df[target_col].max()) <= 1.0:
+    y_all = train_df[target_col].to_numpy(dtype=np.float64, copy=False)
+    pos_mask = y_all > 0.0
+    n_pos = int(pos_mask.sum())
+    if n_pos == 0:
+        return {"Intercept": -20.0, **zero_coefs}, None, None
+    y_pos = np.ascontiguousarray(y_all[pos_mask], dtype=np.float64)
+    if float(y_pos.max()) <= 1.0:
         return {"Intercept": -20.0, **zero_coefs}, None, None
 
-    active_features = [
-        f for f in feature_cols if f in pos_df.columns and pos_df[f].nunique(dropna=True) > 1
-    ]
-    if len(pos_df) <= len(active_features) + 1:
-        active_features = []
-    formula = f"{target_col} ~ {' + '.join(active_features)}" if active_features else f"{target_col} ~ 1"
+    pos_df = train_df.loc[pos_mask]
+    X, active_features = _build_design_matrix(pos_df, feature_cols)
+    col_names = ["Intercept", *active_features]
+    reg_a = float(regularization_alpha) if regularization_alpha is not None and regularization_alpha > 0.0 else 0.0
 
-    def _try_truncated_fit(dist_cls, f_str: str) -> tuple[dict[str, float] | None, float | None, Any]:
+    # If L1 penalty is requested, use statsmodels fit_regularized on (y_pos, X)
+    if reg_a > 0.0 and float(l1_wt) > 0.0:
+        from statsmodels.discrete.truncated_model import TruncatedLFNegativeBinomialP, TruncatedLFPoisson
+
         try:
-            mod = dist_cls.from_formula(f_str, data=pos_df)
-            if regularization_alpha is not None and regularization_alpha > 0.0:
-                res = mod.fit_regularized(
-                    alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
-                )
-                summ = None
-            else:
-                try:
-                    res = mod.fit(maxiter=100, disp=False)
-                    summ = res.summary()
-                except Exception:
-                    res = mod.fit(method="bfgs", maxiter=100, disp=False)
-                    summ = None
-            raw = {str(k): float(v) for k, v in res.params.to_dict().items()}
-            a_val = raw.pop("alpha", None)
-            if not all(np.isfinite(v) and abs(v) < 50.0 for v in raw.values()):
-                return None, None, None
-            if dist_cls is TruncatedLFNegativeBinomialP:
-                if a_val is None or not np.isfinite(a_val) or a_val <= 0.0 or a_val > 1e4:
-                    return None, None, None
-                return raw, float(a_val), summ
-            return raw, None, summ
+            dist_cls = TruncatedLFNegativeBinomialP if base_type == "nbinom" else TruncatedLFPoisson
+            mod = dist_cls(y_pos, X)
+            res = mod.fit_regularized(alpha=reg_a, L1_wt=float(l1_wt), maxiter=100, disp=False)
+            params_arr = np.asarray(res.params, dtype=np.float64)
+            if np.all(np.isfinite(params_arr)):
+                beta_arr = params_arr[: len(col_names)]
+                a_val = float(params_arr[-1]) if base_type == "nbinom" else None
+                raw_params = {col_names[i]: float(beta_arr[i]) for i in range(len(col_names))}
+                count_params = {
+                    "Intercept": float(raw_params.get("Intercept", 0.0)),
+                    **{str(f): float(raw_params.get(f, 0.0)) for f in feature_cols},
+                }
+                if a_val is not None and (not np.isfinite(a_val) or a_val <= 0.0 or a_val > 1e4):
+                    a_val = None
+                return count_params, a_val, None
         except Exception:
-            return None, None, None
+            pass
 
-    raw_params: dict[str, float] | None = None
+    ztp_beta = _fit_ztp_fast(y_pos, X, reg_alpha=reg_a, l1_wt=l1_wt)
+    beta_hat: np.ndarray | None = None
     alpha_val: float | None = None
-    summary = None
 
     if base_type == "nbinom":
-        raw_params, alpha_val, summary = _try_truncated_fit(TruncatedLFNegativeBinomialP, formula)
-        if raw_params is None and active_features:
-            raw_params, alpha_val, summary = _try_truncated_fit(
-                TruncatedLFNegativeBinomialP, f"{target_col} ~ 1"
-            )
+        beta_hat, alpha_val = _fit_ztnb2_fast(
+            y_pos, X, reg_alpha=reg_a, l1_wt=l1_wt, init_beta=ztp_beta
+        )
+        if beta_hat is None and active_features:
+            X_int = np.ones((n_pos, 1), dtype=np.float64)
+            b_int, a_int = _fit_ztnb2_fast(y_pos, X_int, reg_alpha=reg_a, l1_wt=l1_wt)
+            if b_int is not None:
+                return {"Intercept": float(b_int[0]), **zero_coefs}, a_int, None
 
-    if raw_params is None:
-        raw_params, alpha_val, summary = _try_truncated_fit(TruncatedLFPoisson, formula)
-        if raw_params is None and active_features:
-            raw_params, alpha_val, summary = _try_truncated_fit(TruncatedLFPoisson, f"{target_col} ~ 1")
+    if beta_hat is None:
+        beta_hat = ztp_beta
+        alpha_val = None
+        if beta_hat is None and active_features:
+            X_int = np.ones((n_pos, 1), dtype=np.float64)
+            b_int = _fit_ztp_fast(y_pos, X_int, reg_alpha=reg_a, l1_wt=l1_wt)
+            if b_int is not None:
+                return {"Intercept": float(b_int[0]), **zero_coefs}, None, None
 
-    if raw_params is None:
-        mu_pos = max(float(pos_df[target_col].mean()) - 1.0, 1e-4)
+    if beta_hat is None:
+        mu_pos = max(float(y_pos.mean()) - 1.0, 1e-4)
         return {"Intercept": float(np.log(mu_pos)), **zero_coefs}, None, None
 
+    raw_params = {col_names[i]: float(beta_hat[i]) for i in range(len(col_names))}
     count_params = {
         "Intercept": float(raw_params.get("Intercept", 0.0)),
         **{str(f): float(raw_params.get(f, 0.0)) for f in feature_cols},
     }
-    return count_params, alpha_val, summary
+    return count_params, alpha_val, None
 
 
 def train_single_glm(
@@ -371,15 +609,15 @@ def train_single_glm(
     ------------
     1. Filters `df` to training rows (`is_test == 0`) where `target_col` is not `NaN`.
     2. **Standard GLM (`hurdle=False`, `model_type in ("nbinom", "poisson")`)**:
-       Builds the Statsmodels formula `target_col ~ feature_1 + feature_2 + ...` and
-       instantiates either `smf.negativebinomial` (`model_type="nbinom"`) or `smf.poisson`
-       (`model_type="poisson"`), fitting via MLE or penalized likelihood.
+       Builds the numeric design matrix `X` (`Intercept` + active features) directly and fits
+       either `sm.NegativeBinomial` (`model_type="nbinom"`) or `sm.Poisson`
+       (`model_type="poisson"`), via MLE or penalized likelihood.
     3. **Zero-Hurdle GLM (`hurdle=True` or `model_type in ("hurdle_nbinom", "hurdle_poisson")`)**:
        Fits a two-part hurdle model:
-       - *Binary hurdle stage*: logistic regression (`smf.logit`) on `1{target_col > 0}`
+       - *Binary hurdle stage*: logistic regression (`sm.Logit`) on `1{target_col > 0}`
          across all training rows, producing `"hurdle_coefficients"`.
-       - *Zero-truncated count stage*: `TruncatedLFNegativeBinomialP` (`"hurdle_nbinom"`)
-         or `TruncatedLFPoisson` (`"hurdle_poisson"`) fitted strictly on positive training
+       - *Zero-truncated count stage*: Zero-Truncated NB2 (`"hurdle_nbinom"`)
+         or Zero-Truncated Poisson (`"hurdle_poisson"`) fitted strictly on positive training
          rows (`target_col > 0`), producing `"coefficients"` and `"alpha"`.
     4. Separates the Negative Binomial dispersion parameter `"alpha"` from the regression
        `"coefficients"` dictionary so `"coefficients"` strictly maps `"Intercept"` and
@@ -429,7 +667,7 @@ def train_single_glm(
         )
 
     zero_coefs = {str(f): 0.0 for f in feature_cols}
-    if len(train_df) == 0 or float(train_df[target_col].max()) <= 0.0:
+    if len(train_df) == 0:
         return {
             "model_type": model_type,
             "horizon": target_col,
@@ -437,20 +675,24 @@ def train_single_glm(
             "alpha": None,
         }, None
 
-    active_features = [
-        f for f in feature_cols if f in train_df.columns and train_df[f].nunique(dropna=True) > 1
-    ]
-    if len(train_df) <= len(active_features) + 1:
-        active_features = []
-    formula = f"{target_col} ~ {' + '.join(active_features)}" if active_features else f"{target_col} ~ 1"
+    y_vec = train_df[target_col].to_numpy(dtype=np.float64, copy=False)
+    if float(y_vec.max()) <= 0.0:
+        return {
+            "model_type": model_type,
+            "horizon": target_col,
+            "coefficients": {"Intercept": -20.0, **zero_coefs},
+            "alpha": None,
+        }, None
 
-    def _try_glm_fit(dist_name: str, f_str: str) -> tuple[dict[str, float] | None, float | None, Any]:
+    X, active_features = _build_design_matrix(train_df, feature_cols)
+    col_names = ["Intercept", *active_features]
+    want_summary = logger.isEnabledFor(logging.DEBUG)
+
+    def _try_glm_fit(
+        dist_name: str, exog: np.ndarray, exog_names: list[str]
+    ) -> tuple[dict[str, float] | None, float | None, Any]:
         try:
-            mod = (
-                smf.negativebinomial(formula=f_str, data=train_df)
-                if dist_name == "nbinom"
-                else smf.poisson(formula=f_str, data=train_df)
-            )
+            mod = sm.NegativeBinomial(y_vec, exog) if dist_name == "nbinom" else sm.Poisson(y_vec, exog)
             if regularization_alpha is not None and regularization_alpha > 0.0:
                 res = mod.fit_regularized(
                     alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
@@ -459,15 +701,18 @@ def train_single_glm(
             else:
                 try:
                     res = mod.fit(maxiter=100, disp=False)
-                    summ = res.summary()
+                    summ = res.summary() if want_summary else None
                 except Exception:
                     res = mod.fit(method="bfgs", maxiter=100, disp=False)
                     summ = None
-            raw = {str(k): float(v) for k, v in res.params.to_dict().items()}
-            a_val = raw.pop("alpha", None)
-            if not all(np.isfinite(v) and abs(v) < 50.0 for v in raw.values()):
+            params_arr = np.asarray(res.params, dtype=np.float64)
+            k_cols = len(exog_names)
+            beta_arr = params_arr[:k_cols]
+            if not np.all(np.isfinite(beta_arr) & (np.abs(beta_arr) < 50.0)):
                 return None, None, None
+            raw = {exog_names[i]: float(beta_arr[i]) for i in range(k_cols)}
             if dist_name == "nbinom":
+                a_val = float(params_arr[k_cols]) if len(params_arr) > k_cols else None
                 if a_val is None or not np.isfinite(a_val) or a_val <= 0.0 or a_val > 1e4:
                     return None, None, None
                 return raw, float(a_val), summ
@@ -475,16 +720,18 @@ def train_single_glm(
         except Exception:
             return None, None, None
 
-    raw_params, alpha_val, summary = _try_glm_fit(model_type, formula)
+    raw_params, alpha_val, summary = _try_glm_fit(model_type, X, col_names)
     if raw_params is None and active_features:
-        raw_params, alpha_val, summary = _try_glm_fit(model_type, f"{target_col} ~ 1")
+        X_int = np.ones((len(train_df), 1), dtype=np.float64)
+        raw_params, alpha_val, summary = _try_glm_fit(model_type, X_int, ["Intercept"])
     if raw_params is None and model_type == "nbinom":
-        raw_params, alpha_val, summary = _try_glm_fit("poisson", formula)
+        raw_params, alpha_val, summary = _try_glm_fit("poisson", X, col_names)
         if raw_params is None and active_features:
-            raw_params, alpha_val, summary = _try_glm_fit("poisson", f"{target_col} ~ 1")
+            X_int = np.ones((len(train_df), 1), dtype=np.float64)
+            raw_params, alpha_val, summary = _try_glm_fit("poisson", X_int, ["Intercept"])
 
     if raw_params is None:
-        mu_bar = max(float(train_df[target_col].mean()), 1e-6)
+        mu_bar = max(float(y_vec.mean()), 1e-6)
         coef_dict = {"Intercept": float(np.log(mu_bar)), **zero_coefs}
         alpha_val = None
     else:
@@ -942,6 +1189,7 @@ class GLMForecaster(ProbabilisticForecaster):
         l1_wt: float = 0.0,
         restrict_future_leads: bool = False,
         hurdle: bool = False,
+        n_jobs: int = -1,
     ):
         super().__init__()
         self.train_groups = list(train_groups) if train_groups is not None else []
@@ -949,8 +1197,19 @@ class GLMForecaster(ProbabilisticForecaster):
         self.l1_wt = l1_wt
         self.restrict_future_leads = restrict_future_leads
         self.hurdle = bool(hurdle)
+        self.n_jobs = int(n_jobs)
         self.model_data: pd.DataFrame | None = None
         self.model: GLMModel | None = None
+
+    def _resolve_n_jobs(self, n_tasks: int) -> int:
+        if n_tasks <= 1 or self.n_jobs == 1:
+            return 1
+        cpu_cnt = os.cpu_count() or 1
+        if self.n_jobs <= 0:
+            workers = max(1, cpu_cnt + 1 + self.n_jobs) if self.n_jobs < -1 else cpu_cnt
+        else:
+            workers = self.n_jobs
+        return max(1, min(workers, n_tasks))
 
     def fit(self, ts: "DiscreteTimeSeries") -> pd.DataFrame:
         """
@@ -982,74 +1241,88 @@ class GLMForecaster(ProbabilisticForecaster):
             partition_cols.append(dispersion_col)
 
         train_df = ts.df[ts.df["is_test"] == 0] if ts.test_start_period is not None else ts.df
-        n_groups = train_df[partition_cols].drop_duplicates().shape[0]
+        groups_list = list(train_df.groupby(partition_cols, observed=True))
+        n_groups = len(groups_list)
+        n_horizons = len(ts.target_cols)
+        n_tasks = n_groups * n_horizons
+        workers = self._resolve_n_jobs(n_tasks)
         logger.info(
-            "Starting %sGLM training across %d group(s) and %d horizon(s) (%d training rows)...",
+            "Starting %sGLM training across %d group(s) and %d horizon(s) (%d training rows, %d worker(s))...",
             "Hurdle " if self.hurdle else "",
             n_groups,
-            len(ts.target_cols),
+            n_horizons,
             len(train_df),
+            workers,
         )
 
         horizon_feature_cols = {
             target: ts.get_features_for_horizon(target, restrict_future_leads=self.restrict_future_leads)
             for target in ts.target_cols
         }
+        disp_idx = partition_cols.index(dispersion_col)
 
-        def _train_group(group_df: pd.DataFrame) -> pd.Series:
-            group_name = getattr(group_df, "name", "unknown")
-            if isinstance(group_name, tuple):
-                idx = partition_cols.index(dispersion_col)
-                is_overdispersed = group_name[idx]
-            else:
-                is_overdispersed = group_name
-
+        tasks: list[tuple[int, tuple[Any, ...], pd.DataFrame, int, str, str]] = []
+        group_rows: list[dict[str, Any]] = []
+        for g_idx, (group_name, group_df) in enumerate(groups_list):
+            g_tuple = group_name if isinstance(group_name, tuple) else (group_name,)
+            is_overdispersed = g_tuple[disp_idx]
             if self.hurdle:
                 model_type = "hurdle_nbinom" if is_overdispersed == 1 else "hurdle_poisson"
             else:
                 model_type = "nbinom" if is_overdispersed == 1 else "poisson"
-            group_result = {}
-            n_horizons = len(ts.target_cols)
+            group_rows.append(dict(zip(partition_cols, g_tuple)))
             for h_idx, target in enumerate(ts.target_cols, start=1):
-                h_t0 = time.perf_counter()
-                h_features = horizon_feature_cols[target]
-                logger.info(
-                    "Training %s GLM for group %s, horizon [%d/%d] (%s)...",
-                    model_type,
-                    group_name,
-                    h_idx,
-                    n_horizons,
-                    target,
-                )
-                model_dict, summary = train_single_glm(
-                    group_df,
-                    h_features,
-                    target,
-                    model_type,
-                    regularization_alpha=self.regularization_alpha,
-                    l1_wt=self.l1_wt,
-                    hurdle=self.hurdle,
-                )
-                group_result[target] = model_dict
-                if summary is not None:
-                    logger.debug("%s", summary)
-                logger.info(
-                    "Completed %s GLM for group %s, %s in %.2fs",
-                    model_type,
-                    group_name,
-                    target,
-                    time.perf_counter() - h_t0,
-                )
-            return pd.Series(group_result)
+                tasks.append((g_idx, g_tuple, group_df, h_idx, target, model_type))
 
-        try:
-            result_df = train_df.groupby(partition_cols, observed=True).apply(_train_group, include_groups=False).reset_index()
-        except TypeError:
-            result_df = train_df.groupby(partition_cols, observed=True).apply(_train_group).reset_index()
+        def _fit_one_task(
+            task: tuple[int, tuple[Any, ...], pd.DataFrame, int, str, str]
+        ) -> tuple[int, str, dict[str, Any]]:
+            g_idx, g_tuple, g_df, h_idx, target, model_type = task
+            h_t0 = time.perf_counter()
+            h_features = horizon_feature_cols[target]
+            display_group = g_tuple[0] if len(g_tuple) == 1 else g_tuple
+            logger.debug(
+                "Training %s GLM for group %s, horizon [%d/%d] (%s)...",
+                model_type,
+                display_group,
+                h_idx,
+                n_horizons,
+                target,
+            )
+            model_dict, summary = train_single_glm(
+                g_df,
+                h_features,
+                target,
+                model_type,
+                regularization_alpha=self.regularization_alpha,
+                l1_wt=self.l1_wt,
+                hurdle=self.hurdle,
+            )
+            if summary is not None:
+                logger.debug("%s", summary)
+            logger.debug(
+                "Completed %s GLM for group %s, %s in %.2fs",
+                model_type,
+                display_group,
+                target,
+                time.perf_counter() - h_t0,
+            )
+            return g_idx, target, model_dict
+
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                task_outputs = list(pool.map(_fit_one_task, tasks))
+        else:
+            task_outputs = [_fit_one_task(t) for t in tasks]
+
+        for g_idx, target, model_dict in task_outputs:
+            group_rows[g_idx][target] = model_dict
+
+        result_df = pd.DataFrame(group_rows)
         self.model_data = result_df
         self.model = GLMModel.from_dataframe(result_df, target_cols=list(ts.target_cols), feature_cols=list(ts.feature_cols))
         self.model.horizon_feature_cols = horizon_feature_cols
-        logger.info("Finished GLM training in %.2fs", time.perf_counter() - t0)
+        logger.info("Finished %sGLM training in %.2fs", "Hurdle " if self.hurdle else "", time.perf_counter() - t0)
         return result_df
 
     def predict(

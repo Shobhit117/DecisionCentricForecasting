@@ -38,11 +38,17 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 import time
 import warnings
 
 import numpy as np
 import pandas as pd
+
+try:  # allow running from the repository root without `pip install -e .`
+    import probabilistic_modeling  # noqa: F401
+except ImportError:  # pragma: no cover
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from probabilistic_modeling import (
     CatBoostQuantileForecaster,
@@ -83,63 +89,47 @@ def build_section_time_series(
     """
     Construct the panel :class:`DiscreteTimeSeries` for a single ``(store, section)`` window.
 
-    Uses the exact same temporal lags, rolling windows, calendar features, and horizon-shifted
-    snap/event covariates as ``scripts/run_m5_pipeline.py``.
+    Uses the exact same temporal lags, rolling windows, calendar features, and external
+    price/event covariates as ``scripts/run_m5_pipeline.py``.
     """
+    ts_id_cols = [
+        c
+        for c in ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"]
+        if c in sales_slice.columns
+    ]
+    unique_days = np.sort(sales_slice["day"].unique())
+    num_test_days = int((unique_days >= section.test_start_day).sum())
+
     ts = DiscreteTimeSeries(
-        df=sales_slice.copy(),
-        ts_id_cols=["item_id", "dept_id", "cat_id", "store_id", "state_id"],
+        df=sales_slice,
+        ts_id_cols=ts_id_cols,
         period_col="day",
         var_col="demand",
+        num_future_targets=horizon,
+        num_test_days=num_test_days,
+        include_std_dev=for_catboost,
+        use_one_hot_encoding=not for_catboost,
+        downsample_zeros_frac=downsample_zeros_frac,
+        fit_historical_distributions=True,
     )
+    ts.add_calendar_features(calendar_slice, "wday")
+    ts.add_feature(prices_slice, "sell_price", join_on=["store_id", "item_id"])
 
-    ts.add_lag_features(lags=[1, 2, 3, 7, 14])
-    ts.add_rolling_features(windows=[7, 28], functions=["mean", "std"])
-    ts.add_expanding_features(functions=["mean"])
-    ts.add_zero_Streak_feature()
-    ts.add_intermittency_features(windows=[7, 28])
-
-    if for_catboost:
-        ts.add_calendar_features(
-            calendar_slice,
-            ["event_type_1", "wday", "month", "snap_CA", "snap_TX", "snap_WI"],
-            ohe_cols=[],
+    event_col = (
+        "event_type"
+        if "event_type" in calendar_slice.columns
+        else ("event_type_1" if "event_type_1" in calendar_slice.columns else None)
+    )
+    if event_col is not None:
+        ts.add_feature(
+            calendar_slice.fillna({event_col: "no_event"}),
+            event_col,
+            join_on=[],
+            is_cat_feature=True,
+            default_value="no_event",
         )
-    else:
-        ts.add_calendar_features(
-            calendar_slice,
-            ["event_type_1", "wday", "month", "snap_CA", "snap_TX", "snap_WI"],
-            ohe_cols=["event_type_1"],
-            drop_First=True,
-        )
-        ts.add_cyclical_features("wday", period=7, drop_original=True)
-        ts.add_cyclical_features("month", period=12, drop_original=True)
-
-    ts.add_feature(prices_slice, "sell_price", ["state_id", "store_id", "item_id", "day"])
-    ts.add_price_momentum_features(price_col="sell_price", windows=[7, 28])
-    ts.create_targets(horizon=horizon)
-
-    snap_event_cols = [
-        c
-        for c in ts.feature_cols
-        if c.startswith("snap_") or c.startswith("event_type_1")
-    ]
-    if snap_event_cols:
-        ts.shift_features_to_target_horizons(snap_event_cols, horizon=horizon)
-
-    if for_catboost:
-        for col in ["item_id", "dept_id", "cat_id", "store_id", "state_id"]:
-            if col not in ts.feature_cols:
-                ts.feature_cols.append(col)
-        ts.cat_feature_cols = [
-            c
-            for c in ["item_id", "dept_id", "cat_id", "store_id", "state_id", "event_type_1", "wday", "month"]
-            if c in ts.feature_cols
-        ]
-        for col in ts.cat_feature_cols:
-            ts.df[col] = ts.df[col].astype(str)
-
-    ts.split_train_test(test_start_period=section.test_start_day, downsample_zeros_frac=downsample_zeros_frac)
+    if for_catboost and "month" in calendar_slice.columns:
+        ts.add_feature(calendar_slice, "month", join_on=[])
     return ts
 
 
@@ -148,7 +138,7 @@ def build_default_lead_time_map() -> dict[tuple[str, str], DiscreteDistribution]
     stores = ["CA_1", "CA_2", "CA_3", "CA_4", "TX_1", "TX_2", "TX_3", "WI_1", "WI_2", "WI_3"]
     categories = ["FOODS", "HOBBIES", "HOUSEHOLD"]
     return {
-        (s, c): DiscreteDistribution(1, 3, 1, np.array([0.2, 0.5, 0.3]))
+        (s, c): DiscreteDistribution(np.array([0.2, 0.5, 0.3]), 1, 1)
         for s in stores
         for c in categories
     }
@@ -156,7 +146,7 @@ def build_default_lead_time_map() -> dict[tuple[str, str], DiscreteDistribution]
 
 def aggregate_quantile_wmape_across_sections(
     wmape_df: pd.DataFrame,
-    group_Filter: str = "overall",
+    group_filter: str = "overall",
     extra_group_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     """
@@ -168,7 +158,7 @@ def aggregate_quantile_wmape_across_sections(
     - **Section-level distribution metrics**: ``wmape_section_mean`` and ``wmape_section_std``
       across sections.
     """
-    sub = wmape_df[wmape_df["group"] == group_Filter].copy()
+    sub = wmape_df[wmape_df["group"] == group_filter].copy()
     if extra_group_cols:
         sub = wmape_df[wmape_df["group"] != "overall"].copy()
     if sub.empty:
@@ -434,6 +424,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of boosting trees for CatBoostQuantileForecaster (default: 500).",
     )
     parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=-1,
+        help="Number of parallel CPU workers for GLM/CatBoost training (default: -1, all cores).",
+    )
+    parser.add_argument(
         "--trailing-window",
         type=int,
         default=56,
@@ -473,8 +469,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="data/processed",
-        help="Directory containing processed M5 parquet files (default: data/processed).",
+        default="data/m5-forecasting-accuracy/partitioned_data",
+        help="Directory containing processed M5 parquet files (default: data/m5-forecasting-accuracy/partitioned_data).",
     )
     parser.add_argument(
         "--output-dir",
@@ -525,6 +521,7 @@ def main() -> None:
 
     calendar_df = pd.read_parquet(data_dir / "calendar.parquet")
     prices_df = pd.read_parquet(data_dir / "price.parquet")
+    prices_df["sell_price"] = np.log1p(prices_df["sell_price"])
     lead_time_map = build_default_lead_time_map()
 
     manifest_rows: list[dict] = []
@@ -604,14 +601,17 @@ def main() -> None:
                 }
             )
 
-            day_mask = (sales_df["day"] >= sec.train_start_day) & (sales_df["day"] <= sec.test_end_day)
+            # Include horizon-1 lookahead days after test_end_day so all test decision days
+            # have complete realized targets target_t_plus_0..target_t_plus_{H-1} and DDLT windows.
+            slice_end_day = min(max_day, sec.test_end_day + args.horizon - 1)
+            day_mask = (sales_df["day"] >= sec.train_start_day) & (sales_df["day"] <= slice_end_day)
             sales_slice = sales_df.loc[day_mask].reset_index(drop=True)
             cal_slice = calendar_df[
-                (calendar_df["day"] >= sec.train_start_day) & (calendar_df["day"] <= sec.test_end_day)
+                (calendar_df["day"] >= sec.train_start_day) & (calendar_df["day"] <= slice_end_day)
             ].reset_index(drop=True)
             price_slice = store_prices_df[
                 (store_prices_df["day"] >= sec.train_start_day)
-                & (store_prices_df["day"] <= sec.test_end_day)
+                & (store_prices_df["day"] <= slice_end_day)
             ].reset_index(drop=True)
 
             ts_glm: DiscreteTimeSeries | None = None
@@ -651,7 +651,11 @@ def main() -> None:
                     time.perf_counter() - fe_t0,
                 )
 
-            eval_period = [sec.test_start_day] if args.pred_first_day else None
+            eval_period = (
+                [sec.test_start_day]
+                if args.pred_first_day
+                else list(range(sec.test_start_day, sec.test_end_day + 1))
+            )
 
             for model_name in models_to_run:
                 m_t0 = time.perf_counter()
@@ -659,22 +663,29 @@ def main() -> None:
 
                 if model_name == "glm":
                     assert ts_glm is not None
-                    forecaster = GLMForecaster(train_groups=["store_id", "cat_id"], hurdle=False)
+                    forecaster = GLMForecaster(
+                        train_groups=["store_id", "cat_id"], hurdle=False, n_jobs=args.n_jobs
+                    )
                     forecaster.fit(ts_glm)
                     active_ts = ts_glm
                 elif model_name == "glm_hurdle":
                     assert ts_glm is not None
-                    forecaster = GLMForecaster(train_groups=["store_id", "cat_id"], hurdle=True)
+                    forecaster = GLMForecaster(
+                        train_groups=["store_id", "cat_id"], hurdle=True, n_jobs=args.n_jobs
+                    )
                     forecaster.fit(ts_glm)
                     active_ts = ts_glm
                 elif model_name == "catboost":
                     assert ts_cb is not None
                     forecaster = CatBoostQuantileForecaster(
                         quantiles=quantiles,
-                        iterations=args.catboost_iterations,
-                        learning_rate=0.08,
-                        depth=6,
-                        verbose=0,
+                        catboost_params={
+                            "iterations": args.catboost_iterations,
+                            "learning_rate": 0.08,
+                            "depth": 6,
+                            "thread_count": args.n_jobs,
+                            "verbose": False,
+                        },
                     )
                     forecaster.fit(ts_cb)
                     active_ts = ts_cb
@@ -751,6 +762,7 @@ def main() -> None:
                         cycle_time=1,
                         return_distribution=True,
                         pred_first_day=args.pred_first_day,
+                        period=eval_period,
                     )
                     ddlt_cal = evaluate_ddlt_calibration(
                         ddlt_df=ddlt_dist_df,
@@ -809,11 +821,11 @@ def main() -> None:
     wmape_by_sec_df = pd.concat(wmape_sec_frames, ignore_index=True)
     wmape_by_sec_df.to_csv(output_dir / "quantile_wmape_by_section.csv", index=False)
 
-    wmape_summary_df = aggregate_quantile_wmape_across_sections(wmape_by_sec_df, group_Filter="overall")
+    wmape_summary_df = aggregate_quantile_wmape_across_sections(wmape_by_sec_df, group_filter="overall")
     wmape_summary_df.to_csv(output_dir / "quantile_wmape_summary.csv", index=False)
 
     wmape_by_cat_df = aggregate_quantile_wmape_across_sections(
-        wmape_by_sec_df, group_Filter="cat", extra_group_cols=["cat_id"]
+        wmape_by_sec_df, group_filter="cat", extra_group_cols=["cat_id"]
     )
     wmape_by_cat_df.to_csv(output_dir / "quantile_wmape_by_cat.csv", index=False)
 

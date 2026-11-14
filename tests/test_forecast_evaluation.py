@@ -189,7 +189,7 @@ def test_ddlt_calibration_includes_pit_uniformity_and_quantile_wmape():
     lam = 4.0
     pmf = poisson.pmf(np.arange(35), lam)
     pmf /= pmf.sum()
-    dist = DiscreteDistribution(0, len(pmf) - 1, 1, pmf)
+    dist = DiscreteDistribution(pmf, 0, 1)
 
     n_skus, n_days = 40, 20
     history = pd.DataFrame(
@@ -201,7 +201,7 @@ def test_ddlt_calibration_includes_pit_uniformity_and_quantile_wmape():
     )
     ddlt_df = history[history["day"] <= n_days - 2][["item_id", "day"]].copy()
     ddlt_df["demand_distribution"] = [dist] * len(ddlt_df)
-    lt = DiscreteDistribution(0, 0, 1, np.array([1.0]))
+    lt = DiscreteDistribution(np.array([1.0]), 0, 1)
 
     res = evaluate_ddlt_calibration(
         ddlt_df,
