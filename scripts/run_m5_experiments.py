@@ -77,6 +77,48 @@ ALL_MODELS = (
 )
 
 
+def load_enriched_calendar(data_dir: Path) -> pd.DataFrame:
+    """
+    Loads ``calendar.parquet`` and enriches it with ``date``, ``event_type_2``, and
+    state-level ``snap_CA`` / ``snap_TX`` / ``snap_WI`` columns from ``calendar.csv``
+    if they were not yet saved into ``calendar.parquet``.
+    """
+    cal_parquet = data_dir / "calendar.parquet"
+    cal_df = pd.read_parquet(cal_parquet)
+    needed_cols = {"date", "snap_CA", "snap_TX", "snap_WI", "event_type_2"}
+    if not needed_cols.issubset(cal_df.columns):
+        raw_csv = data_dir.parent / "calendar.csv"
+        if raw_csv.exists():
+            raw_cal = pd.read_csv(raw_csv)
+            raw_cal["day"] = raw_cal["d"].str.split("_").str[1].astype(np.int64)
+            add_cols = [c for c in needed_cols if c in raw_cal.columns and c not in cal_df.columns]
+            if add_cols:
+                cal_df = pd.merge(cal_df, raw_cal[["day", *add_cols]], on="day", how="left")
+                cal_df.to_parquet(cal_parquet, index=False)
+
+    event_col = (
+        "event_type"
+        if "event_type" in cal_df.columns
+        else ("event_type_1" if "event_type_1" in cal_df.columns else None)
+    )
+    is_ev1 = (
+        cal_df[event_col].notna() & (cal_df[event_col].astype(str) != "no_event") & (cal_df[event_col].astype(str) != "nan")
+        if event_col is not None
+        else pd.Series(False, index=cal_df.index)
+    )
+    is_ev2 = (
+        cal_df["event_type_2"].notna()
+        & (cal_df["event_type_2"].astype(str) != "no_event")
+        & (cal_df["event_type_2"].astype(str) != "nan")
+        if "event_type_2" in cal_df.columns
+        else pd.Series(False, index=cal_df.index)
+    )
+    cal_df["is_event"] = (is_ev1 | is_ev2).astype(int)
+    if "date" in cal_df.columns:
+        cal_df["day_of_month"] = pd.to_datetime(cal_df["date"]).dt.day.astype(int)
+    return cal_df
+
+
 def build_section_time_series(
     sales_slice: pd.DataFrame,
     calendar_slice: pd.DataFrame,
@@ -89,8 +131,20 @@ def build_section_time_series(
     """
     Construct the panel :class:`DiscreteTimeSeries` for a single ``(store, section)`` window.
 
-    Uses the exact same temporal lags, rolling windows, calendar features, and external
-    price/event covariates as ``scripts/run_m5_pipeline.py``.
+    Model-Specific Feature Engineering
+    ----------------------------------
+    - **Both models**:
+      - Lag and rolling demand statistics, plus zero-frequency (`zero_freq_7`, `zero_freq_28`)
+        and recency (`log_days_since_last_sale`) for intermittency / hurdle modeling.
+      - Target-day (`t + h`) aligned `sell_price` plus within-SKU relative price deviation
+        `sell_price_rel_28` (`sell_price - rolling_mean_28(sell_price)`).
+      - Target-day (`t + h`) aligned binary `is_event` and state-specific `snap` indicator.
+    - **GLM (`for_catboost=False`)**:
+      - Compact, low-collinearity feature set (`lags=(1, 7, 14)`, binary `is_event` instead
+        of sparse multi-category `event_type` dummies that cause separation in zero-truncated fits).
+    - **CatBoost (`for_catboost=True`)**:
+      - Extended lags (`(1, 7, 14, 28)`), rolling standard deviations (`rolling_std_7`, `rolling_std_28`),
+        explicit momentum (`trend_7_vs_28`), target-day categorical `event_type`, `month`, and `day_of_month`.
     """
     ts_id_cols = [
         c
@@ -100,36 +154,87 @@ def build_section_time_series(
     unique_days = np.sort(sales_slice["day"].unique())
     num_test_days = int((unique_days >= section.test_start_day).sum())
 
+    lags = (1, 7, 14, 28) if for_catboost else (1, 7, 14)
     ts = DiscreteTimeSeries(
         df=sales_slice,
         ts_id_cols=ts_id_cols,
         period_col="day",
         var_col="demand",
+        lags=lags,
+        rolling_windows=(7, 28),
         num_future_targets=horizon,
         num_test_days=num_test_days,
         include_std_dev=for_catboost,
+        include_zero_freq=True,
+        include_trend_features=for_catboost,
         use_one_hot_encoding=not for_catboost,
         downsample_zeros_frac=downsample_zeros_frac,
         fit_historical_distributions=True,
     )
     ts.add_calendar_features(calendar_slice, "wday")
-    ts.add_feature(prices_slice, "sell_price", join_on=["store_id", "item_id"])
-
-    event_col = (
-        "event_type"
-        if "event_type" in calendar_slice.columns
-        else ("event_type_1" if "event_type_1" in calendar_slice.columns else None)
+    ts.add_feature(
+        prices_slice,
+        "sell_price",
+        join_on=["store_id", "item_id"],
+        default_value=0.0,
+        relative_rolling_windows=(28,),
+        align_to_target_horizon=True,
     )
-    if event_col is not None:
+
+    cal_work = calendar_slice.copy()
+    if "is_event" in cal_work.columns:
         ts.add_feature(
-            calendar_slice.fillna({event_col: "no_event"}),
-            event_col,
+            cal_work,
+            "is_event",
             join_on=[],
-            is_cat_feature=True,
-            default_value="no_event",
+            is_cat_feature=False,
+            default_value=0,
+            align_to_target_horizon=True,
         )
-    if for_catboost and "month" in calendar_slice.columns:
-        ts.add_feature(calendar_slice, "month", join_on=[])
+
+    # Attach state-specific SNAP indicator (snap_CA, snap_TX, or snap_WI) aligned to target day t+h:
+    state_prefix = None
+    if "state_id" in sales_slice.columns and len(sales_slice) > 0:
+        state_prefix = str(sales_slice["state_id"].iloc[0])
+    elif "store_id" in sales_slice.columns and len(sales_slice) > 0:
+        state_prefix = str(sales_slice["store_id"].iloc[0]).split("_")[0]
+    snap_col = f"snap_{state_prefix}" if state_prefix else None
+    if snap_col and snap_col in cal_work.columns:
+        cal_work["snap"] = cal_work[snap_col].fillna(0).astype(int)
+        ts.add_feature(
+            cal_work,
+            "snap",
+            join_on=[],
+            is_cat_feature=False,
+            default_value=0,
+            align_to_target_horizon=True,
+        )
+
+    if for_catboost:
+        event_col = (
+            "event_type"
+            if "event_type" in cal_work.columns
+            else ("event_type_1" if "event_type_1" in cal_work.columns else None)
+        )
+        if event_col is not None:
+            ts.add_feature(
+                cal_work.fillna({event_col: "no_event"}),
+                event_col,
+                join_on=[],
+                is_cat_feature=True,
+                default_value="no_event",
+                align_to_target_horizon=True,
+            )
+        if "month" in cal_work.columns:
+            ts.add_feature(cal_work, "month", join_on=[], default_value=1)
+        if "day_of_month" in cal_work.columns:
+            ts.add_feature(
+                cal_work,
+                "day_of_month",
+                join_on=[],
+                default_value=15,
+                align_to_target_horizon=True,
+            )
     return ts
 
 
@@ -519,7 +624,7 @@ def main() -> None:
     logger.info("  Output directory   : %s", output_dir)
     logger.info("=====================================================================")
 
-    calendar_df = pd.read_parquet(data_dir / "calendar.parquet")
+    calendar_df = load_enriched_calendar(data_dir)
     prices_df = pd.read_parquet(data_dir / "price.parquet")
     prices_df["sell_price"] = np.log1p(prices_df["sell_price"])
     lead_time_map = build_default_lead_time_map()

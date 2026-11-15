@@ -151,15 +151,19 @@ def load_calendar_and_prices(m5_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame]:
 
     calendar_lazy = pl.scan_csv(path_to_calendar).select(
         pl.col('d').str.split('_').list.get(1).cast(pl.Int64).alias('day'),
+        pl.col('date'),
         pl.col('event_name_1').alias('event_name'),
         pl.col('event_type_1').alias('event_type'),
+        pl.col('event_name_2'),
+        pl.col('event_type_2'),
+        pl.col('snap_CA', 'snap_TX', 'snap_WI'),
         pl.col('wday', 'month', 'year', 'wm_yr_wk'),
     )
 
     prices_lazy = pl.scan_csv(path_to_sell_prices)
     prices_with_calendar = (
         prices_lazy
-        .join(calendar_lazy, on='wm_yr_wk', how='inner')
+        .join(calendar_lazy.select(['day', 'wday', 'month', 'year', 'wm_yr_wk']), on='wm_yr_wk', how='inner')
         .drop('wm_yr_wk')
     )
     return (

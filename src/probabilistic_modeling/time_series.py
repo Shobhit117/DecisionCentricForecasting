@@ -119,8 +119,9 @@ class ExternalFeatureSpec:
     What it does
     ------------
     Records the arguments passed to `DiscreteTimeSeries.add_feature` (`feature_name`,
-    `join_on`, `is_cat_feature`, `default_value`, `lags`, `rolling_windows`) so external
-    covariates (such as prices, promotions, or SNAP indicators) can be merged and lagged
+    `join_on`, `is_cat_feature`, `default_value`, `lags`, `rolling_windows`,
+    `relative_rolling_windows`, `align_to_target_horizon`) so external covariates
+    (such as prices, promotions, or SNAP indicators) can be merged and lagged
     identically at inference time.
 
     Where it is used
@@ -134,6 +135,8 @@ class ExternalFeatureSpec:
     default_value: Any = None
     lags: list[int] | None = None
     rolling_windows: list[int] | None = None
+    relative_rolling_windows: list[int] | None = None
+    align_to_target_horizon: bool = False
 
 
 @dataclass
@@ -147,11 +150,12 @@ class TimeSeriesFeatureSpec:
     Captures every hyperparameter and column list produced during training panel construction:
     - Series identifier, period, and target variable column names (`ts_id_cols`, `period_col`, `var_col`),
     - Lag and rolling window configurations (`lags`, `rolling_windows`, `include_std_dev`,
-      `apply_log_transformation`),
+      `include_zero_freq`, `include_trend_features`, `apply_log_transformation`),
     - Series-level metadata flags (`use_best_fit_feature`, `use_one_hot_encoding`, `trim_leading_zeros`),
     - Ordered history of `add_calendar_features` (`calendar_specs`) and `add_feature` (`external_specs`) calls,
-    - Exact resulting `feature_cols`, `categorical_feature_cols`, `target_cols`, and
-      `future_lead_horizon_map` (mapping future-known lead features to their lead offset `h`).
+    - Exact resulting `feature_cols`, `categorical_feature_cols`, `target_cols`,
+      `future_lead_horizon_map` (mapping future-known lead features to their lead offset `h`),
+      and `target_horizon_map` (mapping target-day aligned features strictly to horizon `h`).
 
     Why it is needed
     ----------------
@@ -178,6 +182,8 @@ class TimeSeriesFeatureSpec:
     rolling_windows: list[int] = field(default_factory=lambda: [7, 28])
     num_future_targets: int = 7
     include_std_dev: bool = False
+    include_zero_freq: bool = False
+    include_trend_features: bool = False
     apply_log_transformation: bool = True
     use_best_fit_feature: bool = False
     use_one_hot_encoding: bool = True
@@ -188,6 +194,7 @@ class TimeSeriesFeatureSpec:
     categorical_feature_cols: list[str] = field(default_factory=list)
     target_cols: list[str] = field(default_factory=list)
     future_lead_horizon_map: dict[str, int] = field(default_factory=dict)
+    target_horizon_map: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Converts this specification into a JSON-serializable dictionary (replacing `NaN` defaults with `None`)."""
@@ -218,6 +225,8 @@ class TimeSeriesFeatureSpec:
             rolling_windows=[int(x) for x in data.get("rolling_windows", [7, 28])],
             num_future_targets=int(data.get("num_future_targets", 7)),
             include_std_dev=bool(data.get("include_std_dev", False)),
+            include_zero_freq=bool(data.get("include_zero_freq", False)),
+            include_trend_features=bool(data.get("include_trend_features", False)),
             apply_log_transformation=bool(data.get("apply_log_transformation", True)),
             use_best_fit_feature=bool(data.get("use_best_fit_feature", False)),
             use_one_hot_encoding=bool(data.get("use_one_hot_encoding", True)),
@@ -228,6 +237,7 @@ class TimeSeriesFeatureSpec:
             categorical_feature_cols=list(data.get("categorical_feature_cols", [])),
             target_cols=list(data.get("target_cols", [])),
             future_lead_horizon_map={str(k): int(v) for k, v in data.get("future_lead_horizon_map", {}).items()},
+            target_horizon_map={str(k): int(v) for k, v in data.get("target_horizon_map", {}).items()},
         )
 
     def save(self, path: str | Path) -> None:
@@ -254,32 +264,56 @@ class TimeSeriesFeatureSpec:
 
         What it does
         ------------
-        Filters `self.feature_cols` to exclude any columns in `exclude_cols`. When
-        `restrict_future_leads=True`, also excludes any future-known lead covariate
-        (created via negative lags `-k`, representing period `t + k`) whose future offset
-        `k` exceeds the target horizon `h`.
-
-        Why it is needed
-        ----------------
-        When future-known covariates (such as future day-of-week or scheduled promotions at
-        `t + 1, ..., t + H - 1`) are added to the panel, a model for horizon `target_t_plus_h`
-        may optionally be restricted (`restrict_future_leads=True`) so it only conditions on
-        covariates up to period `t + h` rather than covariates after `t + h`.
-
-        Where it is used
-        ----------------
-        - `DiscreteTimeSeries.get_features_for_horizon`
-        - `GLMForecaster.fit` and `CatBoostQuantileForecaster.fit` in `models/forecasters.py`
+        Filters `self.feature_cols` to exclude any columns in `exclude_cols`.
+        - For columns registered in `self.target_horizon_map` (via `align_to_target_horizon=True`),
+          includes the column if and only if its target offset equals `h`.
+        - When `restrict_future_leads=True`, also excludes any future-known lead covariate
+          in `self.future_lead_horizon_map` whose future offset `k` exceeds `h`.
         """
         excl = exclude_cols or set()
-        if not restrict_future_leads or not self.future_lead_horizon_map:
+        if not self.target_horizon_map and (not restrict_future_leads or not self.future_lead_horizon_map):
             return [c for c in self.feature_cols if c not in excl]
         h = int(target_col.rsplit("_", 1)[-1])
-        return [
-            c
-            for c in self.feature_cols
-            if c not in excl and self.future_lead_horizon_map.get(c, 0) <= h
-        ]
+        out: list[str] = []
+        for c in self.feature_cols:
+            if c in excl:
+                continue
+            if self.target_horizon_map and c in self.target_horizon_map:
+                if self.target_horizon_map[c] != h:
+                    continue
+            elif restrict_future_leads and self.future_lead_horizon_map:
+                if self.future_lead_horizon_map.get(c, 0) > h:
+                    continue
+            out.append(c)
+        return out
+
+    def get_cat_features_for_horizon(
+        self,
+        target_col: str,
+        restrict_future_leads: bool = False,
+        exclude_cols: set[str] | None = None,
+        extra_cat_cols: list[str] | None = None,
+    ) -> list[str]:
+        """
+        Returns the categorical feature list for a specific forecast horizon `target_t_plus_<h>`.
+        """
+        excl = exclude_cols or set()
+        base_cats = list(dict.fromkeys(list(self.categorical_feature_cols) + list(extra_cat_cols or [])))
+        if not self.target_horizon_map and (not restrict_future_leads or not self.future_lead_horizon_map):
+            return [c for c in base_cats if c not in excl]
+        h = int(target_col.rsplit("_", 1)[-1])
+        out: list[str] = []
+        for c in base_cats:
+            if c in excl:
+                continue
+            if self.target_horizon_map and c in self.target_horizon_map:
+                if self.target_horizon_map[c] != h:
+                    continue
+            elif restrict_future_leads and self.future_lead_horizon_map:
+                if self.future_lead_horizon_map.get(c, 0) > h:
+                    continue
+            out.append(c)
+        return out
 
     def transform(
         self,
@@ -293,25 +327,6 @@ class TimeSeriesFeatureSpec:
         """
         Reconstructs the engineered feature panel on a new `sales_df` using this specification
         and pre-fitted `series_metadata` (without re-estimating training distributions).
-
-        What it does
-        ------------
-        1. Instantiates a `DiscreteTimeSeries` with `fit_historical_distributions=False`,
-           `downsample_zeros_frac=None`, and `pretrained_series_metadata=series_metadata`.
-        2. Replays every `CalendarFeatureSpec` in `self.calendar_specs`.
-        3. Replays every `ExternalFeatureSpec` in `self.external_specs` (matching each
-           feature from `external_features` or `calendar_df`).
-        4. Guarantees schema alignment with training: any expected numerical column (e.g.,
-           a one-hot dummy category that did not appear in the new inference slice) is added
-           with value `0`, and any expected categorical column is ensured to have `"category"`
-           dtype.
-        5. Returns either the full engineered panel (`period="all"`) or the requested
-           inference slice via `ts_new.get_inference_data(period=period)`.
-
-        Where it is used
-        ----------------
-        - `DiscreteTimeSeries.transform`
-        - `ProbabilisticForecaster.transform` and `ProbabilisticForecaster.predict_from_raw`
         """
         ts_new = DiscreteTimeSeries(
             sales_df,
@@ -325,6 +340,8 @@ class TimeSeriesFeatureSpec:
             num_future_targets=self.num_future_targets,
             num_test_days=num_test_days,
             include_std_dev=self.include_std_dev,
+            include_zero_freq=self.include_zero_freq,
+            include_trend_features=self.include_trend_features,
             use_best_fit_feature=self.use_best_fit_feature,
             use_one_hot_encoding=self.use_one_hot_encoding,
             downsample_zeros_frac=None,
@@ -359,6 +376,12 @@ class TimeSeriesFeatureSpec:
                     default_value=ext_spec.default_value,
                     lags=tuple(ext_spec.lags) if ext_spec.lags is not None else None,
                     rolling_windows=tuple(ext_spec.rolling_windows) if ext_spec.rolling_windows is not None else None,
+                    relative_rolling_windows=(
+                        tuple(ext_spec.relative_rolling_windows)
+                        if ext_spec.relative_rolling_windows is not None
+                        else None
+                    ),
+                    align_to_target_horizon=bool(ext_spec.align_to_target_horizon),
                 )
         # Ensure all expected training feature columns exist (e.g. missing one-hot dummy levels filled with 0):
         for col in self.feature_cols:
@@ -371,6 +394,7 @@ class TimeSeriesFeatureSpec:
                 ts_new.df[col] = ts_new.df[col].astype("category")
         ts_new.feature_cols = list(self.feature_cols)
         ts_new.categorical_feature_cols = list(self.categorical_feature_cols)
+        ts_new.target_horizon_map = dict(self.target_horizon_map)
 
         if period == "all":
             return ts_new.df.copy()
@@ -514,6 +538,8 @@ class DiscreteTimeSeries:
         num_future_targets: int = 7,
         num_test_days: int = 1,
         include_std_dev: bool = False,
+        include_zero_freq: bool = False,
+        include_trend_features: bool = False,
         use_best_fit_feature: bool = False,
         use_one_hot_encoding: bool = True,
         downsample_zeros_frac: float | None = 0.1,
@@ -543,6 +569,7 @@ class DiscreteTimeSeries:
         self.target_cols: list[str] = []
         self.categorical_feature_cols: list[str] = []
         self.future_lead_horizon_map: dict[str, int] = {}
+        self.target_horizon_map: dict[str, int] = {}
         self.test_start_period = None
         self.use_one_hot_encoding = use_one_hot_encoding
         self.series_metadata: pd.DataFrame = pd.DataFrame()
@@ -556,6 +583,8 @@ class DiscreteTimeSeries:
             rolling_windows=list(rolling_windows),
             num_future_targets=num_future_targets,
             include_std_dev=include_std_dev,
+            include_zero_freq=include_zero_freq,
+            include_trend_features=include_trend_features,
             apply_log_transformation=True,
             use_best_fit_feature=use_best_fit_feature,
             use_one_hot_encoding=use_one_hot_encoding,
@@ -598,7 +627,14 @@ class DiscreteTimeSeries:
             self._extract_series_metadata()
 
         # Step 4: Engineer lags, rolling windows, and multi-horizon targets:
-        self._engineer_features(lags, rolling_windows, num_future_targets, include_std_dev)
+        self._engineer_features(
+            lags,
+            rolling_windows,
+            num_future_targets,
+            include_std_dev,
+            include_zero_freq=include_zero_freq,
+            include_trend_features=include_trend_features,
+        )
         self._sync_feature_spec()
         self.logger.info(
             "Panel ready in %.2fs: %d rows, %d numerical features, %d categorical features, %d target horizons",
@@ -698,6 +734,7 @@ class DiscreteTimeSeries:
         self.feature_spec.categorical_feature_cols = list(self.categorical_feature_cols)
         self.feature_spec.target_cols = list(self.target_cols)
         self.feature_spec.future_lead_horizon_map = dict(self.future_lead_horizon_map)
+        self.feature_spec.target_horizon_map = dict(self.target_horizon_map)
 
     def _add_test_flag(self, num_test_days: int):
         """
@@ -752,6 +789,21 @@ class DiscreteTimeSeries:
             target_col, restrict_future_leads=restrict_future_leads, exclude_cols=exclude_cols
         )
 
+    def get_cat_features_for_horizon(
+        self,
+        target_col: str,
+        restrict_future_leads: bool = False,
+        exclude_cols: set[str] | None = None,
+        extra_cat_cols: list[str] | None = None,
+    ) -> list[str]:
+        """Delegates to `self.feature_spec.get_cat_features_for_horizon`."""
+        return self.feature_spec.get_cat_features_for_horizon(
+            target_col,
+            restrict_future_leads=restrict_future_leads,
+            exclude_cols=exclude_cols,
+            extra_cat_cols=extra_cat_cols,
+        )
+
     def transform(
         self,
         sales_df: pd.DataFrame,
@@ -780,31 +832,36 @@ class DiscreteTimeSeries:
         num_future_targets: int,
         include_std_dev: bool,
         apply_log_transformation: bool = True,
+        include_zero_freq: bool = False,
+        include_trend_features: bool = False,
     ):
         """
-        Computes lag features, 1-step-shifted rolling window statistics, and multi-horizon
-        target columns on `self.df`.
+        Computes lag features, 1-step-shifted rolling window statistics, optional zero-frequency
+        and momentum features, and multi-horizon target columns on `self.df`.
 
         How look-ahead leakage is prevented
         -----------------------------------
         1. **Autoregressive features**: Because `target_t_plus_0` is the demand on day `t`
-           itself, all lags (`lag >= 1`) and rolling windows (`shifted_var = shift(1)`)
-           strictly use observations up to day `t - 1`.
+           itself, all lags (`lag >= 1`), rolling windows (`shifted_var = shift(1)`), and
+           zero-frequency / recency statistics strictly use observations up to day `t - 1`.
         2. **Cross-boundary targets**: For a training row at day `t` (`is_test == 0`), if
            future target `target_t_plus_i` (`i > 0`) lands on a day `t + i >= test_start_period`
-           (`target_in_test == True`), that cell is masked to `NaN` (lines 557-559) so no
-           model trained on `is_test == 0` rows can ever observe a test-window realization.
+           (`target_in_test == True`), that cell is masked to `NaN` so no model trained on
+           `is_test == 0` rows can ever observe a test-window realization.
         """
         t0 = time.perf_counter()
         self.logger.info(
-            "Engineering time-series features (lags=%s, rolling_windows=%s, include_std_dev=%s, horizons=%d)...",
+            "Engineering time-series features (lags=%s, rolling_windows=%s, include_std_dev=%s, zero_freq=%s, trend=%s, horizons=%d)...",
             lags,
             rolling_windows,
             include_std_dev,
+            include_zero_freq,
+            include_trend_features,
             num_future_targets,
         )
         feature_df = self.df.copy().sort_values(by=self.ts_id_cols + [self.period_col])
         grouped_df = feature_df.groupby(self.ts_id_cols, observed=True)
+        demand_level_cols: list[str] = []
 
         # Create Lag Features (log1p-transformed when apply_log_transformation=True):
         for lag in lags:
@@ -812,16 +869,19 @@ class DiscreteTimeSeries:
             shifted_val = grouped_df[self.var_col].shift(lag)
             feature_df[col_name] = np.log1p(shifted_val) if apply_log_transformation else shifted_val
             self.feature_cols.append(col_name)
+            demand_level_cols.append(col_name)
 
         # Create Rolling Window Features (vectorized Cython groupby rolling on 1-step-shifted series):
         shifted_var = grouped_df[self.var_col].shift(1)
         group_keys = [feature_df[c] for c in self.ts_id_cols]
+        is_zero_shifted = (shifted_var == 0).astype(np.float64) if include_zero_freq else None
         for window in rolling_windows:
             col_name = f"rolling_mean_{window}"
             roll_obj = shifted_var.groupby(group_keys, observed=True).rolling(window=window, min_periods=1)
             rmean = roll_obj.mean().reset_index(level=list(range(len(self.ts_id_cols))), drop=True)
             feature_df[col_name] = np.log1p(rmean) if apply_log_transformation else rmean
             self.feature_cols.append(col_name)
+            demand_level_cols.append(col_name)
 
             if include_std_dev:
                 col_name = f"rolling_std_{window}"
@@ -832,6 +892,41 @@ class DiscreteTimeSeries:
                 )
                 feature_df[col_name] = np.log1p(rstd) if apply_log_transformation else rstd
                 self.feature_cols.append(col_name)
+
+            if include_zero_freq and is_zero_shifted is not None:
+                z_col = f"zero_freq_{window}"
+                z_roll = (
+                    is_zero_shifted.groupby(group_keys, observed=True)
+                    .rolling(window=window, min_periods=1)
+                    .mean()
+                    .reset_index(level=list(range(len(self.ts_id_cols))), drop=True)
+                )
+                feature_df[z_col] = z_roll
+                self.feature_cols.append(z_col)
+
+        if include_zero_freq:
+            step_idx = grouped_df.cumcount().to_numpy(dtype=np.int64)
+            s_vals = shifted_var.to_numpy(dtype=np.float64)
+            last_sale_step = np.where(np.isfinite(s_vals) & (s_vals > 0.0), step_idx, 0)
+            cummax_sale_step = (
+                pd.Series(last_sale_step, index=feature_df.index)
+                .groupby(group_keys, observed=True)
+                .cummax()
+                .to_numpy(dtype=np.int64)
+            )
+            days_since = np.maximum(step_idx - cummax_sale_step, 0)
+            feature_df["log_days_since_last_sale"] = np.log1p(days_since.astype(np.float64))
+            self.feature_cols.append("log_days_since_last_sale")
+
+        if include_trend_features and len(rolling_windows) >= 2:
+            w_sorted = sorted(set(int(w) for w in rolling_windows))
+            for idx in range(len(w_sorted) - 1):
+                w_short, w_long = w_sorted[idx], w_sorted[idx + 1]
+                t_col = f"trend_{w_short}_vs_{w_long}"
+                feature_df[t_col] = (
+                    feature_df[f"rolling_mean_{w_short}"] - feature_df[f"rolling_mean_{w_long}"]
+                )
+                self.feature_cols.append(t_col)
 
         # Create Future Target Columns (target_t_plus_0 .. target_t_plus_{H-1}):
         self.target_cols = []
@@ -847,10 +942,11 @@ class DiscreteTimeSeries:
         # Remove warm-up rows at the start of each series where lag features are NaN:
         feature_df = feature_df[feature_df[self.feature_cols].isna().sum(axis=1) == 0]
 
-        # Optionally downsample rows where both features and targets are all 0s in training data:
+        # Optionally downsample rows where both demand level features and targets are all 0s in training data:
         if self.downsample_zeros_frac is not None and 0.0 < self.downsample_zeros_frac < 1.0:
             rows_before = len(feature_df)
-            mask = (feature_df[self.feature_cols].sum(axis=1) == 0) & (
+            check_cols = demand_level_cols if demand_level_cols else self.feature_cols
+            mask = (feature_df[check_cols].sum(axis=1) == 0) & (
                 feature_df[self.target_cols].fillna(0).sum(axis=1) == 0
             )
             if self.test_start_period is not None:
@@ -1075,11 +1171,14 @@ class DiscreteTimeSeries:
         default_value: Any = np.nan,
         lags: tuple[int, ...] | None = None,
         rolling_windows: tuple[int, ...] | None = None,
+        relative_rolling_windows: tuple[int, ...] | None = None,
+        align_to_target_horizon: bool = False,
     ):
         """
         Merges an external numerical or categorical covariate onto the panel, with optional
-        lags (including negative lags `-h` for future-known covariates at `t + h`)
-        and rolling windows.
+        lags (including negative lags `-h` for future-known covariates at `t + h`),
+        rolling windows, relative rolling deviations (`<feature>_rel_<w> = <feature> - rolling_mean_<w>`),
+        and automatic target-horizon alignment (`align_to_target_horizon=True`).
 
         Why negative lags are precomputed before merging
         ------------------------------------------------
@@ -1091,15 +1190,21 @@ class DiscreteTimeSeries:
         By shifting negative lags (`lag < 0`, named `<feature>_lag_minus_<h>`) on `df_feature`
         *before* merging onto `self.df`, the row at `self.end_period` receives the future
         covariate values from `self.end_period + h`.
+
+        When `align_to_target_horizon=True`, future leads `-1, ..., -(num_future_targets - 1)`
+        are automatically attached and registered in `self.target_horizon_map` so horizon `h`
+        (`target_t_plus_h`) strictly receives the covariate value from period `t + h`.
         """
         t0 = time.perf_counter()
         self.logger.info(
-            "Adding external feature '%s' (join_on=%s, cat=%s, lags=%s, rolling=%s)...",
+            "Adding external feature '%s' (join_on=%s, cat=%s, lags=%s, rolling=%s, rel_rolling=%s, align_horizon=%s)...",
             feature_name,
             join_on,
             is_cat_feature,
             lags,
             rolling_windows,
+            relative_rolling_windows,
+            align_to_target_horizon,
         )
         self.feature_spec.external_specs.append(
             ExternalFeatureSpec(
@@ -1109,30 +1214,48 @@ class DiscreteTimeSeries:
                 default_value=default_value,
                 lags=list(lags) if lags is not None else None,
                 rolling_windows=list(rolling_windows) if rolling_windows is not None else None,
+                relative_rolling_windows=(
+                    list(relative_rolling_windows) if relative_rolling_windows is not None else None
+                ),
+                align_to_target_horizon=bool(align_to_target_horizon),
             )
         )
         df_feat = df_feature.copy()
         keys = list(join_on) + [self.period_col]
         df_feat = df_feat[keys + [feature_name]].drop_duplicates()
 
+        effective_lags: list[int] = list(lags) if lags is not None else []
+        if align_to_target_horizon and self.num_future_targets > 1:
+            existing_set = set(effective_lags)
+            for h in range(1, self.num_future_targets):
+                if -h not in existing_set:
+                    effective_lags.append(-h)
+                    existing_set.add(-h)
+
         # Pre-compute negative lags (future leads) on df_feat before merging so future rows beyond
         # self.end_period are preserved for production inference at self.end_period:
         precomputed_lead_cols: list[str] = []
         lead_col_to_horizon: dict[str, int] = {}
         remaining_lags: list[int] = []
-        if lags is not None:
-            for lag in lags:
+        if effective_lags:
+            df_feat = df_feat.sort_values(by=keys)
+            feat_grouped = df_feat.groupby(join_on, observed=True)[feature_name] if join_on else None
+            for lag in effective_lags:
                 if lag < 0:
                     col_name = f"{feature_name}_lag_{lag}".replace("-", "minus_")
-                    df_feat = df_feat.sort_values(by=keys)
-                    if join_on:
-                        df_feat[col_name] = df_feat.groupby(join_on, observed=True)[feature_name].shift(lag)
+                    if feat_grouped is not None:
+                        df_feat[col_name] = feat_grouped.shift(lag)
                     else:
                         df_feat[col_name] = df_feat[feature_name].shift(lag)
                     precomputed_lead_cols.append(col_name)
                     lead_col_to_horizon[col_name] = abs(int(lag))
                 else:
                     remaining_lags.append(lag)
+
+        if not join_on:
+            # Period-only covariate (e.g., calendar features): fill on the small period table before merging
+            for col_name in [feature_name, *precomputed_lead_cols]:
+                df_feat[col_name] = df_feat[col_name].ffill().bfill().fillna(default_value)
 
         df_feat[self.period_col] = df_feat[self.period_col].astype(self.df[self.period_col].dtype)
         for col in join_on:
@@ -1143,37 +1266,56 @@ class DiscreteTimeSeries:
         )
 
         self.df.sort_values(by=self.ts_id_cols + [self.period_col], inplace=True)
-        gdf = self.df.groupby(self.ts_id_cols, observed=True)
-        self.df[feature_name] = gdf[feature_name].ffill().bfill().fillna(default_value)
-        for col_name in precomputed_lead_cols:
-            self.df[col_name] = gdf[col_name].ffill().bfill().fillna(default_value)
+        gdf = None
+        for col_name in [feature_name, *precomputed_lead_cols]:
+            if self.df[col_name].isna().any():
+                if gdf is None:
+                    gdf = self.df.groupby(self.ts_id_cols, observed=True)
+                self.df[col_name] = gdf[col_name].ffill().bfill().fillna(default_value)
 
         # Positive lags on the merged panel:
         cols_lags = list(precomputed_lead_cols)
         for lag in remaining_lags:
+            if gdf is None:
+                gdf = self.df.groupby(self.ts_id_cols, observed=True)
             col_name = f"{feature_name}_lag_{lag}".replace("-", "minus_")
             self.df[col_name] = gdf[feature_name].shift(lag)
             cols_lags.append(col_name)
 
-        # Rolling means on the merged panel:
+        # Rolling means and relative rolling deviations on the merged panel:
         cols_rolling = []
-        if (rolling_windows is not None) and (not is_cat_feature):
+        cols_rel_rolling = []
+        if not is_cat_feature and (rolling_windows is not None or relative_rolling_windows is not None):
             group_keys = [self.df[c] for c in self.ts_id_cols]
-            for window in rolling_windows:
-                col_name = f"{feature_name}_rolling_mean_{window}"
+            all_windows = sorted(set((rolling_windows or ()) + (relative_rolling_windows or ())))
+            rmean_cache: dict[int, pd.Series] = {}
+            for window in all_windows:
                 roll_obj = self.df[feature_name].groupby(group_keys, observed=True).rolling(
                     window=window, min_periods=1
                 )
-                self.df[col_name] = roll_obj.mean().reset_index(
+                rmean_cache[window] = roll_obj.mean().reset_index(
                     level=list(range(len(self.ts_id_cols))), drop=True
                 )
-                cols_rolling.append(col_name)
+            if rolling_windows is not None:
+                for window in rolling_windows:
+                    col_name = f"{feature_name}_rolling_mean_{window}"
+                    self.df[col_name] = rmean_cache[window]
+                    cols_rolling.append(col_name)
+            if relative_rolling_windows is not None:
+                for window in relative_rolling_windows:
+                    rel_col = f"{feature_name}_rel_{window}"
+                    self.df[rel_col] = (self.df[feature_name] - rmean_cache[window]).fillna(0.0)
+                    cols_rel_rolling.append(rel_col)
 
-        generated_cols = cols_lags + cols_rolling
+        generated_cols = cols_lags + cols_rolling + cols_rel_rolling
         for col in generated_cols:
-            self.df[col] = gdf[col].ffill().bfill().fillna(default_value)
+            if self.df[col].isna().any():
+                if gdf is None:
+                    gdf = self.df.groupby(self.ts_id_cols, observed=True)
+                self.df[col] = gdf[col].ffill().bfill().fillna(default_value)
 
         feature_list = [feature_name] + generated_cols
+        non_base_prefixes = tuple(f"{p}_" for p in generated_cols)
         if is_cat_feature and self.use_one_hot_encoding:
             original_cols = self.df.columns.copy()
             self.df = pd.get_dummies(self.df, columns=feature_list, dtype=int, drop_first=True)
@@ -1183,14 +1325,26 @@ class DiscreteTimeSeries:
                 for c in new_cols:
                     if c.startswith(f"{lead_prefix}_"):
                         self.future_lead_horizon_map[c] = h_val
+                        if align_to_target_horizon:
+                            self.target_horizon_map[c] = h_val
+            if align_to_target_horizon:
+                for c in new_cols:
+                    if c.startswith(f"{feature_name}_") and not c.startswith(non_base_prefixes):
+                        self.target_horizon_map[c] = 0
         elif is_cat_feature and not self.use_one_hot_encoding:
             for f in feature_list:
                 self.df[f] = self.df[f].astype("category")
                 self.categorical_feature_cols.append(f)
             self.future_lead_horizon_map.update(lead_col_to_horizon)
+            if align_to_target_horizon:
+                self.target_horizon_map[feature_name] = 0
+                self.target_horizon_map.update(lead_col_to_horizon)
         else:
             self.feature_cols.extend(feature_list)
             self.future_lead_horizon_map.update(lead_col_to_horizon)
+            if align_to_target_horizon:
+                self.target_horizon_map[feature_name] = 0
+                self.target_horizon_map.update(lead_col_to_horizon)
         self._sync_feature_spec()
         self.logger.info("Feature '%s' added in %.2fs", feature_name, time.perf_counter() - t0)
 

@@ -1642,13 +1642,11 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         for target in ts.target_cols:
             allowed_num = set(ts.get_features_for_horizon(target, restrict_future_leads=self.restrict_future_leads))
             horizon_feature_cols[target] = [c for c in feature_cols if c in allowed_num]
-            if self.restrict_future_leads and ts.future_lead_horizon_map:
-                h_offset = ts._target_offset(target)
-                horizon_cat_feature_cols[target] = [
-                    c for c in cat_cols if ts.future_lead_horizon_map.get(c, 0) <= h_offset
-                ]
-            else:
-                horizon_cat_feature_cols[target] = list(cat_cols)
+            horizon_cat_feature_cols[target] = ts.get_cat_features_for_horizon(
+                target,
+                restrict_future_leads=self.restrict_future_leads,
+                extra_cat_cols=available_extra_cats,
+            )
 
         result = CatBoostQuantileModel(
             self.quantiles,
