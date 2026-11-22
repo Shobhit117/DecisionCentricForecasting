@@ -707,6 +707,9 @@ def _fit_hurdle_binary_stage(
         return {"Intercept": 30.0, **zero_coefs}, None
 
     X, active_features = _build_design_matrix(train_df, feature_cols)
+    if n_pos <= len(active_features) + 1 or (len(train_df) - n_pos) <= len(active_features) + 1:
+        X = np.ones((len(train_df), 1), dtype=np.float64)
+        active_features = []
     col_names = ["Intercept", *active_features]
     reg_a = float(regularization_alpha) if regularization_alpha is not None and regularization_alpha > 0.0 else 0.0
 
@@ -927,7 +930,11 @@ def _fit_standard_count_stage(
     if float(y_vec.max()) <= 0.0:
         return {"Intercept": -20.0, **zero_coefs}, None, None
 
+    n_pos = int((y_vec > 0.0).sum())
     X, active_features = _build_design_matrix(train_df, feature_cols)
+    if n_pos <= len(active_features) + 1:
+        X = np.ones((len(train_df), 1), dtype=np.float64)
+        active_features = []
     col_names = ["Intercept", *active_features]
     reg_a = float(regularization_alpha) if regularization_alpha is not None and regularization_alpha > 0.0 else 0.0
 

@@ -572,6 +572,33 @@ def _pmf_quantile_scalar_numba(pmf: np.ndarray, min_val: int, bin_size: int, q: 
 
 
 @njit(cache=True)
+def _pmf_quantile_round_scalar_numba(pmf: np.ndarray, min_val: int, bin_size: int, q: float) -> int:
+    """
+    Evaluate a nearest-integer linearly-interpolated discrete quantile from a PMF.
+
+    What it does
+    ------------
+    Finds the first bin ``i`` where ``F(x_i) = csum + pmf[i] >= q``. Under piecewise-linear
+    interpolation of the discrete CDF across the jump ``[F(x_{i-1}), F(x_i)] = [csum, csum + pmf[i]]``,
+    the continuous quantile is ``x_{i-1} + bin_size * (q - csum) / pmf[i]``. Rounding that
+    continuous quantile to the nearest support point selects ``x_{i-1}`` when ``i > 0`` and
+    ``(q - csum) < 0.5 * pmf[i]``, and ``x_i`` otherwise.
+    """
+    n = len(pmf)
+    if q <= 0.0 or n <= 1:
+        return min_val
+    csum = 0.0
+    for i in range(n):
+        pi = pmf[i]
+        if csum + pi >= q or csum + pi >= 1.0 - 1e-12:
+            if i > 0 and (q - csum) < 0.5 * pi:
+                return min_val + (i - 1) * bin_size
+            return min_val + i * bin_size
+        csum += pi
+    return min_val + (n - 1) * bin_size
+
+
+@njit(cache=True)
 def _pmf_to_cdf_numba(pmf: np.ndarray) -> np.ndarray:
     """
     Build a guaranteed non-decreasing CDF array from ``pmf`` using a running maximum.
@@ -868,6 +895,24 @@ def _batch_pmf_quantiles_numba(
     out = np.empty(n, dtype=np.int64)
     for i in range(n):
         out[i] = _pmf_quantile_scalar_numba(pmfs[i], int(mins[i]), int(bin_sizes[i]), float(alphas[i]))
+    return out
+
+
+@njit(cache=True)
+def _batch_pmf_quantiles_round_numba(
+    pmfs: NumbaList,
+    mins: np.ndarray,
+    bin_sizes: np.ndarray,
+    alphas: np.ndarray,
+) -> np.ndarray:
+    """
+    Evaluate one nearest-integer linearly-interpolated quantile ``alphas[i]`` for each
+    product distribution ``i`` in compiled code.
+    """
+    n = len(pmfs)
+    out = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        out[i] = _pmf_quantile_round_scalar_numba(pmfs[i], int(mins[i]), int(bin_sizes[i]), float(alphas[i]))
     return out
 
 
@@ -1349,8 +1394,12 @@ def _count_pmf_truncated_numba(mu: float, alpha: float, tol: float) -> np.ndarra
         log_mu = math.log(mu)
         sd = math.sqrt(mu)
 
-    # Initial buffer size: mean + 12 standard deviations + 32 bins
-    cap = int(mu + 12.0 * sd + 32.0)
+    # Initial buffer size: mean + 12 standard deviations + 32 bins (clamped to _COUNT_PMF_MAX_SUPPORT)
+    cap_est = mu + 12.0 * sd + 32.0
+    if not (cap_est < _COUNT_PMF_MAX_SUPPORT):
+        cap = _COUNT_PMF_MAX_SUPPORT
+    else:
+        cap = max(int(cap_est), 2)
     pmf = np.empty(cap, dtype=np.float64)
     cdf = 0.0
     k = 0
@@ -1455,7 +1504,11 @@ def _hurdle_count_pmf_truncated_numba(pi: float, lam: float, alpha: float, tol: 
         return out_deg
 
     log_pos_mass = math.log(pos_mass)
-    cap = max(int(lam + 12.0 * sd + 32.0), 2)
+    cap_est = lam + 12.0 * sd + 32.0
+    if not (cap_est < _COUNT_PMF_MAX_SUPPORT):
+        cap = _COUNT_PMF_MAX_SUPPORT
+    else:
+        cap = max(int(cap_est), 2)
     pmf = np.empty(cap, dtype=np.float64)
     pmf[0] = 1.0 - pi
     cdf_pos = 0.0

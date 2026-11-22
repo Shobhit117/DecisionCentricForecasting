@@ -225,24 +225,126 @@ The table below shows the non-randomized PIT density across all 10 decile bins f
 
 ---
 
-## 5. Key Takeaways
+## 5. Synthetic Lead-Time Distribution Sensitivity Study (7 Lead-Time Regimes)
+
+To evaluate how the probabilistic framework behaves under diverse supply-chain lead-time dynamics, we convolved the daily predictive distributions across **7 synthetic lead-time profiles** (`--lead-time-profiles all`, results saved in [`data/output/experiments_lead_time/`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/ddlt_pit_summary.csv)) spanning short vs. long protection windows, deterministic vs. high-variance lead times, right-skewed tail delays, and bimodal supply disruptions ($R = 1$ day review period in all cases):
+
+### 5.1 Synthetic Lead-Time Profiles Evaluated
+
+| Profile ID | Lead-Time Support $L$ (Days) | Protection Window $L+R$ (Days) | Probability Mass Function $P(L = \ell)$ | $\mathbb{E}[L]$ (Days) | $\text{SD}(L)$ (Days) | Supply-Chain Interpretation |
+| :--- | :---: | :---: | :--- | :---: | :---: | :--- |
+| **`deterministic_short`** | $\{2\}$ | $\{3\}$ | $[1.00]$ | 2.00 | 0.00 | Fixed short replenishment cycle (zero lead-time variance). |
+| **`short_concentrated`** *(Baseline)* | $\{1, 2, 3\}$ | $\{2, 3, 4\}$ | $[0.20, 0.50, 0.30]$ | 2.10 | 0.70 | Standard regional DC replenishment with tight 1–3 day delivery. |
+| **`right_skewed`** | $\{1, \dots, 7\}$ | $\{2, \dots, 8\}$ | $[0.40, 0.25, 0.15, 0.10, 0.05, 0.03, 0.02]$ | 2.32 | 1.50 | Fast modal delivery ($L=1\text{--}2$) with occasional multi-day transit delays up to 7 days. |
+| **`bimodal_disrupted`** | $\{1, \dots, 10\}$ | $\{2, \dots, 11\}$ | $[0.30, 0.40, 0.05, 0, 0, 0, 0, 0.05, 0.12, 0.08]$ | 3.61 | 3.19 | 75% normal fast delivery ($L \in \{1,2,3\}$) + 25% supplier stockout/port delay regime ($L \in \{8,9,10\}$). |
+| **`uniform_wide`** | $\{1, \dots, 10\}$ | $\{2, \dots, 11\}$ | $[0.10, 0.10, \dots, 0.10]$ | 5.50 | 2.87 | Maximum uninformative lead-time uncertainty across 1–10 days. |
+| **`long_symmetric`** | $\{4, \dots, 10\}$ | $\{5, \dots, 11\}$ | $[0.05, 0.15, 0.25, 0.30, 0.15, 0.07, 0.03]$ | 6.68 | 1.34 | Long cross-country transit centered around 1 week ($L=7$). |
+| **`deterministic_long`** | $\{7\}$ | $\{8\}$ | $[1.00]$ | 7.00 | 0.00 | Fixed weekly/7-day lead time (8-day protection window; pure multi-day demand convolution). |
+
+---
+
+### 5.2 Convolved DDLT Calibration Across All 7 Lead-Time Profiles (8,400 Decision Rows / Profile)
+
+Across **all 7 lead-time regimes**, **`glm_hurdle` achieves the lowest (best) DDLT CRPS, the lowest PIT MAE, the lowest PIT KS, and the best Upper-Tail PIT Density**:
+
+| Lead-Time Profile | Model | Expected Realized DDLT (Units) | DDLT Bias (%) | DDLT CRPS | Dispersion Ratio | PIT Mean | PIT MAE | PIT KS | Upper Tail $[0.9, 1.0]$ |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`deterministic_short`**<br>($L=2, L+R=3$) | **`glm_hurdle`** | 3.93 | -7.67% | **1.4005** | 1.5060 | **0.5096** | **0.0623** | **0.0244** | **1.2242** |
+| | **`glm`** | 3.93 | **-4.90%** | 1.4565 | **1.1293** | 0.5101 | 0.0631 | 0.0246 | 1.2431 |
+| | `empirical_trailing` | 3.93 | -8.75% | 1.5982 | 1.7653 | 0.5340 | 0.1475 | 0.0673 | 1.6246 |
+| | `empirical_seasonal` | 3.93 | -13.45% | 1.6581 | 2.7100 | 0.5488 | 0.2582 | 0.1081 | 2.0809 |
+| **`short_concentrated`**<br>($L \in \{1..3\}, \mathbb{E}[L]=2.1$) | **`glm_hurdle`** | 4.09 | -8.09% | **1.5474** | 1.5264 | **0.5084** | **0.0581** | **0.0229** | **1.2126** |
+| | **`glm`** | 4.09 | **-5.40%** | 1.5990 | **1.1683** | 0.5091 | 0.0639 | 0.0251 | 1.2514 |
+| | `empirical_trailing` | 4.09 | -9.20% | 1.7286 | 1.7164 | 0.5333 | 0.1431 | 0.0663 | 1.6258 |
+| | `empirical_seasonal` | 4.09 | -13.91% | 1.7816 | 2.4228 | 0.5474 | 0.2345 | 0.1020 | 2.0203 |
+| **`right_skewed`**<br>($L \in \{1..7\}, \mathbb{E}[L]=2.32$) | **`glm_hurdle`** | 4.41 | -8.56% | **1.8864** | 1.5111 | **0.5057** | **0.0466** | **0.0181** | **1.1616** |
+| | **`glm`** | 4.41 | **-6.04%** | 1.9301 | **1.2187** | 0.5070 | 0.0577 | 0.0226 | 1.2264 |
+| | `empirical_trailing` | 4.41 | -9.82% | 2.0422 | 1.5915 | 0.5313 | 0.1303 | 0.0608 | 1.5761 |
+| | `empirical_seasonal` | 4.41 | -14.53% | 2.0883 | 2.0127 | 0.5439 | 0.2072 | 0.0904 | 1.8863 |
+| **`bimodal_disrupted`**<br>($L \in \{1..10\}, \mathbb{E}[L]=3.61$) | **`glm_hurdle`** | 6.06 | -8.96% | **3.0227** | 1.4643 | **0.4986** | **0.0285** | **0.0062** | **1.0612** |
+| | **`glm`** | 6.06 | **-6.80%** | 3.0590 | **1.2737** | 0.5028 | 0.0493 | 0.0180 | 1.1804 |
+| | `empirical_trailing` | 6.06 | -10.54% | 3.1664 | 1.4554 | 0.5287 | 0.1096 | 0.0503 | 1.5028 |
+| | `empirical_seasonal` | 6.06 | -15.23% | 3.2170 | 1.6926 | 0.5410 | 0.1884 | 0.0775 | 1.7459 |
+| **`uniform_wide`**<br>($L \in \{1..10\}, \mathbb{E}[L]=5.50$) | **`glm_hurdle`** | 8.80 | -9.89% | **3.5483** | 1.7353 | **0.5007** | **0.0878** | **0.0264** | **1.2640** |
+| | **`glm`** | 8.80 | **-7.88%** | 3.6067 | **1.4837** | 0.5073 | 0.1131 | 0.0395 | 1.3953 |
+| | `empirical_trailing` | 8.80 | -11.61% | 3.7338 | 1.7426 | 0.5414 | 0.1817 | 0.0842 | 1.8422 |
+| | `empirical_seasonal` | 8.80 | -16.31% | 3.8127 | 2.1234 | 0.5583 | 0.2533 | 0.1175 | 2.1751 |
+| **`long_symmetric`**<br>($L \in \{4..10\}, \mathbb{E}[L]=6.68$) | **`glm_hurdle`** | 10.45 | -10.24% | **3.3126** | 2.3859 | **0.5092** | **0.1323** | **0.0426** | **1.4259** |
+| | **`glm`** | 10.45 | **-8.32%** | 3.3977 | **1.9275** | 0.5168 | 0.1587 | 0.0544 | 1.5444 |
+| | `empirical_trailing` | 10.45 | -12.04% | 3.5609 | 2.4375 | 0.5562 | 0.2433 | 0.1091 | 2.0901 |
+| | `empirical_seasonal` | 10.45 | -16.74% | 3.6834 | 3.4240 | 0.5794 | 0.3351 | 0.1529 | 2.5288 |
+| **`deterministic_long`**<br>($L=7, L+R=8$) | **`glm_hurdle`** | 10.89 | -10.23% | **3.2584** | 2.8615 | **0.5117** | **0.1569** | **0.0503** | **1.5033** |
+| | **`glm`** | 10.89 | **-8.40%** | 3.3454 | **2.2363** | 0.5196 | 0.1782 | 0.0612 | 1.6119 |
+| | `empirical_trailing` | 10.89 | -12.08% | 3.5288 | 2.9142 | 0.5603 | 0.2751 | 0.1191 | 2.1881 |
+| | `empirical_seasonal` | 10.89 | -16.78% | 3.6896 | 4.6498 | 0.5858 | 0.3813 | 0.1694 | 2.6944 |
+
+---
+
+### 5.3 Service-Level Coverage & Pinball WMAPE Across Lead-Time Regimes
+
+The table below compares **PIT Coverage Gap (in percentage points from nominal $\tau$)** and **DDLT Pinball WMAPE (%)** at the critical inventory service levels $\tau \in \{0.50, 0.80, 0.90, 0.95, 0.99\}$ across all 7 lead-time regimes:
+
+| Lead-Time Profile | Model | $\tau=0.50$ Gap / Pinball | $\tau=0.80$ Gap / Pinball | $\tau=0.90$ Gap / Pinball | $\tau=0.95$ Gap / Pinball | $\tau=0.99$ Gap / Pinball |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`deterministic_short`** | **`glm_hurdle`** | **-1.04 pp** / **49.36%** | **-2.44 pp** / **42.26%** | **-2.24 pp** / **29.95%** | **-1.60 pp** / **20.27%** | **-1.26 pp** / **7.77%** |
+| | **`glm`** | -1.06 pp / 51.06% | -2.46 pp / 44.83% | -2.43 pp / 32.15% | -2.13 pp / 21.36% | -1.26 pp / 7.89% |
+| | `empirical_trailing` | -4.05 pp / 56.03% | -6.73 pp / 48.96% | -6.25 pp / 35.33% | -5.41 pp / 24.15% | -3.41 pp / 9.42% |
+| **`short_concentrated`** | **`glm_hurdle`** | **-0.86 pp** / **52.55%** | **-2.29 pp** / **45.48%** | **-2.13 pp** / **32.29%** | **-1.65 pp** / **21.68%** | **-1.23 pp** / **8.30%** |
+| | **`glm`** | -0.92 pp / 54.07% | -2.35 pp / 47.73% | -2.51 pp / 34.26% | -2.16 pp / 22.76% | -1.26 pp / 8.47% |
+| | `empirical_trailing` | -3.87 pp / 58.41% | -6.63 pp / 51.68% | -6.26 pp / 37.21% | -5.37 pp / 25.38% | -3.36 pp / 9.92% |
+| **`right_skewed`** | **`glm_hurdle`** | **-0.50 pp** / **58.81%** | **-1.81 pp** / **53.83%** | **-1.62 pp** / **39.19%** | **-1.43 pp** / **26.70%** | **-1.18 pp** / **10.04%** |
+| | **`glm`** | -0.56 pp / 60.21% | -1.93 pp / 55.59% | -2.26 pp / 40.61% | -1.96 pp / 27.26% | -1.30 pp / 10.15% |
+| | `empirical_trailing` | -3.70 pp / 63.51% | -6.08 pp / 58.80% | -5.76 pp / 43.07% | -4.98 pp / 29.58% | -3.04 pp / 11.35% |
+| **`bimodal_disrupted`** | **`glm_hurdle`** | **+0.24 pp** / **66.85%** | **+0.17 pp** / **68.44%** | **-0.61 pp** / **49.58%** | **-1.39 pp** / **33.37%** | **-1.71 pp** / **12.89%** |
+| | **`glm`** | -0.09 pp / 67.85% | -1.02 pp / 69.12% | -1.80 pp / 49.97% | -2.09 pp / 33.46% | -1.65 pp / 12.92% |
+| | `empirical_trailing` | -3.68 pp / 70.43% | -4.88 pp / 71.46% | -5.03 pp / 51.76% | -4.90 pp / 35.07% | -3.65 pp / 14.23% |
+| **`uniform_wide`** | **`glm_hurdle`** | +0.55 pp / **55.94%** | **-1.84 pp** / **48.20%** | **-2.64 pp** / **35.05%** | **-3.38 pp** / **24.22%** | -2.64 pp / **10.21%** |
+| | **`glm`** | **-0.16 pp** / 56.84% | -3.35 pp / 49.13% | -3.95 pp / 35.47% | -3.79 pp / 24.42% | **-2.46 pp** / 10.31% |
+| | `empirical_trailing` | -4.53 pp / 58.56% | -8.23 pp / 51.16% | -8.42 pp / 37.38% | -7.68 pp / 26.12% | -5.47 pp / 11.70% |
+| **`long_symmetric`** | **`glm_hurdle`** | **-0.91 pp** / **42.95%** | **-3.60 pp** / **37.71%** | **-4.26 pp** / **28.29%** | **-4.77 pp** / **20.23%** | -3.40 pp / **9.15%** |
+| | **`glm`** | -1.87 pp / 44.09% | -5.16 pp / 38.69% | -5.44 pp / 28.82% | -4.89 pp / 20.49% | **-3.10 pp** / 9.33% |
+| | `empirical_trailing` | -6.46 pp / 45.97% | -10.91 pp / 40.89% | -10.90 pp / 30.87% | -9.70 pp / 22.20% | -6.78 pp / 10.63% |
+| **`deterministic_long`** | **`glm_hurdle`** | **-1.38 pp** / **40.22%** | **-4.34 pp** / **35.36%** | **-5.03 pp** / **26.84%** | -5.44 pp / **19.53%** | -4.02 pp / **9.53%** |
+| | **`glm`** | -2.41 pp / 41.31% | -5.98 pp / 36.41% | -6.12 pp / 27.42% | **-5.35 pp** / 19.86% | **-3.48 pp** / 9.83% |
+| | `empirical_trailing` | -7.08 pp / 43.38% | -11.91 pp / 38.65% | -11.88 pp / 29.48% | -10.62 pp / 21.52% | -7.57 pp / 10.64% |
+
+---
+
+### 5.4 Key Insights from the Lead-Time Distribution Study
+
+1. **`glm_hurdle` Dominates Across All 7 Lead-Time Regimes:**
+   - Regardless of whether the lead time is deterministic ($L=2$ or $L=7$), right-skewed, uniform ($L \in \{1..10\}$), or bimodal, **`glm_hurdle` achieves the #1 lowest DDLT CRPS and #1 lowest Pinball WMAPE at every service level ($\tau \in \{0.50, 0.80, 0.90, 0.95, 0.99\}$)**.
+2. **Exact Mixture-of-Convolutions Shines Under High Lead-Time Uncertainty (`bimodal_disrupted` & `right_skewed`):**
+   - By the Law of Total Variance, total DDLT variance decomposes into:
+     $$\text{Var}(D^{L+R}) = \mathbb{E}[L+R]\,\text{Var}(D) + \big(\mathbb{E}[D]\big)^2\,\text{Var}(L)$$
+   - When lead-time uncertainty $\text{Var}(L)$ is large—such as in **`bimodal_disrupted`** ($\text{SD}(L) = 3.19$ days) or **`right_skewed`** ($\text{SD}(L) = 1.50$ days)—the lead-time mixture variance term $(\mathbb{E}[D])^2 \text{Var}(L)$ dominates total DDLT uncertainty. Because our DDLT engine computes the **exact probability mixture of $m$-day convolutions** $\sum_{m} P(L+R=m) (X_1 * \dots * X_m)$ rather than a Gaussian approximation, **`glm_hurdle` achieves near-perfect PIT uniformity on `bimodal_disrupted` (`PIT MAE = 0.0285`, `PIT KS = 0.0062`, `Upper Tail = 1.0612`, and `+0.17 pp` coverage gap at $\tau = 0.80$, `-0.61 pp` at $\tau = 0.90$)**.
+3. **Why Longer Deterministic Lead Times (`deterministic_long`, $L+R=8$ Days) Exhibit Higher Dispersion Ratios:**
+   - Compare **`deterministic_short`** ($L+R = 3$ days) vs. **`deterministic_long`** ($L+R = 8$ days), where $\text{Var}(L) = 0$ in both cases:
+     - At $L+R = 3$ days (`deterministic_short`), `glm` has a dispersion ratio of **1.13** (`PIT MAE = 0.0631`) and `glm_hurdle` has **1.51** (`PIT MAE = 0.0623`), with only a **-1.60 pp** coverage gap at $\tau = 0.95$.
+     - At $L+R = 8$ days (`deterministic_long`), the dispersion ratio rises to **2.24** for `glm` and **2.86** for `glm_hurdle`, and the $\tau = 0.90$ PIT coverage gap widens to **-5.03 pp** for `glm_hurdle` (versus **-11.88 pp** for `empirical_trailing` and **-16.94 pp** for `empirical_seasonal`).
+   - **Theoretical Explanation (Positive Autocorrelation of Daily Demand):** Convolving 8 daily marginal distributions $X_1 * X_2 * \dots * X_8$ under conditional independence sums the marginal variances ($\sum_{h=1}^8 \text{Var}(X_h)$), omitting the $2 \sum_{i < j} \text{Cov}(X_i, X_j) > 0$ cross-day covariance terms that accumulate over an 8-day window when an SKU experiences a multi-day demand shift. Even so, `glm_hurdle` cuts the 8-day coverage deficit by **more than half** relative to the empirical baselines (`-5.03 pp` vs. `-11.88 pp` and `-16.94 pp`).
+
+---
+
+## 6. Key Takeaways
 
 1. **Matching the Grouping Strategy to Each GLM's Likelihood Structure:**
    - **Base `glm` (`hurdle=False, velocity_tiers=True`)** fits a single count distribution to all rows ($y_i \ge 0$), so partitioning by 3 causal velocity tiers (`velocity_tier`) prevents high-volume SKUs from inflating the shared dispersion parameter $\alpha$. This improved base `glm`'s DDLT PIT MAE by **19%** (`0.0790` $\to$ `0.0639`), reduced DDLT bias to **-5.40%**, and matched `catboost` on DDLT CRPS (**1.5990** vs. **1.5986**).
    - **Zero-Hurdle `glm_hurdle` (`hurdle=True, velocity_tiers="demand_regime"`)** fits Stage 2 (ZTP / ZTNB2) strictly on positive observations ($y_i \ge 1$). Partitioning by **Syntetos–Boylan (SBC) Demand Regime (`demand_regime`) $\times$ `positive_overdispersion`** avoids sample-starving Stage 2 in slow-moving tiers while separating smooth, erratic, intermittent, and lumpy positive-count dynamics.
 2. **`glm_hurdle` Achieves the Best Overall Probabilistic & DDLT Accuracy:**
    - **Best Daily Forecast Accuracy & Calibration:** Lowest daily `mean` WMAPE (**77.34%**), lowest daily `q0.50` WMAPE (**72.70%**), best daily CRPS (**0.7098**), and best daily PIT MAE (**0.0508**).
-   - **Best Convolved DDLT Accuracy & Calibration:** Lowest convolved DDLT CRPS (**1.5469** vs. `catboost` 1.5986 and base `glm` 1.5990), best DDLT PIT MAE (**0.0581**), and **lowest DDLT Pinball WMAPE across every service level ($\tau \in \{0.50, 0.80, 0.90, 0.95, 0.99\}$)**.
-3. **Numba Analytical Gradient Kernels Deliver 20×–25× Faster Training:**
-   - Both `glm` (2.1–4.0 s/section) and `glm_hurdle` (2.7–3.5 s/section) train and propagate DDLT distributions an order of magnitude faster than `catboost` (66.5–79.7 s/section), making them ideal for large-scale retail replenishment pipelines.
+   - **Best Convolved DDLT Accuracy Across All 7 Lead-Time Regimes:** Lowest convolved DDLT CRPS and **lowest DDLT Pinball WMAPE across every service level ($\tau \in \{0.50, 0.80, 0.90, 0.95, 0.99\}$)** across all 7 synthetic lead-time profiles.
+3. **Numba Analytical Gradient Kernels & Exact DP Convolutions Deliver 20×–25× Faster Execution:**
+   - Both `glm` (2.1–4.0 s/section) and `glm_hurdle` (2.7–3.5 s/section) train and propagate DDLT distributions an order of magnitude faster than `catboost` (66.5–79.7 s/section)—and evaluating all 7 lead-time profiles simultaneously takes under 0.2 seconds per section.
 
 ---
 
-## 6. Reproducibility & Output Artifacts
+## 7. Reproducibility & Output Artifacts
 
 To reproduce the 100-SKU benchmark via [`scripts/run_m5_experiments.py`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/scripts/run_m5_experiments.py):
 
 ```powershell
+# Standard 5-model benchmark:
 python scripts/run_m5_experiments.py `
   --stores CA_1 TX_1 WI_1 `
   --sample-skus 100 `
@@ -253,9 +355,22 @@ python scripts/run_m5_experiments.py `
   --downsample-zeros-frac 0.2 `
   --models glm glm_hurdle catboost empirical_trailing empirical_seasonal `
   --output-dir data/output/experiments_multistore_v2
+
+# Multi-profile synthetic lead-time sensitivity benchmark (7 lead-time distributions):
+python scripts/run_m5_experiments.py `
+  --stores CA_1 TX_1 WI_1 `
+  --sample-skus 100 `
+  --train-days 365 `
+  --test-days 14 `
+  --step-days 365 `
+  --max-sections 2 `
+  --downsample-zeros-frac 0.2 `
+  --models glm glm_hurdle empirical_trailing empirical_seasonal `
+  --lead-time-profiles all `
+  --output-dir data/output/experiments_lead_time
 ```
 
-All generated CSV summary tables are stored in [`data/output/experiments_multistore_v2/`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/):
+All generated CSV summary tables are stored in [`data/output/experiments_multistore_v2/`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/) and [`data/output/experiments_lead_time/`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/):
 - [`sections_manifest.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/sections_manifest.csv)
 - [`quantile_wmape_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/quantile_wmape_summary.csv)
 - [`quantile_wmape_by_cat.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/quantile_wmape_by_cat.csv)
@@ -263,6 +378,6 @@ All generated CSV summary tables are stored in [`data/output/experiments_multist
 - [`forecast_pit_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/forecast_pit_summary.csv)
 - [`forecast_pit_coverage.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/forecast_pit_coverage.csv)
 - [`forecast_pit_histogram.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/forecast_pit_histogram.csv)
-- [`ddlt_pit_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_summary.csv)
-- [`ddlt_pit_coverage.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_coverage.csv)
-- [`ddlt_pit_histogram.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_histogram.csv)
+- [`ddlt_pit_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_summary.csv) & [`experiments_lead_time/ddlt_pit_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/ddlt_pit_summary.csv)
+- [`ddlt_pit_coverage.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_coverage.csv) & [`experiments_lead_time/ddlt_pit_coverage.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/ddlt_pit_coverage.csv)
+- [`ddlt_pit_histogram.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_histogram.csv) & [`experiments_lead_time/ddlt_pit_histogram.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/ddlt_pit_histogram.csv)

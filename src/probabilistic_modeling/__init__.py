@@ -67,6 +67,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "InventorySimulationResult": "inventory.simulation",
     "simulate_inventory": "inventory.simulation",
     "resolve_target_inventory": "inventory.simulation",
+    "compute_kings_target_inventory": "inventory.simulation",
     "compute_simulation_kpis": "inventory.simulation",
     # utils
     "setup_logging": "logging_utils",

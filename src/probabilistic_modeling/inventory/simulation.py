@@ -39,8 +39,14 @@ import numpy as np
 import pandas as pd
 from numba import njit, prange
 from numba.typed import List as NumbaList
+from scipy.stats import norm
 
-from probabilistic_modeling.ddlt import _batch_pmf_quantiles_numba, _pmf_quantile_scalar_numba
+from probabilistic_modeling._panel import DenseHistory
+from probabilistic_modeling.ddlt import (
+    _batch_pmf_quantiles_numba,
+    _batch_pmf_quantiles_round_numba,
+    _pmf_quantile_scalar_numba,
+)
 from probabilistic_modeling.distributions.discrete import DiscreteDistribution
 from probabilistic_modeling.inventory.newsvendor import _solve_multi_product_newsvendor
 
@@ -362,6 +368,194 @@ def _simulate_inventory_mc_numba(
     return tot_sold, tot_lost, tot_ordered, sum_closing_inv, stockout_days
 
 
+def _lead_time_mean_var_vectors(
+    df: pd.DataFrame,
+    lead_time: DiscreteDistribution | dict[Any, DiscreteDistribution] | int,
+    lead_time_keys: list[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Resolve per-row expected lead time ``E[L]`` and lead-time variance ``Var(L)`` for ``df``.
+    """
+    n_rows = len(df)
+    if isinstance(lead_time, (int, float, np.integer, np.floating)):
+        return np.full(n_rows, float(lead_time), dtype=np.float64), np.zeros(n_rows, dtype=np.float64)
+
+    def _moments(d: DiscreteDistribution) -> tuple[float, float]:
+        sup = d.min + np.arange(len(d.pmf), dtype=np.float64) * d.bin_size
+        mu = float(np.dot(sup, d.pmf))
+        var = float(np.dot((sup - mu) ** 2, d.pmf))
+        return mu, var
+
+    if isinstance(lead_time, DiscreteDistribution) or not lead_time_keys:
+        d = lead_time if isinstance(lead_time, DiscreteDistribution) else next(iter(lead_time.values()))
+        mu_l, var_l = _moments(d)
+        return np.full(n_rows, mu_l, dtype=np.float64), np.full(n_rows, var_l, dtype=np.float64)
+
+    moment_map: dict[Any, tuple[float, float]] = {}
+    for k, d in lead_time.items():
+        mv = _moments(d)
+        moment_map[k] = mv
+        moment_map[str(k)] = mv
+    default_mv = next(iter(moment_map.values()))
+
+    mu_vec = np.empty(n_rows, dtype=np.float64)
+    var_vec = np.empty(n_rows, dtype=np.float64)
+    if len(lead_time_keys) == 1:
+        col = lead_time_keys[0]
+        for i, val in enumerate(df[col].to_numpy()):
+            mv = moment_map.get(val, moment_map.get(str(val), default_mv))
+            mu_vec[i] = mv[0]
+            var_vec[i] = mv[1]
+    else:
+        for i, row_vals in enumerate(df[lead_time_keys].itertuples(index=False, name=None)):
+            mv = moment_map.get(row_vals, moment_map.get(str(row_vals), default_mv))
+            mu_vec[i] = mv[0]
+            var_vec[i] = mv[1]
+    return mu_vec, var_vec
+
+
+def compute_kings_target_inventory(
+    df: pd.DataFrame,
+    lead_time: DiscreteDistribution | dict[Any, DiscreteDistribution] | int = 1,
+    lead_time_keys: list[str] | None = None,
+    cycle_time: int = 1,
+    service_level: float = 0.95,
+    history: pd.DataFrame | None = None,
+    ts_id_cols: list[str] | None = None,
+    period_col: str = "day",
+    var_col: str = "demand",
+    window: int = 56,
+    method: str = "trailing",
+    rounding: str = "round",
+    target_col: str = "target_inventory",
+    dist_col: str = "demand_distribution",
+) -> pd.DataFrame:
+    """
+    Computes order-up-to target inventory ``S_t`` using **King's Formula** (Normal approximation
+    for demand during stochastic lead time + review period):
+
+        mu_DDLT    = (E[L] + R) * mu_D
+        sigma_King = sqrt((E[L] + R) * sigma_D^2 + Var(L) * mu_D^2)
+        SS_King    = Phi^{-1}(alpha) * sigma_King
+        S_King     = round_or_ceil(max(0, mu_DDLT + SS_King))
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Decision rows (one row per SKU and decision period ``period_col``).
+    lead_time : DiscreteDistribution | dict | int
+        Replenishment lead-time distribution(s) or deterministic integer lead time.
+    lead_time_keys : list[str], optional
+        Columns mapping each row to its lead-time distribution when ``lead_time`` is a dict.
+    cycle_time : int, default 1
+        Review period ``R`` in periods.
+    service_level : float, default 0.95
+        Target cycle service level (instock quantile ``alpha in (0, 1)``).
+    history : pd.DataFrame, optional
+        Long historical demand panel ``(ts_id_cols, period_col, var_col)`` required when
+        ``method in ("trailing", "seasonal")``.
+    ts_id_cols : list[str], optional
+        Series identifier columns (inferred from ``df`` if omitted).
+    period_col, var_col : str
+        Period and demand column names in ``history``.
+    window : int, default 56
+        Trailing historical window length in periods for ``method="trailing"`` (or ``window // 7``
+        same-weekday weeks for ``method="seasonal"``).
+    method : {"trailing", "seasonal", "model"}, default "trailing"
+        How daily demand mean ``mu_D`` and standard deviation ``sigma_D`` are estimated:
+        - ``"trailing"``: sample mean and sample std (``ddof=1``) over the trailing ``window``
+          periods ``[t - window, t)`` strictly before decision period ``t``.
+        - ``"seasonal"``: sample mean and sample std over the last ``max(2, window // 7)``
+          same-weekday observations strictly before decision period ``t``.
+        - ``"model"``: uses the forecaster's predicted distribution moments on ``df`` (from
+          ``dist_col`` if present, or from ``target_t_plus_<h>_mu`` and trailing ``sigma_D``)
+          combined with Gaussian quantile ``Phi^{-1}(alpha)``.
+    rounding : {"round", "ceil"}, default "round"
+        Whether to round continuous ``mu_DDLT + z_alpha * sigma_King`` to nearest integer
+        (``"round"``) or round up (``"ceil"``).
+    target_col : str, default "target_inventory"
+        Output column name written to the returned DataFrame copy.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of ``df`` with ``target_col``, ``kings_cycle_stock``, ``kings_safety_stock``,
+        and ``kings_sigma`` columns populated.
+    """
+    if not (0.0 < float(service_level) < 1.0):
+        raise ValueError("'service_level' must be strictly between 0 and 1 for King's formula.")
+    method_norm = method.lower().strip()
+    if method_norm not in ("trailing", "seasonal", "model"):
+        raise ValueError(f"Unsupported King's formula method '{method}'. Choose from 'trailing', 'seasonal', 'model'.")
+    round_norm = rounding.lower().strip()
+    if round_norm not in ("round", "ceil"):
+        raise ValueError(f"Unsupported rounding '{rounding}'. Choose from 'round', 'ceil'.")
+
+    out = df.copy()
+    mu_lt, var_lt = _lead_time_mean_var_vectors(out, lead_time, lead_time_keys)
+    exposure_mean = mu_lt + float(cycle_time)
+    z_alpha = float(norm.ppf(float(service_level)))
+
+    if method_norm == "model" and dist_col in out.columns and out[dist_col].notna().all():
+        distrs = list(out[dist_col])
+        mu_ddlt = np.array([float(d.mean()) for d in distrs], dtype=np.float64)
+        sigma_king = np.array([float(d.std()) for d in distrs], dtype=np.float64)
+    else:
+        if history is None:
+            raise ValueError(f"'history' DataFrame is required when method='{method_norm}' and '{dist_col}' is absent.")
+        id_cols = list(ts_id_cols) if ts_id_cols else [
+            c for c in ("store_id", "item_id") if c in out.columns and c in history.columns
+        ]
+        if not id_cols:
+            id_cols = [c for c in ("id", "item_id") if c in out.columns and c in history.columns]
+        if not id_cols:
+            raise ValueError("Could not infer 'ts_id_cols' shared between 'df' and 'history'.")
+
+        dense_hist = DenseHistory.from_frame(history, id_cols, period_col, var_col)
+        r, c = dense_hist.locate(out)
+        hist_mat = dense_hist.matrix
+        if method_norm == "seasonal":
+            n_weeks = max(2, int(window) // 7)
+            offsets = -7 * np.arange(1, n_weeks + 1)
+        else:
+            offsets = np.arange(-max(2, int(window)), 0)
+
+        idx = c[:, None] + offsets[None, :]
+        valid = (idx >= 0) & (idx < hist_mat.shape[1]) & (r[:, None] >= 0) & (c[:, None] >= 0)
+        vals = np.where(
+            valid,
+            hist_mat[np.clip(r, 0, None)[:, None], np.clip(idx, 0, hist_mat.shape[1] - 1)],
+            np.nan,
+        )
+        n_valid = np.sum(np.isfinite(vals), axis=1)
+        mu_d = np.where(n_valid > 0, np.nanmean(vals, axis=1), 0.0)
+        std_d = np.where(n_valid > 1, np.nanstd(vals, axis=1, ddof=1), 0.0)
+        mu_d = np.nan_to_num(mu_d, nan=0.0, posinf=0.0, neginf=0.0)
+        std_d = np.nan_to_num(std_d, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if method_norm == "model":
+            mu_cols = sorted(col for col in out.columns if col.startswith("target_t_plus_") and col.endswith("_mu"))
+            if mu_cols:
+                mu_d = np.nanmean(out[mu_cols].to_numpy(dtype=np.float64), axis=1)
+                mu_d = np.nan_to_num(mu_d, nan=0.0, posinf=0.0, neginf=0.0)
+
+        mu_ddlt = exposure_mean * mu_d
+        sigma_king = np.sqrt(np.maximum(0.0, exposure_mean * (std_d ** 2) + var_lt * (mu_d ** 2)))
+
+    safety_stock = z_alpha * sigma_king
+    raw_target = np.maximum(0.0, mu_ddlt + safety_stock)
+    if round_norm == "ceil":
+        target_inv = np.ceil(raw_target).astype(np.int64)
+    else:
+        target_inv = np.round(raw_target).astype(np.int64)
+
+    out["kings_cycle_stock"] = mu_ddlt
+    out["kings_safety_stock"] = safety_stock
+    out["kings_sigma"] = sigma_king
+    out[target_col] = target_inv
+    return out
+
+
 def resolve_target_inventory(
     df: pd.DataFrame,
     policy: str = "auto",
@@ -370,13 +564,27 @@ def resolve_target_inventory(
     target_col: str = "target_inventory",
     dist_col: str = "demand_distribution",
     group_cols: list[str] | None = None,
+    quantile_rounding: str = "ceil",
+    lead_time: DiscreteDistribution | dict[Any, DiscreteDistribution] | int = 1,
+    lead_time_keys: list[str] | None = None,
+    cycle_time: int = 1,
+    history: pd.DataFrame | None = None,
+    ts_id_cols: list[str] | None = None,
+    period_col: str = "day",
+    var_col: str = "demand",
+    kings_window: int = 56,
+    kings_method: str = "trailing",
+    kings_rounding: str = "round",
 ) -> pd.DataFrame:
     """
     Computes or validates `target_col` on `df` according to `policy`:
 
     - `policy="quantile"`: sets `target_col` to the `service_level` quantile of
       `df[dist_col]` using Numba-compiled `O(1)`-memory quantile lookup
-      (`_batch_pmf_quantiles_numba`, no newsvendor needed).
+      (`_batch_pmf_quantiles_numba` when `quantile_rounding="ceil"`, or
+      `_batch_pmf_quantiles_round_numba` when `quantile_rounding="round"`).
+    - `policy="kings"`: sets `target_col` using King's safety-stock formula via
+      :func:`compute_kings_target_inventory`.
     - `policy="newsvendor"`: solves the budget-constrained multi-product newsvendor problem
       using `budget` and economic columns (`sell_price`, `purchase_cost`, `shortage_penalty`)
       via `_solve_multi_product_newsvendor`.
@@ -399,9 +607,9 @@ def resolve_target_inventory(
         out["shortage_penalty"] = out["shortage_cost"]
 
     policy_norm = policy.lower().strip()
-    if policy_norm not in ("auto", "quantile", "newsvendor", "precomputed"):
+    if policy_norm not in ("auto", "quantile", "kings", "newsvendor", "precomputed"):
         raise ValueError(
-            f"Unsupported policy '{policy}'. Choose from 'auto', 'quantile', 'newsvendor', 'precomputed'."
+            f"Unsupported policy '{policy}'. Choose from 'auto', 'quantile', 'kings', 'newsvendor', 'precomputed'."
         )
 
     if policy_norm == "auto":
@@ -422,6 +630,25 @@ def resolve_target_inventory(
             raise ValueError(f"Column '{target_col}' is required when policy='precomputed'.")
         return out
 
+    if policy_norm == "kings":
+        sl = 0.95 if service_level is None else float(service_level)
+        return compute_kings_target_inventory(
+            out,
+            lead_time=lead_time,
+            lead_time_keys=lead_time_keys,
+            cycle_time=cycle_time,
+            service_level=sl,
+            history=history,
+            ts_id_cols=ts_id_cols,
+            period_col=period_col,
+            var_col=var_col,
+            window=kings_window,
+            method=kings_method,
+            rounding=kings_rounding,
+            target_col=target_col,
+            dist_col=dist_col,
+        )
+
     if dist_col not in out.columns:
         if target_col in out.columns and policy_norm == "quantile":
             logger.info("'%s' not present; using existing '%s' column.", dist_col, target_col)
@@ -437,6 +664,10 @@ def resolve_target_inventory(
                 raise ValueError("'service_level' must be between 0 and 1.")
             alphas = np.full(len(out), sl, dtype=np.float64)
 
+        q_round = quantile_rounding.lower().strip()
+        if q_round not in ("ceil", "round"):
+            raise ValueError(f"Unsupported quantile_rounding '{quantile_rounding}'. Choose from 'ceil', 'round'.")
+
         distrs = list(out[dist_col])
         pmfs = NumbaList()
         mins = np.empty(len(distrs), dtype=np.int64)
@@ -446,7 +677,10 @@ def resolve_target_inventory(
             mins[idx] = int(d.min)
             bin_sizes[idx] = int(d.bin_size)
 
-        out[target_col] = _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alphas)
+        if q_round == "round":
+            out[target_col] = _batch_pmf_quantiles_round_numba(pmfs, mins, bin_sizes, alphas)
+        else:
+            out[target_col] = _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alphas)
         return out
 
     # policy_norm == "newsvendor":
@@ -514,6 +748,7 @@ def compute_simulation_kpis(
         stockout_freq = float((gdf["lost_sales"] > 0).mean()) if n_item_days > 0 else 0.0
         cycle_sl = 1.0 - stockout_freq
 
+        avg_target = float(gdf["target_inventory"].mean()) if (n_item_days > 0 and "target_inventory" in gdf.columns) else 0.0
         avg_closing = float(gdf["closing_inv"].mean()) if n_item_days > 0 else 0.0
         avg_on_hand = float(gdf["on_hand_before_demand"].mean()) if n_item_days > 0 else 0.0
         avg_in_transit = float(gdf["in_transit_end"].mean()) if n_item_days > 0 else 0.0
@@ -532,6 +767,7 @@ def compute_simulation_kpis(
             "fill_rate": round(fill_rate, 4),
             "cycle_service_level": round(cycle_sl, 4),
             "stockout_frequency": round(stockout_freq, 4),
+            "avg_target_inventory": round(avg_target, 2),
             "avg_closing_inv": round(avg_closing, 2),
             "avg_on_hand": round(avg_on_hand, 2),
             "avg_in_transit": round(avg_in_transit, 2),
@@ -749,6 +985,11 @@ class InventorySimulator:
         budget: float | None = None,
         group_cols: list[str] | None = None,
         n_mc_simulations: int = 0,
+        quantile_rounding: str = "ceil",
+        history: pd.DataFrame | None = None,
+        kings_window: int = 56,
+        kings_method: str = "trailing",
+        kings_rounding: str = "round",
     ) -> InventorySimulationResult:
         """
         Runs the multi-period inventory simulation over `predictions_df`.
@@ -796,6 +1037,16 @@ class InventorySimulator:
             budget=budget,
             target_col=target_col,
             group_cols=nv_group_cols,
+            quantile_rounding=quantile_rounding,
+            lead_time=self.lead_time,
+            lead_time_keys=self.lead_time_keys,
+            cycle_time=self.cycle_time,
+            history=history,
+            ts_id_cols=item_id_cols,
+            period_col=period_col,
+            kings_window=kings_window,
+            kings_method=kings_method,
+            kings_rounding=kings_rounding,
         )
         if "demand_distribution" in df.columns:
             df = df.drop(columns=["demand_distribution"])
@@ -814,7 +1065,12 @@ class InventorySimulator:
 
         periods = sorted(df[period_col].unique())
         n_days = len(periods)
-        items_df = df[item_id_cols].drop_duplicates().reset_index(drop=True)
+        item_meta_cols = list(item_id_cols)
+        if self.lead_time_keys is not None:
+            for k_col in self.lead_time_keys:
+                if k_col not in item_meta_cols and k_col in df.columns:
+                    item_meta_cols.append(k_col)
+        items_df = df[item_meta_cols].drop_duplicates(subset=item_id_cols).reset_index(drop=True)
         n_items = len(items_df)
 
         if len(df) != n_items * n_days:
@@ -1039,6 +1295,11 @@ def simulate_inventory(
     n_mc_simulations: int = 0,
     random_seed: int = 42,
     random_state: int | None = None,
+    quantile_rounding: str = "ceil",
+    history: pd.DataFrame | None = None,
+    kings_window: int = 56,
+    kings_method: str = "trailing",
+    kings_rounding: str = "round",
 ) -> InventorySimulationResult:
     """
     Functional convenience wrapper around `InventorySimulator(...).run(predictions_df, ...)`.
@@ -1071,4 +1332,9 @@ def simulate_inventory(
         budget=budget,
         group_cols=group_cols,
         n_mc_simulations=n_mc_simulations,
+        quantile_rounding=quantile_rounding,
+        history=history,
+        kings_window=kings_window,
+        kings_method=kings_method,
+        kings_rounding=kings_rounding,
     )

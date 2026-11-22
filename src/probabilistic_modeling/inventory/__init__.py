@@ -2,6 +2,7 @@
 from probabilistic_modeling.inventory.simulation import (
     InventorySimulationResult,
     InventorySimulator,
+    compute_kings_target_inventory,
     compute_simulation_kpis,
     resolve_target_inventory,
     simulate_inventory,
@@ -10,6 +11,7 @@ from probabilistic_modeling.inventory.simulation import (
 __all__ = [
     "InventorySimulationResult",
     "InventorySimulator",
+    "compute_kings_target_inventory",
     "compute_simulation_kpis",
     "resolve_target_inventory",
     "simulate_inventory",

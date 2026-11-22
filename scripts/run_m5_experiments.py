@@ -37,6 +37,7 @@ Evaluation Framework
 from __future__ import annotations
 
 import argparse
+import gc
 from pathlib import Path
 import sys
 import time
@@ -74,6 +75,19 @@ ALL_MODELS = (
     "catboost",
     "empirical_trailing",
     "empirical_seasonal",
+)
+
+ALL_M5_STORES = (
+    "CA_1",
+    "CA_2",
+    "CA_3",
+    "CA_4",
+    "TX_1",
+    "TX_2",
+    "TX_3",
+    "WI_1",
+    "WI_2",
+    "WI_3",
 )
 
 
@@ -238,15 +252,38 @@ def build_section_time_series(
     return ts
 
 
-def build_default_lead_time_map() -> dict[tuple[str, str], DiscreteDistribution]:
-    """Build per-(store_id, cat_id) stochastic lead-time distributions for DDLT evaluation."""
+DEFAULT_LEAD_TIME_PROFILES: dict[str, DiscreteDistribution] = {
+    "short_concentrated": DiscreteDistribution(np.array([0.2, 0.5, 0.3]), 1, 1),
+    "deterministic_short": DiscreteDistribution(np.array([1.0]), 2, 1),
+    "deterministic_long": DiscreteDistribution(np.array([1.0]), 7, 1),
+    "right_skewed": DiscreteDistribution(np.array([0.40, 0.25, 0.15, 0.10, 0.05, 0.03, 0.02]), 1, 1),
+    "long_symmetric": DiscreteDistribution(np.array([0.05, 0.15, 0.25, 0.30, 0.15, 0.07, 0.03]), 4, 1),
+    "uniform_wide": DiscreteDistribution(np.full(10, 0.10), 1, 1),
+    "bimodal_disrupted": DiscreteDistribution(
+        np.array([0.30, 0.40, 0.05, 0.0, 0.0, 0.0, 0.0, 0.05, 0.12, 0.08]), 1, 1
+    ),
+}
+
+
+def build_lead_time_map_for_profile(profile_name: str = "short_concentrated") -> dict[tuple[str, str], DiscreteDistribution]:
+    """Build per-(store_id, cat_id) stochastic lead-time distributions for a named synthetic lead-time profile."""
+    if profile_name not in DEFAULT_LEAD_TIME_PROFILES:
+        raise ValueError(
+            f"Unknown lead-time profile '{profile_name}'. Available profiles: {list(DEFAULT_LEAD_TIME_PROFILES)}"
+        )
+    lt_dist = DEFAULT_LEAD_TIME_PROFILES[profile_name]
     stores = ["CA_1", "CA_2", "CA_3", "CA_4", "TX_1", "TX_2", "TX_3", "WI_1", "WI_2", "WI_3"]
     categories = ["FOODS", "HOBBIES", "HOUSEHOLD"]
     return {
-        (s, c): DiscreteDistribution(np.array([0.2, 0.5, 0.3]), 1, 1)
+        (s, c): lt_dist
         for s in stores
         for c in categories
     }
+
+
+def build_default_lead_time_map() -> dict[tuple[str, str], DiscreteDistribution]:
+    """Build default per-(store_id, cat_id) stochastic lead-time distributions for DDLT evaluation."""
+    return build_lead_time_map_for_profile("short_concentrated")
 
 
 def aggregate_quantile_wmape_across_sections(
@@ -338,7 +375,13 @@ def aggregate_pit_across_sections(
     folds weighted by observation count ``obs_col``.
     """
     has_target = "target" in summary_sec_df.columns
-    group_keys = ["model", "group", *(["target"] if has_target else [])]
+    has_profile = "lead_time_profile" in summary_sec_df.columns
+    group_keys = [
+        *(["lead_time_profile"] if has_profile else []),
+        "model",
+        "group",
+        *(["target"] if has_target else []),
+    ]
 
     # 1. Aggregate PIT histograms first so pooled uniformity metrics use pooled bin masses
     pit_rows: list[dict] = []
@@ -572,6 +615,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip multi-day lead-time demand (DDLT) convolution and DDLT PIT evaluation.",
     )
     parser.add_argument(
+        "--lead-time-profiles",
+        type=str,
+        nargs="+",
+        default=["short_concentrated"],
+        choices=[*DEFAULT_LEAD_TIME_PROFILES.keys(), "all"],
+        help="Synthetic lead-time distribution profile(s) to evaluate for DDLT (default: short_concentrated; pass 'all' for all 7 profiles).",
+    )
+    parser.add_argument(
         "--data-dir",
         type=str,
         default="data/m5-forecasting-accuracy/partitioned_data",
@@ -582,6 +633,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="data/output/experiments",
         help="Directory where experiment CSV tables and logs will be saved.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Save per-(store, section) checkpoints and resume from already-completed sections if interrupted.",
     )
     parser.add_argument(
         "--log-level",
@@ -603,14 +659,24 @@ def main() -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
 
     models_to_run = list(ALL_MODELS) if "all" in args.models else list(dict.fromkeys(args.models))
+    stores_to_run = list(ALL_M5_STORES) if "all" in [s.lower() for s in args.stores] else list(dict.fromkeys(args.stores))
+    lt_profiles_to_run = (
+        list(DEFAULT_LEAD_TIME_PROFILES.keys())
+        if "all" in args.lead_time_profiles
+        else list(dict.fromkeys(args.lead_time_profiles))
+    )
     quantiles = tuple(sorted(float(q) for q in args.quantiles))
     calib_levels = tuple(sorted(float(lv) for lv in args.calibration_levels))
     data_dir = Path(args.data_dir)
+    ckpt_dir = output_dir / "checkpoints"
+    if args.resume:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=====================================================================")
     logger.info("M5 Probabilistic Forecasting Benchmark")
-    logger.info("  Stores             : %s", args.stores)
+    logger.info("  Stores             : %s", stores_to_run)
     logger.info("  Models             : %s", models_to_run)
+    logger.info("  Lead-Time Profiles : %s", lt_profiles_to_run)
     logger.info(
         "  Sectioning         : train_days=%d, test_days=%d, step_days=%d, max_sections=%s",
         args.train_days,
@@ -621,13 +687,15 @@ def main() -> None:
     logger.info("  Forecast horizon   : %d days (pred_first_day=%s)", args.horizon, args.pred_first_day)
     logger.info("  Quantiles          : %s", list(quantiles))
     logger.info("  Calibration levels : %s (n_pit_bins=%d)", list(calib_levels), args.n_pit_bins)
-    logger.info("  Output directory   : %s", output_dir)
+    logger.info("  Output directory   : %s (resume=%s)", output_dir, args.resume)
     logger.info("=====================================================================")
 
     calendar_df = load_enriched_calendar(data_dir)
     prices_df = pd.read_parquet(data_dir / "price.parquet")
     prices_df["sell_price"] = np.log1p(prices_df["sell_price"])
-    lead_time_map = build_default_lead_time_map()
+    lead_time_maps = {
+        prof: build_lead_time_map_for_profile(prof) for prof in lt_profiles_to_run
+    }
 
     manifest_rows: list[dict] = []
     wmape_sec_frames: list[pd.DataFrame] = []
@@ -638,18 +706,12 @@ def main() -> None:
     ddlt_cov_frames: list[pd.DataFrame] = []
     ddlt_hist_frames: list[pd.DataFrame] = []
 
-    need_glm_ts = any(
-        m in models_to_run
-        for m in (
-            "glm",
-            "glm_hurdle",
-            "empirical_trailing",
-            "empirical_seasonal",
-        )
-    )
-    need_cb_ts = "catboost" in models_to_run
+    glm_models_ordered = [
+        m for m in models_to_run if m in ("glm", "glm_hurdle", "empirical_trailing", "empirical_seasonal")
+    ]
+    cb_models_ordered = [m for m in models_to_run if m == "catboost"]
 
-    for store_id in args.stores:
+    for store_id in stores_to_run:
         sales_path = data_dir / f"sales_data_{store_id}.parquet"
         if not sales_path.exists():
             raise FileNotFoundError(
@@ -712,6 +774,19 @@ def main() -> None:
                 }
             )
 
+            ckpt_prefix = ckpt_dir / f"{store_id}_{sec.name}"
+            if args.resume and (ckpt_prefix.with_name(f"{ckpt_prefix.name}_done.flag")).exists():
+                logger.info("Resuming: loading completed checkpoint for [%s | %s]", store_id, sec.name)
+                wmape_sec_frames.append(pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_wmape.csv")))
+                fpit_summ_frames.append(pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_fpit_summ.csv")))
+                fpit_cov_frames.append(pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_fpit_cov.csv")))
+                fpit_hist_frames.append(pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_fpit_hist.csv")))
+                if not args.skip_ddlt and (ckpt_prefix.with_name(f"{ckpt_prefix.name}_ddlt_summ.csv")).exists():
+                    ddlt_summ_frames.append(pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_ddlt_summ.csv")))
+                    ddlt_cov_frames.append(pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_ddlt_cov.csv")))
+                    ddlt_hist_frames.append(pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_ddlt_hist.csv")))
+                continue
+
             # Include horizon-1 lookahead days after test_end_day so all test decision days
             # have complete realized targets target_t_plus_0..target_t_plus_{H-1} and DDLT windows.
             slice_end_day = min(max_day, sec.test_end_day + args.horizon - 1)
@@ -725,179 +800,161 @@ def main() -> None:
                 & (store_prices_df["day"] <= slice_end_day)
             ].reset_index(drop=True)
 
-            ts_glm: DiscreteTimeSeries | None = None
-            ts_cb: DiscreteTimeSeries | None = None
-            if need_glm_ts:
-                fe_t0 = time.perf_counter()
-                ts_glm = build_section_time_series(
-                    sales_slice=sales_slice,
-                    calendar_slice=cal_slice,
-                    prices_slice=price_slice,
-                    section=sec,
-                    horizon=args.horizon,
-                    for_catboost=False,
-                    downsample_zeros_frac=args.downsample_zeros_frac,
-                )
-                logger.info(
-                    "Built GLM/Baseline panel (%d rows, %d features) in %.2fs",
-                    len(ts_glm.df),
-                    len(ts_glm.feature_cols),
-                    time.perf_counter() - fe_t0,
-                )
-            if need_cb_ts:
-                fe_t0 = time.perf_counter()
-                ts_cb = build_section_time_series(
-                    sales_slice=sales_slice,
-                    calendar_slice=cal_slice,
-                    prices_slice=price_slice,
-                    section=sec,
-                    horizon=args.horizon,
-                    for_catboost=True,
-                    downsample_zeros_frac=args.downsample_zeros_frac,
-                )
-                logger.info(
-                    "Built CatBoost panel (%d rows, %d features) in %.2fs",
-                    len(ts_cb.df),
-                    len(ts_cb.feature_cols),
-                    time.perf_counter() - fe_t0,
-                )
-
             eval_period = (
                 [sec.test_start_day]
                 if args.pred_first_day
                 else list(range(sec.test_start_day, sec.test_end_day + 1))
             )
 
-            for model_name in models_to_run:
-                m_t0 = time.perf_counter()
-                logger.info("Running model '%s' on %s / %s...", model_name, store_id, sec.name)
+            sec_wmape_list: list[pd.DataFrame] = []
+            sec_fpit_summ_list: list[pd.DataFrame] = []
+            sec_fpit_cov_list: list[pd.DataFrame] = []
+            sec_fpit_hist_list: list[pd.DataFrame] = []
+            sec_ddlt_summ_list: list[pd.DataFrame] = []
+            sec_ddlt_cov_list: list[pd.DataFrame] = []
+            sec_ddlt_hist_list: list[pd.DataFrame] = []
 
-                if model_name == "glm":
-                    assert ts_glm is not None
-                    forecaster = GLMForecaster(
-                        train_groups=["store_id", "cat_id"],
-                        hurdle=False,
-                        velocity_tiers=True,
-                        n_jobs=args.n_jobs,
-                    )
-                    forecaster.fit(ts_glm)
-                    active_ts = ts_glm
-                elif model_name == "glm_hurdle":
-                    assert ts_glm is not None
-                    forecaster = GLMForecaster(
-                        train_groups=["store_id", "cat_id"],
-                        hurdle=True,
-                        velocity_tiers="demand_regime",
-                        n_jobs=args.n_jobs,
-                    )
-                    forecaster.fit(ts_glm)
-                    active_ts = ts_glm
-                elif model_name == "catboost":
-                    assert ts_cb is not None
-                    forecaster = CatBoostQuantileForecaster(
-                        quantiles=quantiles,
-                        catboost_params={
-                            "iterations": args.catboost_iterations,
-                            "learning_rate": 0.08,
-                            "depth": 6,
-                            "thread_count": args.n_jobs,
-                            "verbose": False,
-                        },
-                    )
-                    forecaster.fit(ts_cb)
-                    active_ts = ts_cb
-                elif model_name == "empirical_trailing":
-                    assert ts_glm is not None
-                    forecaster = EmpiricalQuantileForecaster(
-                        quantiles=quantiles,
-                        method="trailing",
-                        window=args.trailing_window,
+            ts_glm: DiscreteTimeSeries | None = None
+            ts_cb: DiscreteTimeSeries | None = None
+
+            # Build GLM/Baseline panel first, run GLM & Empirical models, then free ts_glm before CatBoost
+            # so peak RAM usage is cut by ~50% on full-SKU (3,049 series) runs.
+            for phase_name, phase_models, is_cb in (
+                ("glm_and_baselines", glm_models_ordered, False),
+                ("catboost", cb_models_ordered, True),
+            ):
+                if not phase_models:
+                    continue
+                fe_t0 = time.perf_counter()
+                if not is_cb:
+                    ts_glm = build_section_time_series(
+                        sales_slice=sales_slice,
+                        calendar_slice=cal_slice,
+                        prices_slice=price_slice,
+                        section=sec,
                         horizon=args.horizon,
+                        for_catboost=False,
+                        downsample_zeros_frac=args.downsample_zeros_frac,
                     )
-                    forecaster.fit(ts_glm, history=sales_slice)
-                    active_ts = ts_glm
-                elif model_name == "empirical_seasonal":
-                    assert ts_glm is not None
-                    forecaster = EmpiricalQuantileForecaster(
-                        quantiles=quantiles,
-                        method="seasonal",
-                        n_weeks=args.seasonal_weeks,
-                        horizon=args.horizon,
+                    logger.info(
+                        "Built GLM/Baseline panel (%d rows, %d features) in %.2fs",
+                        len(ts_glm.df),
+                        len(ts_glm.feature_cols),
+                        time.perf_counter() - fe_t0,
                     )
-                    forecaster.fit(ts_glm, history=sales_slice)
-                    active_ts = ts_glm
                 else:
-                    raise ValueError(f"Unknown model: {model_name}")
-
-                target_cols = list(active_ts.target_cols)
-                pred_df = forecaster.predict(active_ts, period=eval_period)
-                populate_model_quantiles(pred_df, target_cols, quantiles=quantiles, inplace=True)
-
-                # (i) Evaluate WMAPE across quantiles
-                wmape_sec = evaluate_quantile_wmape(
-                    pred_df=pred_df,
-                    target_cols=target_cols,
-                    quantiles=quantiles,
-                    group_cols=["cat_id"],
-                    include_mean=True,
-                    include_horizon_sum=True,
-                )
-                wmape_sec.insert(0, "model", model_name)
-                wmape_sec.insert(0, "section", sec.name)
-                wmape_sec.insert(0, "section_id", sec.section_id)
-                wmape_sec.insert(0, "store_id", store_id)
-                wmape_sec_frames.append(wmape_sec)
-
-                # (ii-a) Evaluate horizon-level PIT distributions
-                fpit_res = evaluate_forecast_pit(
-                    pred_df=pred_df,
-                    target_cols=target_cols,
-                    levels=calib_levels,
-                    quantiles=quantiles,
-                    group_cols=["cat_id"],
-                    include_by_horizon=True,
-                    n_pit_bins=args.n_pit_bins,
-                )
-                for df_piece, collector in (
-                    (fpit_res.summary_df, fpit_summ_frames),
-                    (fpit_res.coverage_df, fpit_cov_frames),
-                    (fpit_res.pit_df, fpit_hist_frames),
-                ):
-                    tagged = df_piece.copy()
-                    tagged.insert(0, "model", model_name)
-                    tagged.insert(0, "section", sec.name)
-                    tagged.insert(0, "section_id", sec.section_id)
-                    tagged.insert(0, "store_id", store_id)
-                    collector.append(tagged)
-
-                # (ii-b) Evaluate convolved DDLT PIT distributions & DDLT quantile WMAPE
-                if not args.skip_ddlt:
-                    ddlt_dist_df = forecaster.compute_ddlt(
-                        active_ts,
-                        lead_time=lead_time_map,
-                        lead_time_keys=["store_id", "cat_id"],
-                        cycle_time=1,
-                        return_distribution=True,
-                        pred_first_day=args.pred_first_day,
-                        period=eval_period,
+                    ts_cb = build_section_time_series(
+                        sales_slice=sales_slice,
+                        calendar_slice=cal_slice,
+                        prices_slice=price_slice,
+                        section=sec,
+                        horizon=args.horizon,
+                        for_catboost=True,
+                        downsample_zeros_frac=args.downsample_zeros_frac,
                     )
-                    ddlt_cal = evaluate_ddlt_calibration(
-                        ddlt_df=ddlt_dist_df,
-                        history=sales_slice,
-                        lead_time=lead_time_map,
-                        ts_id_cols=active_ts.ts_id_cols,
-                        lead_time_keys=["store_id", "cat_id"],
-                        cycle_time=1,
-                        period_col=active_ts.period_col,
-                        var_col=active_ts.var_col,
-                        levels=calib_levels,
+                    logger.info(
+                        "Built CatBoost panel (%d rows, %d features) in %.2fs",
+                        len(ts_cb.df),
+                        len(ts_cb.feature_cols),
+                        time.perf_counter() - fe_t0,
+                    )
+
+                for model_name in phase_models:
+                    m_t0 = time.perf_counter()
+                    logger.info("Running model '%s' on %s / %s...", model_name, store_id, sec.name)
+
+                    if model_name == "glm":
+                        assert ts_glm is not None
+                        forecaster = GLMForecaster(
+                            train_groups=["store_id", "cat_id"],
+                            hurdle=False,
+                            velocity_tiers=True,
+                            n_jobs=args.n_jobs,
+                        )
+                        forecaster.fit(ts_glm)
+                        active_ts = ts_glm
+                    elif model_name == "glm_hurdle":
+                        assert ts_glm is not None
+                        forecaster = GLMForecaster(
+                            train_groups=["store_id", "cat_id"],
+                            hurdle=True,
+                            velocity_tiers="demand_regime",
+                            n_jobs=args.n_jobs,
+                        )
+                        forecaster.fit(ts_glm)
+                        active_ts = ts_glm
+                    elif model_name == "catboost":
+                        assert ts_cb is not None
+                        forecaster = CatBoostQuantileForecaster(
+                            quantiles=quantiles,
+                            catboost_params={
+                                "iterations": args.catboost_iterations,
+                                "learning_rate": 0.08,
+                                "depth": 6,
+                                "thread_count": args.n_jobs,
+                                "verbose": False,
+                            },
+                        )
+                        forecaster.fit(ts_cb)
+                        active_ts = ts_cb
+                    elif model_name == "empirical_trailing":
+                        assert ts_glm is not None
+                        forecaster = EmpiricalQuantileForecaster(
+                            quantiles=quantiles,
+                            method="trailing",
+                            window=args.trailing_window,
+                            horizon=args.horizon,
+                        )
+                        forecaster.fit(ts_glm, history=sales_slice)
+                        active_ts = ts_glm
+                    elif model_name == "empirical_seasonal":
+                        assert ts_glm is not None
+                        forecaster = EmpiricalQuantileForecaster(
+                            quantiles=quantiles,
+                            method="seasonal",
+                            n_weeks=args.seasonal_weeks,
+                            horizon=args.horizon,
+                        )
+                        forecaster.fit(ts_glm, history=sales_slice)
+                        active_ts = ts_glm
+                    else:
+                        raise ValueError(f"Unknown model: {model_name}")
+
+                    target_cols = list(active_ts.target_cols)
+                    pred_df = forecaster.predict(active_ts, period=eval_period)
+                    populate_model_quantiles(pred_df, target_cols, quantiles=quantiles, inplace=True)
+
+                    # (i) Evaluate WMAPE across quantiles
+                    wmape_sec = evaluate_quantile_wmape(
+                        pred_df=pred_df,
+                        target_cols=target_cols,
+                        quantiles=quantiles,
                         group_cols=["cat_id"],
+                        include_mean=True,
+                        include_horizon_sum=True,
+                    )
+                    wmape_sec.insert(0, "model", model_name)
+                    wmape_sec.insert(0, "section", sec.name)
+                    wmape_sec.insert(0, "section_id", sec.section_id)
+                    wmape_sec.insert(0, "store_id", store_id)
+                    wmape_sec_frames.append(wmape_sec)
+                    sec_wmape_list.append(wmape_sec)
+
+                    # (ii-a) Evaluate horizon-level PIT distributions
+                    fpit_res = evaluate_forecast_pit(
+                        pred_df=pred_df,
+                        target_cols=target_cols,
+                        levels=calib_levels,
+                        quantiles=quantiles,
+                        group_cols=["cat_id"],
+                        include_by_horizon=True,
                         n_pit_bins=args.n_pit_bins,
                     )
-                    for df_piece, collector in (
-                        (ddlt_cal.summary_df, ddlt_summ_frames),
-                        (ddlt_cal.coverage_df, ddlt_cov_frames),
-                        (ddlt_cal.pit_df, ddlt_hist_frames),
+                    del pred_df
+                    for df_piece, collector, sec_collector in (
+                        (fpit_res.summary_df, fpit_summ_frames, sec_fpit_summ_list),
+                        (fpit_res.coverage_df, fpit_cov_frames, sec_fpit_cov_list),
+                        (fpit_res.pit_df, fpit_hist_frames, sec_fpit_hist_list),
                     ):
                         tagged = df_piece.copy()
                         tagged.insert(0, "model", model_name)
@@ -905,27 +962,104 @@ def main() -> None:
                         tagged.insert(0, "section_id", sec.section_id)
                         tagged.insert(0, "store_id", store_id)
                         collector.append(tagged)
+                        sec_collector.append(tagged)
 
-                q50_row = wmape_sec[
-                    (wmape_sec["group"] == "overall")
-                    & (wmape_sec["target"] == "all_horizons")
-                    & (wmape_sec["quantile"] == "q0.5")
-                ]
-                pit_row = fpit_res.summary_df[
-                    (fpit_res.summary_df["group"] == "overall")
-                    & (fpit_res.summary_df["target"] == "all_horizons")
-                ]
-                q50_wmape = float(q50_row["wmape"].iloc[0]) if not q50_row.empty else np.nan
-                pit_mae = float(pit_row["pit_mae"].iloc[0]) if not pit_row.empty else np.nan
-                logger.info(
-                    "Finished '%s' on %s / %s in %.2fs | all_horizons q0.5 WMAPE=%.2f%% | PIT MAE=%.3f",
-                    model_name,
-                    store_id,
-                    sec.name,
-                    time.perf_counter() - m_t0,
-                    q50_wmape,
-                    pit_mae,
+                    # (ii-b) Evaluate convolved DDLT PIT distributions & DDLT quantile WMAPE
+                    if not args.skip_ddlt:
+                        for lt_prof_name, lt_map in lead_time_maps.items():
+                            ddlt_dist_df = forecaster.compute_ddlt(
+                                active_ts,
+                                lead_time=lt_map,
+                                lead_time_keys=["store_id", "cat_id"],
+                                cycle_time=1,
+                                return_distribution=True,
+                                pred_first_day=args.pred_first_day,
+                                period=eval_period,
+                            )
+                            ddlt_cal = evaluate_ddlt_calibration(
+                                ddlt_df=ddlt_dist_df,
+                                history=sales_slice,
+                                lead_time=lt_map,
+                                ts_id_cols=active_ts.ts_id_cols,
+                                lead_time_keys=["store_id", "cat_id"],
+                                cycle_time=1,
+                                period_col=active_ts.period_col,
+                                var_col=active_ts.var_col,
+                                levels=calib_levels,
+                                group_cols=["cat_id"],
+                                n_pit_bins=args.n_pit_bins,
+                            )
+                            del ddlt_dist_df
+                            for df_piece, collector, sec_collector in (
+                                (ddlt_cal.summary_df, ddlt_summ_frames, sec_ddlt_summ_list),
+                                (ddlt_cal.coverage_df, ddlt_cov_frames, sec_ddlt_cov_list),
+                                (ddlt_cal.pit_df, ddlt_hist_frames, sec_ddlt_hist_list),
+                            ):
+                                tagged = df_piece.copy()
+                                if len(lead_time_maps) > 1:
+                                    tagged.insert(0, "lead_time_profile", lt_prof_name)
+                                tagged.insert(0, "model", model_name)
+                                tagged.insert(0, "section", sec.name)
+                                tagged.insert(0, "section_id", sec.section_id)
+                                tagged.insert(0, "store_id", store_id)
+                                collector.append(tagged)
+                                sec_collector.append(tagged)
+
+                    q50_row = wmape_sec[
+                        (wmape_sec["group"] == "overall")
+                        & (wmape_sec["target"] == "all_horizons")
+                        & (wmape_sec["quantile"] == "q0.5")
+                    ]
+                    pit_row = fpit_res.summary_df[
+                        (fpit_res.summary_df["group"] == "overall")
+                        & (fpit_res.summary_df["target"] == "all_horizons")
+                    ]
+                    q50_wmape = float(q50_row["wmape"].iloc[0]) if not q50_row.empty else np.nan
+                    pit_mae = float(pit_row["pit_mae"].iloc[0]) if not pit_row.empty else np.nan
+                    logger.info(
+                        "Finished '%s' on %s / %s in %.2fs | all_horizons q0.5 WMAPE=%.2f%% | PIT MAE=%.3f",
+                        model_name,
+                        store_id,
+                        sec.name,
+                        time.perf_counter() - m_t0,
+                        q50_wmape,
+                        pit_mae,
+                    )
+                    del forecaster
+                    gc.collect()
+
+                if not is_cb:
+                    del ts_glm
+                    ts_glm = None
+                else:
+                    del ts_cb
+                    ts_cb = None
+                gc.collect()
+
+            if args.resume:
+                pd.concat(sec_wmape_list, ignore_index=True).to_csv(
+                    ckpt_prefix.with_name(f"{ckpt_prefix.name}_wmape.csv"), index=False
                 )
+                pd.concat(sec_fpit_summ_list, ignore_index=True).to_csv(
+                    ckpt_prefix.with_name(f"{ckpt_prefix.name}_fpit_summ.csv"), index=False
+                )
+                pd.concat(sec_fpit_cov_list, ignore_index=True).to_csv(
+                    ckpt_prefix.with_name(f"{ckpt_prefix.name}_fpit_cov.csv"), index=False
+                )
+                pd.concat(sec_fpit_hist_list, ignore_index=True).to_csv(
+                    ckpt_prefix.with_name(f"{ckpt_prefix.name}_fpit_hist.csv"), index=False
+                )
+                if sec_ddlt_summ_list:
+                    pd.concat(sec_ddlt_summ_list, ignore_index=True).to_csv(
+                        ckpt_prefix.with_name(f"{ckpt_prefix.name}_ddlt_summ.csv"), index=False
+                    )
+                    pd.concat(sec_ddlt_cov_list, ignore_index=True).to_csv(
+                        ckpt_prefix.with_name(f"{ckpt_prefix.name}_ddlt_cov.csv"), index=False
+                    )
+                    pd.concat(sec_ddlt_hist_list, ignore_index=True).to_csv(
+                        ckpt_prefix.with_name(f"{ckpt_prefix.name}_ddlt_hist.csv"), index=False
+                    )
+                ckpt_prefix.with_name(f"{ckpt_prefix.name}_done.flag").write_text("ok", encoding="utf-8")
 
             logger.info("Completed section %s / %s in %.2fs", store_id, sec.name, time.perf_counter() - sec_t0)
 
@@ -1009,6 +1143,7 @@ def main() -> None:
         overall_ddlt = ddlt_summary_df[ddlt_summary_df["group"] == "overall"]
         if not overall_ddlt.empty:
             cols = [
+                *(["lead_time_profile"] if "lead_time_profile" in overall_ddlt.columns else []),
                 "model",
                 "n_sections",
                 "n_rows",
