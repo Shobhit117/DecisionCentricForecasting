@@ -639,7 +639,13 @@ def main() -> None:
     ddlt_hist_frames: list[pd.DataFrame] = []
 
     need_glm_ts = any(
-        m in models_to_run for m in ("glm", "glm_hurdle", "empirical_trailing", "empirical_seasonal")
+        m in models_to_run
+        for m in (
+            "glm",
+            "glm_hurdle",
+            "empirical_trailing",
+            "empirical_seasonal",
+        )
     )
     need_cb_ts = "catboost" in models_to_run
 
@@ -769,14 +775,20 @@ def main() -> None:
                 if model_name == "glm":
                     assert ts_glm is not None
                     forecaster = GLMForecaster(
-                        train_groups=["store_id", "cat_id"], hurdle=False, n_jobs=args.n_jobs
+                        train_groups=["store_id", "cat_id"],
+                        hurdle=False,
+                        velocity_tiers=True,
+                        n_jobs=args.n_jobs,
                     )
                     forecaster.fit(ts_glm)
                     active_ts = ts_glm
                 elif model_name == "glm_hurdle":
                     assert ts_glm is not None
                     forecaster = GLMForecaster(
-                        train_groups=["store_id", "cat_id"], hurdle=True, n_jobs=args.n_jobs
+                        train_groups=["store_id", "cat_id"],
+                        hurdle=True,
+                        velocity_tiers="demand_regime",
+                        n_jobs=args.n_jobs,
                     )
                     forecaster.fit(ts_glm)
                     active_ts = ts_glm

@@ -1582,6 +1582,192 @@ def _ddlt_from_hurdle_glm_row_numba(
     return _random_sum_aligned_numba(lt_pmf, lt_min, rv_pmfs, rv_mins, 1, tail_tol)
 
 
+@njit(parallel=True, nogil=True, cache=True)
+def _ddlt_from_quantiles_batch_numba(
+    lt_pmf: np.ndarray,
+    lt_min: int,
+    levels: np.ndarray,
+    q_matrix: np.ndarray,
+    default_pmf_flat: np.ndarray,
+    default_offsets: np.ndarray,
+    default_mins: np.ndarray,
+    row_default_idx: np.ndarray,
+    service_levels: np.ndarray,
+    return_distribution: bool,
+    tol: float = 1e-4,
+    tail_tol: float = DEFAULT_TAIL_TOL,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Multi-core parallel batch kernel (``numba.prange``) computing DDLT distributions or
+    service-level ``target_inventory`` across all rows of ``q_matrix`` of shape
+    ``(n_rows, horizon, n_quantiles)``.
+
+    Returns
+    -------
+    pmf_flat : np.ndarray (1D float64)
+        Concatenated DDLT PMFs across all rows when ``return_distribution=True`` (empty otherwise).
+    offsets : np.ndarray (1D int64)
+        Slice boundaries of length ``n_rows + 1`` into ``pmf_flat`` when ``return_distribution=True``.
+    mins : np.ndarray (1D int64)
+        Minimum support value per row when ``return_distribution=True``.
+    targets : np.ndarray (1D int64)
+        Integer ``target_inventory`` per row when ``return_distribution=False`` (empty otherwise).
+    """
+    n_rows = q_matrix.shape[0]
+    dummy_pmf = np.ones(1, dtype=np.float64)
+
+    if not return_distribution:
+        targets = np.empty(n_rows, dtype=np.int64)
+        for i in prange(n_rows):
+            d_idx = row_default_idx[i]
+            if d_idx >= 0:
+                d_pmf = default_pmf_flat[default_offsets[d_idx] : default_offsets[d_idx + 1]]
+                d_min = int(default_mins[d_idx])
+            else:
+                d_pmf = dummy_pmf
+                d_min = 0
+            ddlt_pmf, ddlt_min = _ddlt_from_quantiles_row_numba(
+                lt_pmf, lt_min, levels, q_matrix[i], d_pmf, d_min, tol, tail_tol
+            )
+            targets[i] = _pmf_quantile_scalar_numba(ddlt_pmf, ddlt_min, 1, float(service_levels[i]))
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            targets,
+        )
+
+    pmf_list = NumbaList()
+    for _ in range(n_rows):
+        pmf_list.append(np.empty(0, dtype=np.float64))
+    mins = np.empty(n_rows, dtype=np.int64)
+    lengths = np.empty(n_rows, dtype=np.int64)
+
+    for i in prange(n_rows):
+        idx = int(i)
+        d_idx = row_default_idx[idx]
+        if d_idx >= 0:
+            d_pmf = default_pmf_flat[default_offsets[d_idx] : default_offsets[d_idx + 1]]
+            d_min = int(default_mins[d_idx])
+        else:
+            d_pmf = dummy_pmf
+            d_min = 0
+        ddlt_pmf, ddlt_min = _ddlt_from_quantiles_row_numba(
+            lt_pmf, lt_min, levels, q_matrix[idx], d_pmf, d_min, tol, tail_tol
+        )
+        pmf_list[idx] = ddlt_pmf
+        mins[idx] = ddlt_min
+        lengths[idx] = len(ddlt_pmf)
+
+    offsets = np.zeros(n_rows + 1, dtype=np.int64)
+    for i in range(n_rows):
+        offsets[i + 1] = offsets[i] + lengths[i]
+    pmf_flat = np.empty(offsets[n_rows], dtype=np.float64)
+    for i in prange(n_rows):
+        idx = int(i)
+        s = offsets[idx]
+        arr = pmf_list[idx]
+        n_arr = len(arr)
+        for k in range(n_arr):
+            pmf_flat[s + int(k)] = arr[k]
+
+    return pmf_flat, offsets, mins, np.empty(0, dtype=np.int64)
+
+
+@njit(parallel=True, nogil=True, cache=True)
+def _ddlt_from_glm_batch_numba(
+    lt_pmf: np.ndarray,
+    lt_min: int,
+    mu_arr: np.ndarray,
+    alpha_arr: np.ndarray,
+    pi_arr: np.ndarray,
+    lam_arr: np.ndarray,
+    use_hurdle: bool,
+    default_pmf_flat: np.ndarray,
+    default_offsets: np.ndarray,
+    default_mins: np.ndarray,
+    row_default_idx: np.ndarray,
+    service_levels: np.ndarray,
+    return_distribution: bool,
+    tol: float = DEFAULT_SUPPORT_TOL,
+    tail_tol: float = DEFAULT_TAIL_TOL,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Multi-core parallel batch kernel (``numba.prange``) computing DDLT distributions or
+    service-level ``target_inventory`` across all rows of standard GLM ``(mu_arr, alpha_arr)``
+    or Zero-Hurdle GLM ``(pi_arr, lam_arr, alpha_arr)`` parameter matrices.
+    """
+    n_rows = mu_arr.shape[0]
+    dummy_pmf = np.ones(1, dtype=np.float64)
+
+    if not return_distribution:
+        targets = np.empty(n_rows, dtype=np.int64)
+        for i in prange(n_rows):
+            d_idx = row_default_idx[i]
+            if d_idx >= 0:
+                d_pmf = default_pmf_flat[default_offsets[d_idx] : default_offsets[d_idx + 1]]
+                d_min = int(default_mins[d_idx])
+            else:
+                d_pmf = dummy_pmf
+                d_min = 0
+            if use_hurdle:
+                ddlt_pmf, ddlt_min = _ddlt_from_hurdle_glm_row_numba(
+                    lt_pmf, lt_min, pi_arr[i], lam_arr[i], alpha_arr[i], d_pmf, d_min, tol, tail_tol
+                )
+            else:
+                ddlt_pmf, ddlt_min = _ddlt_from_glm_row_numba(
+                    lt_pmf, lt_min, mu_arr[i], alpha_arr[i], d_pmf, d_min, tol, tail_tol
+                )
+            targets[i] = _pmf_quantile_scalar_numba(ddlt_pmf, ddlt_min, 1, float(service_levels[i]))
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            targets,
+        )
+
+    pmf_list = NumbaList()
+    for _ in range(n_rows):
+        pmf_list.append(np.empty(0, dtype=np.float64))
+    mins = np.empty(n_rows, dtype=np.int64)
+    lengths = np.empty(n_rows, dtype=np.int64)
+
+    for i in prange(n_rows):
+        idx = int(i)
+        d_idx = row_default_idx[idx]
+        if d_idx >= 0:
+            d_pmf = default_pmf_flat[default_offsets[d_idx] : default_offsets[d_idx + 1]]
+            d_min = int(default_mins[d_idx])
+        else:
+            d_pmf = dummy_pmf
+            d_min = 0
+        if use_hurdle:
+            ddlt_pmf, ddlt_min = _ddlt_from_hurdle_glm_row_numba(
+                lt_pmf, lt_min, pi_arr[idx], lam_arr[idx], alpha_arr[idx], d_pmf, d_min, tol, tail_tol
+            )
+        else:
+            ddlt_pmf, ddlt_min = _ddlt_from_glm_row_numba(
+                lt_pmf, lt_min, mu_arr[idx], alpha_arr[idx], d_pmf, d_min, tol, tail_tol
+            )
+        pmf_list[idx] = ddlt_pmf
+        mins[idx] = ddlt_min
+        lengths[idx] = len(ddlt_pmf)
+
+    offsets = np.zeros(n_rows + 1, dtype=np.int64)
+    for i in range(n_rows):
+        offsets[i + 1] = offsets[i] + lengths[i]
+    pmf_flat = np.empty(offsets[n_rows], dtype=np.float64)
+    for i in prange(n_rows):
+        idx = int(i)
+        s = offsets[idx]
+        arr = pmf_list[idx]
+        n_arr = len(arr)
+        for k in range(n_arr):
+            pmf_flat[s + int(k)] = arr[k]
+
+    return pmf_flat, offsets, mins, np.empty(0, dtype=np.int64)
+
+
 # =============================================================================
 # Section 5: High-Level DDLTCalculator Orchestrator
 # =============================================================================
@@ -1724,6 +1910,50 @@ class DDLTCalculator:
             out.append(hit)
         return out
 
+    def _default_demand_packed(
+        self, gdf: pd.DataFrame, max_lt: int, horizon: int, tol: float, needs_default: bool
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Pack unique per-series fallback distributions into flat contiguous Numba arrays
+        ``(default_pmf_flat, default_offsets, default_mins, row_default_idx)`` for ``prange`` batch kernels.
+        """
+        n_rows = len(gdf)
+        if not needs_default or n_rows == 0:
+            return (
+                np.empty(0, dtype=np.float64),
+                np.zeros(1, dtype=np.int64),
+                np.empty(0, dtype=np.int64),
+                np.full(n_rows, -1, dtype=np.int64),
+            )
+        cols = ["best_fit", "distr_param_0", "distr_param_1", "distr_param_2"]
+        present = [c for c in cols if c in gdf.columns]
+        values = gdf[present].to_numpy(dtype=object)
+        cache_idx: dict[tuple, int] = {}
+        unique_pmfs: list[np.ndarray] = []
+        unique_mins: list[int] = []
+        row_default_idx = np.empty(n_rows, dtype=np.int64)
+        for i, row in enumerate(values):
+            key = tuple(None if pd.isna(v) else v for v in row)
+            idx = cache_idx.get(key)
+            if idx is None:
+                distr = self._build_default_demand(pd.Series(row, index=present), max_lt, horizon, tol=tol)
+                idx = len(unique_pmfs)
+                unique_pmfs.append(np.ascontiguousarray(distr.pmf, dtype=np.float64))
+                unique_mins.append(int(distr.min))
+                cache_idx[key] = idx
+            row_default_idx[i] = idx
+
+        lengths = np.fromiter((len(p) for p in unique_pmfs), dtype=np.int64, count=len(unique_pmfs))
+        default_offsets = np.zeros(len(unique_pmfs) + 1, dtype=np.int64)
+        np.cumsum(lengths, out=default_offsets[1:])
+        default_pmf_flat = (
+            np.ascontiguousarray(np.concatenate(unique_pmfs), dtype=np.float64)
+            if unique_pmfs
+            else np.empty(0, dtype=np.float64)
+        )
+        default_mins = np.asarray(unique_mins, dtype=np.int64)
+        return default_pmf_flat, default_offsets, default_mins, row_default_idx
+
     def from_quantiles_group(
         self,
         gdf: pd.DataFrame,
@@ -1745,8 +1975,9 @@ class DDLTCalculator:
            3D float64 tensor ``q_matrix`` of shape ``(n_rows, horizon, num_quantiles)``.
         3. Computes the effective support truncation tolerance ``tol_eff`` and prepares fallback
            distributions if ``max(L + R) > horizon``.
-        4. Calls :func:`_ddlt_from_quantiles_row_numba` for each row and attaches either
-           ``demand_distribution`` (:class:`DiscreteDistribution`) or ``target_inventory`` (`int`).
+        4. Calls the multi-core parallel :func:`_ddlt_from_quantiles_batch_numba` kernel across
+           all rows and attaches either ``demand_distribution`` (:class:`DiscreteDistribution`)
+           or ``target_inventory`` (`int`).
         """
         from probabilistic_modeling.models.catboost_quantile import quantile_col_name
         from probabilistic_modeling.distributions.quantile import validate_quantile_levels
@@ -1764,9 +1995,11 @@ class DDLTCalculator:
             raise ValueError("At least one forecast horizon is required.")
 
         if not return_distribution:
-            service_levels_arr = gdf["service_level"].to_numpy(dtype=float)
+            service_levels_arr = np.ascontiguousarray(gdf["service_level"].to_numpy(dtype=np.float64))
             if np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
                 raise ValueError("'service_levels' values must be between 0 and 1.")
+        else:
+            service_levels_arr = np.empty(0, dtype=np.float64)
 
         q_cols = [quantile_col_name(t, q) for t in target_cols for q in levels]
         missing_cols = [c for c in q_cols if c not in gdf.columns]
@@ -1799,34 +2032,39 @@ class DDLTCalculator:
         q_matrix = np.ascontiguousarray(
             gdf[q_cols].to_numpy(dtype=np.float64).reshape(len(gdf), horizon, num_q)
         )
-        dummy_pmf = np.ones(1, dtype=np.float64)
-        defaults = self._default_demand_arrays(gdf, int(lt_with_cycle.max), horizon, tol_eff) if needs_default else None
+        bad_q = ~np.isfinite(q_matrix)
+        if np.any(bad_q):
+            row_num = int(np.argmax(bad_q.any(axis=(1, 2))))
+            raise ValueError(f"Invalid CatBoost quantile forecast for row {row_num}: {q_matrix[row_num]}.")
 
-        results = []
-        for row_num in range(len(gdf)):
-            row_quantiles = q_matrix[row_num]
-            if np.any(~np.isfinite(row_quantiles)):
-                raise ValueError(f"Invalid CatBoost quantile forecast for row {row_num}: {row_quantiles}.")
-
-            if needs_default:
-                default_pmf, default_min = defaults[row_num]
-            else:
-                default_pmf = dummy_pmf
-                default_min = 0
-
-            ddlt_pmf, ddlt_min = _ddlt_from_quantiles_row_numba(
-                lt_pmf, lt_min, levels, row_quantiles, default_pmf, default_min, tol_eff, self.tail_tol
-            )
-            if return_distribution:
-                results.append(DiscreteDistribution(ddlt_pmf, ddlt_min, 1, truncation_tol=n_terms * tol_eff))
-            else:
-                q_val = _pmf_quantile_scalar_numba(ddlt_pmf, ddlt_min, 1, float(service_levels_arr[row_num]))
-                results.append(int(q_val))
+        default_pmf_flat, default_offsets, default_mins, row_default_idx = self._default_demand_packed(
+            gdf, int(lt_with_cycle.max), horizon, tol_eff, needs_default
+        )
+        pmf_flat, offsets, mins, targets = _ddlt_from_quantiles_batch_numba(
+            lt_pmf,
+            lt_min,
+            levels,
+            q_matrix,
+            default_pmf_flat,
+            default_offsets,
+            default_mins,
+            row_default_idx,
+            service_levels_arr,
+            return_distribution,
+            tol_eff,
+            self.tail_tol,
+        )
 
         if return_distribution:
-            gdf["demand_distribution"] = results
+            trunc_tol = n_terms * tol_eff
+            gdf["demand_distribution"] = [
+                DiscreteDistribution._from_normalized(
+                    pmf_flat[offsets[i] : offsets[i + 1]], int(mins[i]), 1, truncation_tol=trunc_tol
+                )
+                for i in range(len(gdf))
+            ]
         else:
-            gdf["target_inventory"] = results
+            gdf["target_inventory"] = targets
         logger.info("DDLT from quantiles completed for %d rows in %.2fs", len(gdf), time.perf_counter() - t0)
         return gdf
 
@@ -1855,9 +2093,8 @@ class DDLTCalculator:
            of shape ``(n_rows, horizon)``.
         2. Computes the effective truncation tolerance ``tol_eff`` and caches any historical
            fallback distributions needed when ``max(L + R) > horizon``.
-        3. Calls the compiled :func:`_ddlt_from_glm_row_numba` (or
-           :func:`_ddlt_from_hurdle_glm_row_numba`) kernel for each row and attaches
-           either ``demand_distribution`` or ``target_inventory``.
+        3. Calls the multi-core parallel :func:`_ddlt_from_glm_batch_numba` kernel across
+           all rows and attaches either ``demand_distribution`` or ``target_inventory``.
         """
         t0 = time.perf_counter()
         if pred_first_day:
@@ -1891,9 +2128,11 @@ class DDLTCalculator:
                 raise ValueError("Number of 'pi', 'lambda', and 'mu' columns do not match.")
 
         if not return_distribution:
-            service_levels_arr = gdf["service_level"].to_numpy(dtype=float)
+            service_levels_arr = np.ascontiguousarray(gdf["service_level"].to_numpy(dtype=np.float64))
             if np.any((service_levels_arr < 0) | (service_levels_arr > 1)):
                 raise ValueError("'service_levels' values must be between 0 and 1.")
+        else:
+            service_levels_arr = np.empty(0, dtype=np.float64)
 
         lt_with_cycle = self._shifted_lead_time(lead_time)
         needs_default = lt_with_cycle.max > horizon
@@ -1932,40 +2171,43 @@ class DDLTCalculator:
                 raise ValueError(
                     f"Invalid hurdle GLM parameters for row {row_num}: pi={pi_arr[row_num]}, lambda={lam_arr[row_num]}."
                 )
+        else:
+            pi_arr = np.empty((0, 0), dtype=np.float64)
+            lam_arr = np.empty((0, 0), dtype=np.float64)
 
         lt_pmf = np.ascontiguousarray(lt_with_cycle.pmf, dtype=np.float64)
         lt_min = int(lt_with_cycle.min)
-        defaults = self._default_demand_arrays(gdf, int(lt_with_cycle.max), horizon, tol_eff) if needs_default else None
-        dummy_pmf = np.ones(1, dtype=np.float64)
+        default_pmf_flat, default_offsets, default_mins, row_default_idx = self._default_demand_packed(
+            gdf, int(lt_with_cycle.max), horizon, tol_eff, needs_default
+        )
 
-        results = []
-        for row_num in range(len(gdf)):
-            default_pmf, default_min = defaults[row_num] if defaults is not None else (dummy_pmf, 0)
-            if use_hurdle:
-                ddlt_pmf, ddlt_min = _ddlt_from_hurdle_glm_row_numba(
-                    lt_pmf,
-                    lt_min,
-                    pi_arr[row_num],
-                    lam_arr[row_num],
-                    alpha_arr[row_num],
-                    default_pmf,
-                    default_min,
-                    tol_eff,
-                    self.tail_tol,
-                )
-            else:
-                ddlt_pmf, ddlt_min = _ddlt_from_glm_row_numba(
-                    lt_pmf, lt_min, mu_arr[row_num], alpha_arr[row_num], default_pmf, default_min, tol_eff, self.tail_tol
-                )
-            if return_distribution:
-                results.append(DiscreteDistribution(ddlt_pmf, ddlt_min, 1, truncation_tol=n_terms * tol_eff))
-            else:
-                q_val = _pmf_quantile_scalar_numba(ddlt_pmf, ddlt_min, 1, float(service_levels_arr[row_num]))
-                results.append(int(q_val))
+        pmf_flat, offsets, mins, targets = _ddlt_from_glm_batch_numba(
+            lt_pmf,
+            lt_min,
+            mu_arr,
+            alpha_arr,
+            pi_arr,
+            lam_arr,
+            use_hurdle,
+            default_pmf_flat,
+            default_offsets,
+            default_mins,
+            row_default_idx,
+            service_levels_arr,
+            return_distribution,
+            tol_eff,
+            self.tail_tol,
+        )
 
         if return_distribution:
-            gdf["demand_distribution"] = results
+            trunc_tol = n_terms * tol_eff
+            gdf["demand_distribution"] = [
+                DiscreteDistribution._from_normalized(
+                    pmf_flat[offsets[i] : offsets[i + 1]], int(mins[i]), 1, truncation_tol=trunc_tol
+                )
+                for i in range(len(gdf))
+            ]
         else:
-            gdf["target_inventory"] = results
+            gdf["target_inventory"] = targets
         logger.info("DDLT from GLM completed for %d rows in %.2fs", len(gdf), time.perf_counter() - t0)
         return gdf

@@ -667,16 +667,26 @@ class DiscreteTimeSeries:
     def _extract_series_metadata(self):
         """
         Extracts one row per series containing static training metadata (`overdispersion`,
-        `positive_overdispersion`, `best_fit`, `distr_param_0..2`) into `self.series_metadata`.
+        `positive_overdispersion`, `velocity_tier`, `demand_regime`, `best_fit`,
+        `distr_param_0..2`) into `self.series_metadata`.
 
         Why it is needed
         ----------------
         Persisting `self.series_metadata` allows `TimeSeriesFeatureSpec.transform` and
-        `ProbabilisticForecaster` to attach training-time overdispersion flags and fallback
-        distribution parameters to new inference data without re-fitting on test periods.
+        `ProbabilisticForecaster` to attach training-time overdispersion flags, velocity/intermittency
+        tiers, and fallback distribution parameters to new inference data without re-fitting on test periods.
         """
         meta_cols = list(self.ts_id_cols)
-        for c in ("overdispersion", "positive_overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2"):
+        for c in (
+            "overdispersion",
+            "positive_overdispersion",
+            "velocity_tier",
+            "demand_regime",
+            "best_fit",
+            "distr_param_0",
+            "distr_param_1",
+            "distr_param_2",
+        ):
             if c in self.df.columns:
                 meta_cols.append(c)
         self.series_metadata = self.df[meta_cols].drop_duplicates(subset=self.ts_id_cols).reset_index(drop=True)
@@ -692,8 +702,8 @@ class DiscreteTimeSeries:
 
         Why it is needed
         ----------------
-        Ensures that at inference time every series uses the exact same `overdispersion`
-        and `positive_overdispersion` routing (Poisson vs. Negative Binomial) and `best_fit`
+        Ensures that at inference time every series uses the exact same `overdispersion`,
+        `positive_overdispersion`, `velocity_tier`, `demand_regime` routing and `best_fit`
         fallback parameters learned during training.
         """
         meta = pretrained_meta.copy()
@@ -702,7 +712,16 @@ class DiscreteTimeSeries:
                 meta[col] = meta[col].astype(self.df[col].dtype)
         meta_cols = [
             c
-            for c in ("overdispersion", "positive_overdispersion", "best_fit", "distr_param_0", "distr_param_1", "distr_param_2")
+            for c in (
+                "overdispersion",
+                "positive_overdispersion",
+                "velocity_tier",
+                "demand_regime",
+                "best_fit",
+                "distr_param_0",
+                "distr_param_1",
+                "distr_param_2",
+            )
             if c in meta.columns
         ]
         self.df = pd.merge(
@@ -711,10 +730,9 @@ class DiscreteTimeSeries:
             on=self.ts_id_cols,
             how="left",
         )
-        if "overdispersion" in self.df.columns:
-            self.df["overdispersion"] = self.df["overdispersion"].fillna(0).astype(int)
-        if "positive_overdispersion" in self.df.columns:
-            self.df["positive_overdispersion"] = self.df["positive_overdispersion"].fillna(0).astype(int)
+        for int_meta_col in ("overdispersion", "positive_overdispersion", "velocity_tier", "demand_regime"):
+            if int_meta_col in self.df.columns:
+                self.df[int_meta_col] = self.df[int_meta_col].fillna(0).astype(int)
         if "best_fit" in self.df.columns:
             self.df["best_fit"] = self.df["best_fit"].astype("category")
             if use_best_fit_feature:
@@ -988,27 +1006,52 @@ class DiscreteTimeSeries:
 
     def _add_overdispersion_flag(self, grouped: DataFrameGroupBy):
         """
-        Computes per-series binary indicators:
+        Computes per-series training-window dispersion and velocity/intermittency indicators:
         - `overdispersion = 1` iff the training-window sample variance exceeds the
           training-window sample mean (`var > mean`) across all training observations.
         - `positive_overdispersion = 1` iff the sample variance exceeds the sample mean
           strictly across positive training observations (`demand > 0`).
+        - `velocity_tier` (`0, 1, 2`): categorizes each series by its training nonzero
+          demand frequency `p_pos = N_+ / N_train`:
+          * `0` (Low / Intermittent velocity): `p_pos < 0.25` (`ADI > 4.0`)
+          * `1` (Medium velocity): `0.25 <= p_pos < 0.75` (`1.33 < ADI <= 4.0`)
+          * `2` (High / Smooth velocity): `p_pos >= 0.75` (`ADI <= 1.33`)
+        - `demand_regime` (`0, 1, 2, 3`): Syntetos-Boylan classification using
+          `ADI = N_train / N_+` (cutoff `1.32`) and `CV^2 = Var(Y|Y>0) / E[Y|Y>0]^2` (cutoff `0.49`):
+          * `0` (Smooth): `ADI < 1.32` and `CV^2 < 0.49`
+          * `1` (Erratic): `ADI < 1.32` and `CV^2 >= 0.49`
+          * `2` (Intermittent): `ADI >= 1.32` and `CV^2 < 0.49`
+          * `3` (Lumpy): `ADI >= 1.32` and `CV^2 >= 0.49`
 
         Where it is used
         ----------------
-        Used by `GLMForecaster.fit` to automatically select a Negative Binomial vs. Poisson GLM
-        for standard GLMs (`overdispersion`) and Zero-Hurdle GLMs (`positive_overdispersion`).
+        Used by `GLMForecaster.fit` to automatically route series to Poisson vs. Negative Binomial
+        GLMs (`overdispersion` / `positive_overdispersion`) and to optionally partition GLMs by
+        velocity / intermittency tier (`velocity_tiers=True` or `velocity_tiers="demand_regime"`).
         """
         tmp_col = self._create_tmp_col_for_train(self.var_col)
         mean = grouped[tmp_col].transform("mean")
         var = grouped[tmp_col].transform("var")
+        n_train = grouped[tmp_col].transform("count")
         self.df["overdispersion"] = (var > mean).astype(int)
 
         pos_col = f"{tmp_col}_pos"
         self.df[pos_col] = np.where(self.df[tmp_col] > 0, self.df[tmp_col], np.nan)
         pos_mean = grouped[pos_col].transform("mean")
         pos_var = grouped[pos_col].transform("var")
+        n_pos = grouped[pos_col].transform("count")
         self.df["positive_overdispersion"] = (pos_var > pos_mean).fillna(False).astype(int)
+
+        p_pos = (n_pos / np.maximum(n_train, 1)).fillna(0.0).to_numpy(dtype=np.float64)
+        self.df["velocity_tier"] = np.where(p_pos >= 0.75, 2, np.where(p_pos >= 0.25, 1, 0)).astype(int)
+
+        pos_mean_arr = pos_mean.fillna(0.0).to_numpy(dtype=np.float64)
+        pos_var_arr = pos_var.fillna(0.0).to_numpy(dtype=np.float64)
+        cv2 = np.where(pos_mean_arr > 1e-12, pos_var_arr / np.maximum(pos_mean_arr * pos_mean_arr, 1e-12), 0.0)
+        is_intermittent = p_pos <= (1.0 / 1.32)  # ADI >= 1.32
+        is_erratic = cv2 >= 0.49
+        self.df["demand_regime"] = (is_intermittent.astype(int) * 2 + is_erratic.astype(int)).astype(int)
+
         self.df.drop(columns=[tmp_col, pos_col], inplace=True)
 
     def _fit_distributions(
@@ -1374,9 +1417,10 @@ class DiscreteTimeSeries:
         self,
         train_groups: tuple[str, ...] | list[str] | None = None,
         hurdle: bool = False,
+        velocity_tiers: bool | str = False,
     ) -> pd.DataFrame:
-        """Convenience method delegating to `GLMForecaster(train_groups=train_groups, hurdle=hurdle).fit(self)`."""
-        return GLMForecaster(train_groups=train_groups, hurdle=hurdle).fit(self)
+        """Convenience method delegating to `GLMForecaster(train_groups=train_groups, hurdle=hurdle, velocity_tiers=velocity_tiers).fit(self)`."""
+        return GLMForecaster(train_groups=train_groups, hurdle=hurdle, velocity_tiers=velocity_tiers).fit(self)
 
     def predict_glm(self, model_data: pd.DataFrame) -> pd.DataFrame:
         """Convenience method delegating to `GLMForecaster().predict(self, model=model_data)`."""

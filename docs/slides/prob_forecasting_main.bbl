@@ -19,6 +19,42 @@
 
 \refsection{0}
   \datalist[entry]{nyt/global//global/global/global}
+    \entry{cameron2013}{book}{}{}
+      \name{author}{2}{}{%
+        {{un=0,uniquepart=base,hash=cameron2013a}{%
+           family={Cameron},
+           familyi={C\bibinitperiod},
+           given={A.\bibnamedelimi Colin},
+           giveni={A\bibinitperiod\bibinitdelim C\bibinitperiod},
+           givenun=0}}%
+        {{un=0,uniquepart=base,hash=cameron2013b}{%
+           family={Trivedi},
+           familyi={T\bibinitperiod},
+           given={Pravin\bibnamedelimi K.},
+           giveni={P\bibinitperiod\bibinitdelim K\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Cambridge University Press}%
+      }
+      \strng{namehash}{cameron2013hash}
+      \strng{fullhash}{cameron2013hash}
+      \strng{fullhashraw}{cameron2013hash}
+      \strng{bibnamehash}{cameron2013hash}
+      \strng{authorbibnamehash}{cameron2013hash}
+      \strng{authornamehash}{cameron2013hash}
+      \strng{authorfullhash}{cameron2013hash}
+      \strng{authorfullhashraw}{cameron2013hash}
+      \field{sortinit}{C}
+      \field{sortinithash}{4d103a86280481745c9c897c925753c0}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{edition}{2}
+      \field{title}{Regression Analysis of Count Data}
+      \field{year}{2013}
+    \endentry
     \entry{koenker1978}{article}{}{}
       \name{author}{2}{}{%
         {{un=0,uniquepart=base,hash=713ca648cccb03223d755f3f2ff51a5c}{%
@@ -146,6 +182,40 @@
       \field{year}{2001}
       \field{pages}{334\bibrangedash 351}
       \range{pages}{18}
+    \endentry
+    \entry{mullahy1986}{article}{}{}
+      \name{author}{1}{}{%
+        {{un=0,uniquepart=base,hash=mullahy1986a}{%
+           family={Mullahy},
+           familyi={M\bibinitperiod},
+           given={John},
+           giveni={J\bibinitperiod},
+           givenun=0}}%
+      }
+      \list{publisher}{1}{%
+        {Elsevier}%
+      }
+      \strng{namehash}{mullahy1986hash}
+      \strng{fullhash}{mullahy1986hash}
+      \strng{fullhashraw}{mullahy1986hash}
+      \strng{bibnamehash}{mullahy1986hash}
+      \strng{authorbibnamehash}{mullahy1986hash}
+      \strng{authornamehash}{mullahy1986hash}
+      \strng{authorfullhash}{mullahy1986hash}
+      \strng{authorfullhashraw}{mullahy1986hash}
+      \field{sortinit}{M}
+      \field{sortinithash}{4625c616857f13d17ce56f7d4f97d451}
+      \field{extradatescope}{labelyear}
+      \field{labeldatesource}{}
+      \field{labelnamesource}{author}
+      \field{labeltitlesource}{title}
+      \field{journaltitle}{Journal of Econometrics}
+      \field{number}{3}
+      \field{title}{Specification and testing of some modified count data models}
+      \field{volume}{33}
+      \field{year}{1986}
+      \field{pages}{341\bibrangedash 365}
+      \range{pages}{25}
     \endentry
     \entry{nelder1972}{article}{}{}
       \name{author}{2}{}{%

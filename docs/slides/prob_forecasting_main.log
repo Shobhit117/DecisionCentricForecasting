@@ -1,9 +1,9 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.5.2)  4 NOV 2026 20:26
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.9.27)  21 NOV 2026 23:57
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
-**docs/slides/prob_forecasting_main.tex
-(./docs/slides/prob_forecasting_main.tex
+**prob_forecasting_main.tex
+(./prob_forecasting_main.tex
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
 (c:/texlive/2025/texmf-dist/tex/latex/beamer/beamer.cls
@@ -997,7 +997,7 @@ Package biblatex Warning: 'babel/polyglossia' detected but 'csquotes' missing.
 
 \@quotelevel=\count478
 \@quotereset=\count479
-(docs/slides/prob_forecasting_main.aux)
+(./prob_forecasting_main.aux)
 \openout1 = `prob_forecasting_main.aux'.
 
 LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 39.
@@ -1077,7 +1077,7 @@ e
 ))
 Package hyperref Info: Link coloring OFF on input line 39.
 
-(docs/slides/prob_forecasting_main.out) (docs/slides/prob_forecasting_main.out)
+(./prob_forecasting_main.out) (./prob_forecasting_main.out)
 \@outlinefile=\write6
 \openout6 = `prob_forecasting_main.out'.
 
@@ -1171,19 +1171,19 @@ Package biblatex Info: Automatic encoding selection.
 Package biblatex Info: Trying to load bibliographic data...
 Package biblatex Info: ... file 'prob_forecasting_main.bbl' found.
 
-(docs/slides/prob_forecasting_main.bbl)
+(./prob_forecasting_main.bbl)
 Package biblatex Info: Reference section=0 on input line 39.
 Package biblatex Info: Reference segment=0 on input line 39.
- (docs/slides/prob_forecasting_main.nav)
+ (./prob_forecasting_main.nav)
 
 [1
 
 {c:/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map}]
-(docs/slides/prob_forecasting_main.toc)
+(./prob_forecasting_main.toc)
 
 [2
 
-] (docs/slides/prob_forecasting_main.toc)
+] (./prob_forecasting_main.toc)
 
 [3
 
@@ -1226,8 +1226,7 @@ put line 101.
 [6
 
 
- <docs/slides/figures/demand_same_mean_diff_quantile.pdf>]
-(docs/slides/prob_forecasting_main.toc)
+ <./figures/demand_same_mean_diff_quantile.pdf>] (./prob_forecasting_main.toc)
 
 [7
 
@@ -1261,43 +1260,32 @@ put line 101.
 
 [14
 
+
 ]
 
 [15
 
 
-] (docs/slides/prob_forecasting_main.toc)
+]
 
 [16
 
-]
-<figures/periodic_replenishment.pdf, id=945, 677.53125pt x 376.40625pt>
-File: figures/periodic_replenishment.pdf Graphic file (type pdf)
-<use figures/periodic_replenishment.pdf>
-Package pdftex.def Info: figures/periodic_replenishment.pdf  used on input line
- 220.
-(pdftex.def)             Requested size: 184.9429pt x 102.74527pt.
 
+]
 
 [17
 
- <docs/slides/figures/periodic_replenishment.pdf>]
+
+]
 
 [18
 
-]
-<figures/convolution_leadtime_figure.pdf, id=1016, 1415.2875pt x 733.99219pt>
-File: figures/convolution_leadtime_figure.pdf Graphic file (type pdf)
-<use figures/convolution_leadtime_figure.pdf>
-Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
- line 240.
-(pdftex.def)             Requested size: 342.289pt x 177.51689pt.
 
+]
 
 [19
 
- <docs/slides/figures/convolution_leadtime_figure.pdf>]
-(docs/slides/prob_forecasting_main.toc)
+]
 
 [20
 
@@ -1305,32 +1293,44 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 
 [21
 
-]
+
+] (./prob_forecasting_main.toc)
 
 [22
 
 ]
+<figures/periodic_replenishment.pdf, id=1109, 677.53125pt x 376.40625pt>
+File: figures/periodic_replenishment.pdf Graphic file (type pdf)
+<use figures/periodic_replenishment.pdf>
+Package pdftex.def Info: figures/periodic_replenishment.pdf  used on input line
+ 296.
+(pdftex.def)             Requested size: 184.9429pt x 102.74527pt.
+
 
 [23
 
-]
+ <./figures/periodic_replenishment.pdf>]
 
 [24
 
-
 ]
+<figures/convolution_leadtime_figure.pdf, id=1179, 1415.2875pt x 733.99219pt>
+File: figures/convolution_leadtime_figure.pdf Graphic file (type pdf)
+<use figures/convolution_leadtime_figure.pdf>
+Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
+ line 316.
+(pdftex.def)             Requested size: 342.289pt x 177.51689pt.
+
 
 [25
 
-]
+ <./figures/convolution_leadtime_figure.pdf>] (./prob_forecasting_main.toc)
 
 [26
-
 
 ]
 
 [27
-
 
 ]
 
@@ -1354,9 +1354,10 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 [32
 
 
-] (docs/slides/prob_forecasting_main.toc)
+]
 
 [33
+
 
 ]
 
@@ -1364,14 +1365,9 @@ Package pdftex.def Info: figures/convolution_leadtime_figure.pdf  used on input
 
 ]
 
-LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
-(Font)              Font shape `OT1/cmr/m/sc' tried instead on input line 465.
-
-
-
 [35
 
- <c:/texlive/2025/texmf-dist/tex/latex/beamer/beamericonarticle.pdf>]
+]
 
 [36
 
@@ -1379,6 +1375,42 @@ LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
 ]
 
 [37
+
+]
+
+[38
+
+
+] (./prob_forecasting_main.toc)
+
+[39
+
+]
+
+[40
+
+]
+
+LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
+(Font)              Font shape `OT1/cmr/m/sc' tried instead on input line 541.
+
+
+
+[41
+
+ <c:/texlive/2025/texmf-dist/tex/latex/beamer/beamericonarticle.pdf>]
+
+[42
+
+
+]
+
+[43
+
+
+]
+
+[44
 
 
 ]
@@ -1391,25 +1423,25 @@ LaTeX Font Warning: Font shape `OT1/cmss/m/sc' in size <10.95> not available
 \tf@snm=\write9
 \openout9 = `prob_forecasting_main.snm'.
 
- (docs/slides/prob_forecasting_main.aux)
+ (./prob_forecasting_main.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
 Package rerunfilecheck Info: File `prob_forecasting_main.out' has not changed.
-(rerunfilecheck)             Checksum: 1EFC892504056EA6C2042AE6BD4CDED5;1659.
+(rerunfilecheck)             Checksum: 329DF554D410BCA8386268A53662FCE2;1659.
 Package logreq Info: Writing requests to 'prob_forecasting_main.run.xml'.
 \openout1 = `prob_forecasting_main.run.xml'.
 
  ) 
 Here is how much of TeX's memory you used:
- 30851 strings out of 473190
- 604687 string characters out of 5719980
- 1406426 words of memory out of 5000000
- 53455 multiletter control sequences out of 15000+600000
- 574859 words of font info for 94 fonts, out of 8000000 for 9000
+ 30907 strings out of 473190
+ 605464 string characters out of 5719979
+ 1414562 words of memory out of 5000000
+ 53496 multiletter control sequences out of 15000+600000
+ 575447 words of font info for 96 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 128i,21n,123p,1502b,2353s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 128i,21n,123p,1490b,2353s stack positions out of 10000i,1000n,20000p,200000b,200000s
 <c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmcsc10.pfb><c:/te
 xlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb><c:/texlive/202
 5/texmf-dist/fonts/type1/public/amsfonts/cmextra/cmex7.pfb><c:/texlive/2025/tex
@@ -1436,11 +1468,10 @@ sfonts/cm/cmsy8.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/
 cmsy9.pfb><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmtt10.pfb
 ><c:/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb><c:
 /texlive/2025/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm7.pfb>
-Output written on docs/slides/prob_forecasting_main.pdf (37 pages, 616030 bytes
-).
+Output written on prob_forecasting_main.pdf (44 pages, 643412 bytes).
 PDF statistics:
- 1731 PDF objects out of 2073 (max. 8388607)
- 1380 compressed objects within 14 object streams
- 94 named destinations out of 1000 (max. 500000)
+ 1925 PDF objects out of 2073 (max. 8388607)
+ 1564 compressed objects within 16 object streams
+ 110 named destinations out of 1000 (max. 500000)
  188 words of extra memory for PDF output out of 10000 (max. 10000000)
 

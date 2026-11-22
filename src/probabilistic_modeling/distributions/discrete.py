@@ -210,6 +210,27 @@ class DiscreteDistribution(PredictiveDistribution):
         # support (``None`` = unknown, ``0.0`` = exact). Quantiles above ``1 - truncation_tol``
         # trigger a ``TruncatedSupportWarning``.
         self.truncation_tol = truncation_tol
+
+    @classmethod
+    def _from_normalized(
+        cls,
+        pmf: np.ndarray,
+        min_value: int,
+        bin_size: int = 1,
+        truncation_tol: float | None = None,
+    ) -> "DiscreteDistribution":
+        """
+        Fast internal constructor used by batch Numba DDLT kernels when ``pmf`` is already
+        a contiguous, normalized 1D ``float64`` array summing to ``1.0``.
+        """
+        obj = cls.__new__(cls)
+        obj.pmf = pmf
+        obj.min = int(min_value)
+        obj.best_fit = None
+        obj.best_fit_params = None
+        obj.bin_size = int(bin_size)
+        obj.truncation_tol = truncation_tol
+        return obj
     
     def copy(self):
         """Return a deep copy of this distribution."""

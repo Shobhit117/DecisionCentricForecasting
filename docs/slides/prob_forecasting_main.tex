@@ -162,6 +162,82 @@ A Generalized Linear Model (GLM)\footcite[Original formulation by][]{nelder1972}
 \end{small}
 \end{frame}
 
+\begin{frame}[allowframebreaks]{Zero-Hurdle Generalized Linear Models}
+\begin{small}
+\begin{itemize}
+\item \textbf{Why Hurdle Models?} Retail and supply-chain demand is often \textbf{intermittent or zero-inflated}: many SKU-days record $Y = 0$, while positive orders ($Y \geq 1$) follow a distinct purchasing regime.
+\item Standard Poisson / Negative Binomial GLMs force a single parameter vector $\beta$ to explain both the probability of a sale and the order size, leading to distorted zero-mass and biased upper-tail quantiles.
+\item \textbf{Two-Part Generative Process:} A Zero-Hurdle GLM\footcite[Introduced by][]{mullahy1986} decouples demand into two conditionally independent mechanisms:
+\begin{enumerate}
+\item \textbf{Stage 1 (Binary Hurdle --- Does demand occur?):} A Bernoulli process with occurrence probability $\pi = \mathbb{P}(Y > 0 \mid X)$ modeled via a logit link:
+\begin{align*}
+\pi_{i} &= \sigma(X_{i}\gamma) = \frac{1}{1 + e^{-X_{i}\gamma}}
+\end{align*}
+\item \textbf{Stage 2 (Zero-Truncated Count --- How much is demanded given $Y > 0$?):} Conditional on crossing the hurdle ($y \geq 1$), order size follows a count distribution $f_{\text{count}}(y; \lambda_i, \alpha)$ with log-link rate $\lambda_i = e^{X_i\beta}$, truncated at zero:
+\begin{align*}
+\mathbb{P}(Y = y \mid Y > 0, X_i) &= \frac{f_{\text{count}}(y; \lambda_i, \alpha)}{1 - P_0(\lambda_i, \alpha)}, \quad y \in \{1, 2, \dots\}
+\end{align*}
+where $P_0(\lambda, \alpha) = f_{\text{count}}(0; \lambda, \alpha)$ is the untruncated probability of zero.
+\end{enumerate}
+\end{itemize}
+\end{small}
+
+\framebreak
+\begin{small}
+\begin{itemize}
+\item \textbf{Compound Hurdle Probability Mass Function:} Combining both stages yields the full conditional distribution:
+\begin{align*}
+\mathbb{P}(Y = y \mid X_i) &= \begin{cases}
+1 - \pi_i & \text{if } y = 0 \\[6pt]
+\pi_i \dfrac{f_{\text{count}}(y; \lambda_i, \alpha)}{1 - P_0(\lambda_i, \alpha)} & \text{if } y \in \{1, 2, 3, \dots\}
+\end{cases}
+\end{align*}
+\item \textbf{Base Count Families ($f_{\text{count}}$):}
+\begin{itemize}
+\item \textbf{Zero-Truncated Poisson (ZTP):} $P_0(\lambda_i) = e^{-\lambda_i}$ and $f_{\text{count}}(y; \lambda_i) = \frac{e^{-\lambda_i}\lambda_i^y}{y!}$.
+\item \textbf{Zero-Truncated Negative Binomial (ZTNB2):} $P_0(\lambda_i, \alpha) = (1 + \alpha \lambda_i)^{-\alpha^{-1}}$ with dispersion $\alpha > 0$ (or $r = \alpha^{-1}$).
+\end{itemize}
+\item \textbf{Conditional \& Unconditional Moments:}
+\begin{itemize}
+\item Conditional positive mean: $\mu_i^{+} = \mathbb{E}[Y \mid Y > 0, X_i] = \dfrac{\lambda_i}{1 - P_0(\lambda_i, \alpha)} \geq 1$.
+\item Unconditional expected demand:
+\begin{align*}
+\mu_i &= \mathbb{E}[Y \mid X_i] = \pi_i \, \mu_i^{+} = \frac{\pi_i \, \lambda_i}{1 - P_0(\lambda_i, \alpha)}
+\end{align*}
+\end{itemize}
+\item \textbf{Positive-Support Overdispersion Routing:} Because excess zeros artificially inflate unconditional variance ($\text{Var}(Y) > \mathbb{E}[Y]$ even when positive sales are tight), routing between ZTP and ZTNB2 is determined strictly on positive training observations: $\text{Var}(Y \mid Y > 0) > \mathbb{E}[Y \mid Y > 0]$.
+\end{itemize}
+\end{small}
+
+\framebreak
+\begin{footnotesize}
+\begin{itemize}
+\item \textbf{Separable Log-Likelihood Decomposition:} Let $d_i = \mathbb{I}(y_i > 0) \in \{0, 1\}$. The joint log-likelihood over $n$ observations decomposes into two strictly separable terms\footcite[See][for hurdle separability and estimation]{cameron2013}:
+\begin{align*}
+\ell(\gamma, \beta, \alpha) &= \sum_{i=1}^{n} \ln \mathbb{P}(Y = y_i \mid X_i) = \ell_{\text{hurdle}}(\gamma) + \ell_{\text{count}}(\beta, \alpha)
+\end{align*}
+\item \textbf{1.\ Binary Hurdle Objective (Trained on All $n$ Observations):}
+\begin{align*}
+\ell_{\text{hurdle}}(\gamma) &= \sum_{i=1}^{n} \Big[ d_i (X_i\gamma) - \ln\!\big(1 + e^{X_i\gamma}\big) \Big], \quad \nabla_{\gamma}\ell_{\text{hurdle}} = \sum_{i=1}^{n} \big(d_i - \pi_i\big) X_i^{\top}
+\end{align*}
+\item \textbf{2.\ Zero-Truncated Count Objective (Trained Strictly on Positive Subset $S_{+} = \{i : y_i \geq 1\}$):}
+\begin{itemize}
+\item For \textbf{ZTP}, maximizing $\ell_{\text{ZTP}}(\beta) = \sum_{i \in S_{+}} \big[y_i (X_i\beta) - \lambda_i - \ln(y_i!) - \ln(1 - e^{-\lambda_i})\big]$ yields gradient:
+\begin{align*}
+\nabla_{\beta}\ell_{\text{ZTP}} &= \sum_{i \in S_{+}} \big(y_i - \mu_i^{+}\big) X_i^{\top}, \quad \text{where } \mu_i^{+} = \frac{\lambda_i}{1 - e^{-\lambda_i}}
+\end{align*}
+\item For \textbf{ZTNB2} (with $r = \alpha^{-1}$ and $P_{0,i} = (1 + \alpha\lambda_i)^{-r}$), we jointly optimize $(\beta, \ln\alpha)$ via L-BFGS-B:
+\begin{align*}
+\ell_{\text{ZTNB2}}(\beta, \alpha) &= \sum_{i \in S_{+}} \Big[\ln\Gamma(y_i + r) - \ln\Gamma(r) - \ln(y_i!) + r\ln r + y_i\ln\lambda_i \\[-2pt]
+&\qquad\quad - (y_i + r)\ln(r + \lambda_i) - \ln(1 - P_{0,i})\Big] \\[2pt]
+\nabla_{\beta}\ell_{\text{ZTNB2}} &= \sum_{i \in S_{+}} \left(\frac{y_i - \mu_i^{+}}{1 + \alpha\lambda_i}\right) X_i^{\top}, \quad \text{where } \mu_i^{+} = \frac{\lambda_i}{1 - (1 + \alpha\lambda_i)^{-r}}
+\end{align*}
+\end{itemize}
+\item \textbf{High-Performance Training:} Because $\ell(\gamma, \beta, \alpha)$ decouples, Stage 1 and Stage 2 are trained independently via L-BFGS-B using Numba-compiled analytical log-likelihood and gradient kernels (with ZTP warm-starting ZTNB2).
+\end{itemize}
+\end{footnotesize}
+\end{frame}
+
 \begin{frame}{Generalized Additive Models for Location, Scale, and Shape (GAMLSS)}
 \begin{small}
 GAMLSS\footcite[Introduced by][]{rigby2005} is a parametric framework that models every parameter of a distribution - not just the mean.

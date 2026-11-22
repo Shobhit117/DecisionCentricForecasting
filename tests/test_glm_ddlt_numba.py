@@ -24,8 +24,12 @@ from probabilistic_modeling.models.forecasters import (
     CatBoostQuantileForecaster,
     GLMForecaster,
     ProbabilisticForecaster,
+    _fit_logit_fast,
+    _fit_nb2_fast,
+    _fit_poisson_fast,
     _hurdle_conditional_mean,
     load_forecaster,
+    train_single_glm,
 )
 from probabilistic_modeling.time_series import DiscreteTimeSeries, predict_glm, train_glm
 
@@ -416,5 +420,155 @@ def test_hurdle_glm_forecaster_positive_overdispersion_and_end_to_end(tmp_path):
     for dist in ddlt_df["demand_distribution"]:
         assert isinstance(dist, DiscreteDistribution)
         assert dist.mean() > 0.0
+
+
+def test_glm_forecaster_velocity_tiers_and_demand_regimes(tmp_path):
+    """
+    Verifies that:
+    1. `DiscreteTimeSeries` computes `velocity_tier` (0=Low, 1=Medium, 2=High) and
+       Syntetos-Boylan `demand_regime` (0=Smooth, 1=Erratic, 2=Intermittent, 3=Lumpy)
+       strictly on training rows (`is_test == 0`) and stores them in `series_metadata`.
+    2. `GLMForecaster(velocity_tiers=True)` and `GLMForecaster(velocity_tiers="demand_regime")`
+       partition training by the respective tier column + overdispersion, persist/reload cleanly,
+       and score via the parallel `_predict_glm_batch_numba` kernel with exact agreement against
+       single-row `predict_glm`.
+    """
+    rng = np.random.default_rng(2027)
+    days = list(range(1, 91))
+    records = []
+    for d in days:
+        # SKU_low: ~15% nonzero frequency (velocity_tier == 0), small constant positives -> Intermittent (demand_regime == 2)
+        dem_low = int(rng.choice([2, 3])) if rng.random() < 0.15 else 0
+        # SKU_med: ~50% nonzero frequency (velocity_tier == 1), high variance positives -> Lumpy (demand_regime == 3)
+        dem_med = int(1 + rng.negative_binomial(1, 0.15)) if rng.random() < 0.50 else 0
+        # SKU_high: ~90% nonzero frequency (velocity_tier == 2), low variance positives -> Smooth (demand_regime == 0)
+        dem_high = int(rng.choice([8, 9, 10])) if rng.random() < 0.90 else 0
+        for item_id, dem in (("SKU_low", dem_low), ("SKU_med", dem_med), ("SKU_high", dem_high)):
+            records.append({
+                "store_id": "S1",
+                "cat_id": "FOODS",
+                "item_id": item_id,
+                "day": d,
+                "demand": dem,
+            })
+
+    sales_df = pd.DataFrame(records)
+    ts = DiscreteTimeSeries(
+        sales_df,
+        ts_id_cols=["store_id", "cat_id", "item_id"],
+        period_col="day",
+        var_col="demand",
+        lags=(1, 7),
+        rolling_windows=(7,),
+        num_future_targets=3,
+        num_test_days=5,
+        use_one_hot_encoding=False,
+        downsample_zeros_frac=None,
+        fit_historical_distributions=False,
+    )
+
+    meta = ts.series_metadata.set_index("item_id")
+    assert int(meta.loc["SKU_low", "velocity_tier"]) == 0
+    assert int(meta.loc["SKU_med", "velocity_tier"]) == 1
+    assert int(meta.loc["SKU_high", "velocity_tier"]) == 2
+
+    assert int(meta.loc["SKU_low", "demand_regime"]) == 2   # Intermittent (ADI >= 1.32, CV^2 < 0.49)
+    assert int(meta.loc["SKU_med", "demand_regime"]) == 3   # Lumpy (ADI >= 1.32, CV^2 >= 0.49)
+    assert int(meta.loc["SKU_high", "demand_regime"]) == 0  # Smooth (ADI < 1.32, CV^2 < 0.49)
+
+    for vel_mode, expected_col in ((True, "velocity_tier"), ("demand_regime", "demand_regime")):
+        fc = GLMForecaster(
+            train_groups=["store_id", "cat_id"],
+            hurdle=True,
+            velocity_tiers=vel_mode,
+        )
+        model_df = fc.fit(ts)
+        assert expected_col in model_df.columns
+        assert len(model_df) == 3
+
+        save_dir = tmp_path / f"glm_vel_{expected_col}"
+        fc.save(save_dir)
+        loaded = load_forecaster(save_dir)
+        assert isinstance(loaded, GLMForecaster)
+        assert loaded.velocity_tiers == vel_mode
+
+        preds = loaded.predict(ts, period=86)
+        assert len(preds) == 3
+        for _, row in preds.iterrows():
+            tier_val = int(row[expected_col])
+            m_row = model_df[model_df[expected_col] == tier_val].iloc[0]
+            for t in ts.target_cols:
+                mu_ref, alpha_ref = predict_glm(m_row[t], row)
+                assert float(row[f"{t}_mu"]) == pytest.approx(mu_ref, rel=1e-11)
+                if alpha_ref is None or np.isnan(alpha_ref):
+                    assert np.isnan(row[f"{t}_alpha"])
+                else:
+                    assert float(row[f"{t}_alpha"]) == pytest.approx(float(alpha_ref), rel=1e-11)
+
+
+def test_base_glm_numba_kernels_match_statsmodels_mle():
+    """
+    Verifies that the compiled Numba MLE training kernels for base GLMs (`_fit_poisson_fast`,
+    `_fit_nb2_fast`) and binary hurdle (`_fit_logit_fast`) match `statsmodels` MLE parameter
+    estimates (`sm.Poisson`, `sm.NegativeBinomial`, `sm.Logit`) to high precision, and that
+    `train_single_glm(..., hurdle=False)` produces accurate coefficients and dispersion `alpha`.
+    """
+    import statsmodels.api as sm
+
+    rng = np.random.default_rng(12345)
+    n = 600
+    x1 = rng.normal(0.0, 1.0, size=n)
+    x2 = rng.uniform(-1.0, 1.0, size=n)
+    X = np.column_stack([np.ones(n, dtype=np.float64), x1, x2])
+
+    # 1. Binary Logit MLE vs sm.Logit
+    true_gamma = np.array([-0.4, 0.9, -0.6])
+    prob = 1.0 / (1.0 + np.exp(-(X @ true_gamma)))
+    y_bin = rng.binomial(1, prob).astype(np.float64)
+    gamma_numba = _fit_logit_fast(y_bin, X)
+    gamma_sm = sm.Logit(y_bin, X).fit(disp=False).params
+    np.testing.assert_allclose(gamma_numba, gamma_sm, rtol=1e-4, atol=1e-5)
+
+    # 2. Standard Poisson MLE vs sm.Poisson
+    true_beta_p = np.array([0.8, 0.5, -0.3])
+    mu_p = np.exp(X @ true_beta_p)
+    y_pois = rng.poisson(mu_p).astype(np.float64)
+    beta_p_numba = _fit_poisson_fast(y_pois, X)
+    beta_p_sm = sm.Poisson(y_pois, X).fit(disp=False).params
+    np.testing.assert_allclose(beta_p_numba, beta_p_sm, rtol=1e-4, atol=1e-5)
+
+    # 3. Standard Negative Binomial (NB2) MLE vs sm.NegativeBinomial
+    true_beta_nb = np.array([1.1, 0.45, -0.35])
+    true_alpha = 0.65
+    mu_nb = np.exp(X @ true_beta_nb)
+    r_nb = 1.0 / true_alpha
+    p_nb = r_nb / (r_nb + mu_nb)
+    y_nb = rng.negative_binomial(r_nb, p_nb).astype(np.float64)
+    beta_nb_numba, alpha_numba = _fit_nb2_fast(y_nb, X, init_beta=_fit_poisson_fast(y_nb, X))
+    res_nb_sm = sm.NegativeBinomial(y_nb, X).fit(disp=False)
+    np.testing.assert_allclose(beta_nb_numba, res_nb_sm.params[:3], rtol=1e-3, atol=1e-4)
+    assert alpha_numba == pytest.approx(float(res_nb_sm.params[3]), rel=1e-3, abs=1e-4)
+
+    # 4. End-to-end train_single_glm for standard Poisson & NB2
+    df_test = pd.DataFrame({"x1": x1, "x2": x2, "y_pois": y_pois, "y_nb": y_nb, "is_test": 0})
+    m_pois, _ = train_single_glm(df_test, ["x1", "x2"], "y_pois", model_type="poisson", hurdle=False)
+    assert m_pois["model_type"] == "poisson" and m_pois["alpha"] is None
+    np.testing.assert_allclose(
+        [m_pois["coefficients"]["Intercept"], m_pois["coefficients"]["x1"], m_pois["coefficients"]["x2"]],
+        beta_p_sm,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    m_nb, _ = train_single_glm(df_test, ["x1", "x2"], "y_nb", model_type="nbinom", hurdle=False)
+    assert m_nb["model_type"] == "nbinom" and m_nb["alpha"] == pytest.approx(float(res_nb_sm.params[3]), rel=1e-3)
+    np.testing.assert_allclose(
+        [m_nb["coefficients"]["Intercept"], m_nb["coefficients"]["x1"], m_nb["coefficients"]["x2"]],
+        res_nb_sm.params[:3],
+        rtol=1e-3,
+        atol=1e-4,
+    )
+
+
 
 

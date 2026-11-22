@@ -31,7 +31,7 @@ from pathlib import Path
 import time
 from typing import Any, TYPE_CHECKING
 
-from numba import njit
+from numba import njit, prange
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -109,17 +109,18 @@ def compute_forecasting_metrics(
         pred_df["abs_diff"] = np.nan
         return pred_df
 
-    tmp_cols = []
-    for col_name in target_cols:
-        tmp_col = f"tmp_{col_name}"
-        pred_df[tmp_col] = np.where(pred_df[col_name].isna(), 0, pred_df[target_to_pred[col_name]])
-        tmp_cols.append(tmp_col)
+    sorted_targets = sorted(target_cols)
+    sorted_preds = [target_to_pred[c] for c in sorted_targets]
+    t_mat = pred_df[sorted_targets].to_numpy(dtype=np.float64, copy=False)
+    p_mat = pred_df[sorted_preds].to_numpy(dtype=np.float64, copy=False)
+    valid = ~np.isnan(t_mat)
 
-    pred_df["actual"] = pred_df[target_cols].fillna(0).sum(axis=1)
-    pred_df["pred"] = pred_df[tmp_cols].sum(axis=1)
-    pred_df.drop(columns=tmp_cols, inplace=True)
-    pred_df["under_diff"] = np.maximum(pred_df["actual"] - pred_df["pred"], 0)
-    pred_df["over_diff"] = np.maximum(pred_df["pred"] - pred_df["actual"], 0)
+    actual = np.where(valid, t_mat, 0.0).sum(axis=1)
+    pred = np.where(valid, p_mat, 0.0).sum(axis=1)
+    pred_df["actual"] = actual
+    pred_df["pred"] = pred
+    pred_df["under_diff"] = np.maximum(actual - pred, 0.0)
+    pred_df["over_diff"] = np.maximum(pred - actual, 0.0)
     pred_df["abs_diff"] = pred_df["under_diff"] + pred_df["over_diff"]
     return pred_df
 
@@ -212,6 +213,105 @@ def _hurdle_conditional_mean(lam: np.ndarray | float, alpha: float | None) -> np
     return float(cond_mu) if is_scalar else cond_mu
 
 
+@njit(parallel=True, nogil=True, cache=True)
+def _predict_glm_batch_numba(
+    X_mat: np.ndarray,
+    row_group_id: np.ndarray,
+    count_intercepts: np.ndarray,
+    count_weights: np.ndarray,
+    hurdle_intercepts: np.ndarray,
+    hurdle_weights: np.ndarray,
+    alphas: np.ndarray,
+    is_hurdle_mat: np.ndarray,
+    valid_model_mat: np.ndarray,
+    has_any_hurdle: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Multi-core parallel Numba kernel (`numba.prange`) that evaluates all `H` forecast horizons
+    simultaneously across all `N` rows for standard Poisson/NB2 and Zero-Hurdle Poisson/NB2 GLMs.
+
+    Returns
+    -------
+    mu_out : np.ndarray of shape (N, H)
+    alpha_out : np.ndarray of shape (N, H)
+    pi_out : np.ndarray of shape (N, H) when `has_any_hurdle=True` else (0, 0)
+    lam_out : np.ndarray of shape (N, H) when `has_any_hurdle=True` else (0, 0)
+    """
+    n_rows, n_feats = X_mat.shape
+    n_horizons = count_intercepts.shape[1]
+    mu_out = np.empty((n_rows, n_horizons), dtype=np.float64)
+    alpha_out = np.empty((n_rows, n_horizons), dtype=np.float64)
+    if has_any_hurdle:
+        pi_out = np.empty((n_rows, n_horizons), dtype=np.float64)
+        lam_out = np.empty((n_rows, n_horizons), dtype=np.float64)
+    else:
+        pi_out = np.empty((0, 0), dtype=np.float64)
+        lam_out = np.empty((0, 0), dtype=np.float64)
+
+    for i in prange(n_rows):
+        g = row_group_id[i]
+        if g < 0:
+            for h in range(n_horizons):
+                mu_out[i, h] = np.nan
+                alpha_out[i, h] = np.nan
+                if has_any_hurdle:
+                    pi_out[i, h] = np.nan
+                    lam_out[i, h] = np.nan
+            continue
+
+        for h in range(n_horizons):
+            if valid_model_mat[g, h] == 0:
+                mu_out[i, h] = np.nan
+                alpha_out[i, h] = np.nan
+                if has_any_hurdle:
+                    pi_out[i, h] = np.nan
+                    lam_out[i, h] = np.nan
+                continue
+
+            z = count_intercepts[g, h]
+            for p in range(n_feats):
+                z += X_mat[i, p] * count_weights[g, h, p]
+            if z < -50.0:
+                z = -50.0
+            elif z > 50.0:
+                z = 50.0
+            lam = math.exp(z)
+            a = alphas[g, h]
+            alpha_out[i, h] = a
+
+            if is_hurdle_mat[g, h] == 1:
+                z_h = hurdle_intercepts[g, h]
+                for p in range(n_feats):
+                    z_h += X_mat[i, p] * hurdle_weights[g, h, p]
+                if z_h < -50.0:
+                    z_h = -50.0
+                elif z_h > 50.0:
+                    z_h = 50.0
+                pi = 1.0 / (1.0 + math.exp(-z_h))
+                if a > 0.0:
+                    u = a * lam if a * lam > 0.0 else 0.0
+                    log_p0 = -(1.0 / a) * math.log1p(u)
+                    pos_mass = -math.expm1(log_p0)
+                else:
+                    pos_mass = -math.expm1(-(lam if lam > 0.0 else 0.0))
+                if pos_mass > 1e-12:
+                    ratio = lam / pos_mass
+                    cond_mu = ratio if ratio > 1.0 else 1.0
+                else:
+                    cond_mu = 1.0
+                mu_out[i, h] = pi * cond_mu
+                if has_any_hurdle:
+                    pi_out[i, h] = pi
+                    lam_out[i, h] = lam
+            else:
+                mu_out[i, h] = lam
+                if has_any_hurdle:
+                    pi_out[i, h] = np.nan
+                    lam_out[i, h] = np.nan
+
+    return mu_out, alpha_out, pi_out, lam_out
+
+
 @njit(nogil=True, cache=True)
 def _digamma_scalar(x: float) -> float:
     """Fast scalar digamma function psi(x) = d/dx ln(Gamma(x)) for x > 0."""
@@ -230,6 +330,120 @@ def _digamma_scalar(x: float) -> float:
         )
     )
     return res
+
+
+@njit(nogil=True, cache=True)
+def _logit_nll_and_grad_eta(y: np.ndarray, eta: np.ndarray) -> tuple[float, np.ndarray]:
+    """
+    Analytical average negative log-likelihood and linear-predictor gradient for
+    binary Logistic Regression (`Y in {0, 1}`, `pi = 1 / (1 + exp(-eta))`).
+    """
+    n = y.shape[0]
+    grad_eta = np.empty(n, dtype=np.float64)
+    nll = 0.0
+    inv_n = 1.0 / n
+    for i in range(n):
+        yi = y[i]
+        ei = eta[i]
+        if ei < -30.0:
+            ei = -30.0
+        elif ei > 30.0:
+            ei = 30.0
+        if ei >= 0.0:
+            exp_neg = math.exp(-ei)
+            pi = 1.0 / (1.0 + exp_neg)
+            log1p_exp = ei + math.log1p(exp_neg)
+        else:
+            exp_pos = math.exp(ei)
+            pi = exp_pos / (1.0 + exp_pos)
+            log1p_exp = math.log1p(exp_pos)
+        ll_i = yi * ei - log1p_exp
+        nll -= ll_i
+        grad_eta[i] = (pi - yi) * inv_n
+    return nll * inv_n, grad_eta
+
+
+@njit(nogil=True, cache=True)
+def _poisson_nll_and_grad_eta(y: np.ndarray, eta: np.ndarray) -> tuple[float, np.ndarray]:
+    """
+    Analytical average negative log-likelihood and linear-predictor gradient for
+    standard Poisson Regression (`Y >= 0`, `mu = exp(eta)`).
+    """
+    n = y.shape[0]
+    grad_eta = np.empty(n, dtype=np.float64)
+    nll = 0.0
+    inv_n = 1.0 / n
+    for i in range(n):
+        yi = y[i]
+        ei = eta[i]
+        if ei < -30.0:
+            ei = -30.0
+        elif ei > 30.0:
+            ei = 30.0
+        mu = math.exp(ei)
+        ll_i = yi * ei - mu - math.lgamma(yi + 1.0)
+        nll -= ll_i
+        grad_eta[i] = (mu - yi) * inv_n
+    return nll * inv_n, grad_eta
+
+
+@njit(nogil=True, cache=True)
+def _nb2_nll_and_grad_eta(
+    y: np.ndarray, eta: np.ndarray, log_alpha: float
+) -> tuple[float, np.ndarray, float]:
+    """
+    Analytical average negative log-likelihood and gradients w.r.t. linear predictor `eta`
+    and `log_alpha = ln(alpha)` for standard Negative Binomial NB2 (`Y >= 0`, `mu = exp(eta)`).
+    """
+    n = y.shape[0]
+    grad_eta = np.empty(n, dtype=np.float64)
+    if log_alpha < -15.0:
+        log_alpha = -15.0
+    elif log_alpha > 10.0:
+        log_alpha = 10.0
+    alpha = math.exp(log_alpha)
+    r = math.exp(-log_alpha)
+    lgamma_r = math.lgamma(r)
+    digamma_r = _digamma_scalar(r)
+    r_log_r = -r * log_alpha
+
+    nll = 0.0
+    grad_tau = 0.0
+    inv_n = 1.0 / n
+
+    for i in range(n):
+        yi = y[i]
+        ei = eta[i]
+        if ei < -30.0:
+            ei = -30.0
+        elif ei > 30.0:
+            ei = 30.0
+        mu = math.exp(ei)
+        u = alpha * mu
+        denom = 1.0 + u
+        log1p_u = math.log1p(u)
+
+        ll_i = (
+            math.lgamma(yi + r)
+            - lgamma_r
+            - math.lgamma(yi + 1.0)
+            + r_log_r
+            + yi * ei
+            - (yi + r) * math.log(r + mu)
+        )
+        nll -= ll_i
+        grad_eta[i] = ((mu - yi) / denom) * inv_n
+
+        d_ll_dr = (
+            _digamma_scalar(yi + r)
+            - digamma_r
+            - log1p_u
+            + (mu - yi) / (r + mu)
+        )
+        # Since r = exp(-log_alpha), dr / d(log_alpha) = -r, so d(-ll_i)/d(log_alpha) = r * d_ll_dr
+        grad_tau += (r * d_ll_dr) * inv_n
+
+    return nll * inv_n, grad_eta, grad_tau
 
 
 @njit(nogil=True, cache=True)
@@ -363,6 +577,110 @@ def _build_design_matrix(df: pd.DataFrame, feature_cols: list[str]) -> tuple[np.
     return X, active_features
 
 
+def _fit_logit_fast(
+    y_bin: np.ndarray,
+    X: np.ndarray,
+    reg_alpha: float = 0.0,
+    l1_wt: float = 0.0,
+) -> np.ndarray | None:
+    """Fits binary Logistic Regression via L-BFGS-B using compiled Numba analytical gradients."""
+    k = X.shape[1]
+    p_bar = float(np.clip(y_bin.mean(), 1e-6, 1.0 - 1e-6))
+    beta0 = np.zeros(k, dtype=np.float64)
+    beta0[0] = math.log(p_bar / (1.0 - p_bar))
+    l2_pen = float(reg_alpha) * (1.0 - float(l1_wt)) if reg_alpha > 0.0 else 0.0
+
+    def _obj(beta: np.ndarray) -> tuple[float, np.ndarray]:
+        eta = X @ beta
+        nll, grad_eta = _logit_nll_and_grad_eta(y_bin, eta)
+        grad_beta = X.T @ grad_eta
+        if l2_pen > 0.0:
+            nll += 0.5 * l2_pen * float(np.dot(beta[1:], beta[1:]))
+            grad_beta[1:] += l2_pen * beta[1:]
+        return float(nll), grad_beta
+
+    bounds = [(-30.0, 30.0)] * k
+    res = minimize(_obj, beta0, method="L-BFGS-B", jac=True, bounds=bounds, options={"maxiter": 150, "ftol": 1e-9})
+    if res.x is not None and np.all(np.isfinite(res.x)) and np.all(np.abs(res.x) < 50.0):
+        return res.x
+    return None
+
+
+def _fit_poisson_fast(
+    y: np.ndarray,
+    X: np.ndarray,
+    reg_alpha: float = 0.0,
+    l1_wt: float = 0.0,
+) -> np.ndarray | None:
+    """Fits standard Poisson Regression via L-BFGS-B using compiled Numba analytical gradients."""
+    k = X.shape[1]
+    mu0 = max(float(y.mean()), 1e-4)
+    beta0 = np.zeros(k, dtype=np.float64)
+    beta0[0] = math.log(mu0)
+    l2_pen = float(reg_alpha) * (1.0 - float(l1_wt)) if reg_alpha > 0.0 else 0.0
+
+    def _obj(beta: np.ndarray) -> tuple[float, np.ndarray]:
+        eta = X @ beta
+        nll, grad_eta = _poisson_nll_and_grad_eta(y, eta)
+        grad_beta = X.T @ grad_eta
+        if l2_pen > 0.0:
+            nll += 0.5 * l2_pen * float(np.dot(beta[1:], beta[1:]))
+            grad_beta[1:] += l2_pen * beta[1:]
+        return float(nll), grad_beta
+
+    bounds = [(-30.0, 30.0)] * k
+    res = minimize(_obj, beta0, method="L-BFGS-B", jac=True, bounds=bounds, options={"maxiter": 150, "ftol": 1e-9})
+    if res.x is not None and np.all(np.isfinite(res.x)) and np.all(np.abs(res.x) < 50.0):
+        return res.x
+    return None
+
+
+def _fit_nb2_fast(
+    y: np.ndarray,
+    X: np.ndarray,
+    reg_alpha: float = 0.0,
+    l1_wt: float = 0.0,
+    init_beta: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, float | None]:
+    """Fits standard Negative Binomial (NB2) via L-BFGS-B using compiled Numba analytical gradients."""
+    k = X.shape[1]
+    y_mean = float(y.mean())
+    y_var = float(y.var()) if len(y) > 1 else y_mean
+    alpha0 = max((y_var - y_mean) / max(y_mean * y_mean, 1e-2), 0.1)
+    alpha0 = float(np.clip(alpha0, 1e-3, 50.0))
+
+    theta0 = np.zeros(k + 1, dtype=np.float64)
+    if init_beta is not None and len(init_beta) == k:
+        theta0[:k] = np.clip(init_beta, -25.0, 25.0)
+    else:
+        theta0[0] = math.log(max(y_mean, 1e-4))
+    theta0[k] = math.log(alpha0)
+    l2_pen = float(reg_alpha) * (1.0 - float(l1_wt)) if reg_alpha > 0.0 else 0.0
+
+    def _obj(theta: np.ndarray) -> tuple[float, np.ndarray]:
+        beta = theta[:k]
+        log_alpha = float(theta[k])
+        eta = X @ beta
+        nll, grad_eta, grad_tau = _nb2_nll_and_grad_eta(y, eta, log_alpha)
+        grad = np.empty(k + 1, dtype=np.float64)
+        grad[:k] = X.T @ grad_eta
+        grad[k] = grad_tau
+        if l2_pen > 0.0:
+            nll += 0.5 * l2_pen * float(np.dot(beta[1:], beta[1:]))
+            grad[1:k] += l2_pen * beta[1:]
+        return float(nll), grad
+
+    bounds = [*([(-30.0, 30.0)] * k), (-11.5, 9.2)]
+    res = minimize(_obj, theta0, method="L-BFGS-B", jac=True, bounds=bounds, options={"maxiter": 200, "ftol": 1e-9})
+    if res.x is None or not np.all(np.isfinite(res.x)):
+        return None, None
+    beta_hat = res.x[:k]
+    alpha_hat = float(math.exp(float(res.x[k])))
+    if not np.all(np.abs(beta_hat) < 50.0) or not (1e-5 < alpha_hat < 1e4):
+        return None, None
+    return beta_hat, alpha_hat
+
+
 def _fit_hurdle_binary_stage(
     train_df: pd.DataFrame,
     feature_cols: list[str],
@@ -371,15 +689,17 @@ def _fit_hurdle_binary_stage(
     l1_wt: float = 0.0,
 ) -> tuple[dict[str, float], Any]:
     """
-    Fits the binary hurdle stage `P(Y > 0 | X)` using a logistic regression GLM (`sm.Logit`),
-    with graceful fallback when a group's target is all-zero, all-positive, or exhibits
-    perfect separation / constant covariates.
+    Fits the binary hurdle stage `P(Y > 0 | X)` using compiled Numba analytical gradients + L-BFGS-B
+    (`_fit_logit_fast`), with fallback to `sm.Logit.fit_regularized` when L1 regularization is requested,
+    and graceful fallback when a group's target is all-zero, all-positive, or exhibits perfect separation.
     """
     zero_coefs = {str(f): 0.0 for f in feature_cols}
     if len(train_df) == 0:
         return {"Intercept": -30.0, **zero_coefs}, None
 
-    y_bin = (train_df[target_col].to_numpy(dtype=np.float64, copy=False) > 0.0).astype(np.float64)
+    y_bin = np.ascontiguousarray(
+        (train_df[target_col].to_numpy(dtype=np.float64, copy=False) > 0.0).astype(np.float64)
+    )
     n_pos = int(y_bin.sum())
     if n_pos == 0:
         return {"Intercept": -30.0, **zero_coefs}, None
@@ -388,36 +708,28 @@ def _fit_hurdle_binary_stage(
 
     X, active_features = _build_design_matrix(train_df, feature_cols)
     col_names = ["Intercept", *active_features]
-    want_summary = logger.isEnabledFor(logging.DEBUG)
+    reg_a = float(regularization_alpha) if regularization_alpha is not None and regularization_alpha > 0.0 else 0.0
 
-    summary = None
     params_dict: dict[str, float] | None = None
-    try:
-        logit_model = sm.Logit(y_bin, X)
-        if regularization_alpha is not None and regularization_alpha > 0.0:
+    if reg_a > 0.0 and float(l1_wt) > 0.0:
+        try:
+            logit_model = sm.Logit(y_bin, X)
             res = logit_model.fit_regularized(
-                alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
+                alpha=reg_a, L1_wt=float(l1_wt), maxiter=100, disp=False
             )
-        else:
-            try:
-                res = logit_model.fit(maxiter=100, disp=False)
-                if want_summary:
-                    summary = res.summary()
-            except Exception:
-                res = logit_model.fit(method="lbfgs", maxiter=100, disp=False)
-        raw_vals = np.asarray(res.params, dtype=np.float64)
-        if np.all(np.isfinite(raw_vals) & (np.abs(raw_vals) < 50.0)):
-            params_dict = {col_names[i]: float(raw_vals[i]) for i in range(len(col_names))}
-        else:
-            res_reg = logit_model.fit_regularized(alpha=1e-4, L1_wt=0.0, maxiter=100, disp=False)
-            reg_vals = np.asarray(res_reg.params, dtype=np.float64)
-            if np.all(np.isfinite(reg_vals)):
+            raw_vals = np.asarray(res.params, dtype=np.float64)
+            if np.all(np.isfinite(raw_vals)):
                 params_dict = {
-                    col_names[i]: float(np.clip(reg_vals[i], -30.0, 30.0))
+                    col_names[i]: float(np.clip(raw_vals[i], -30.0, 30.0))
                     for i in range(len(col_names))
                 }
-    except Exception:
-        params_dict = None
+        except Exception:
+            params_dict = None
+
+    if params_dict is None:
+        beta_hat = _fit_logit_fast(y_bin, X, reg_alpha=reg_a, l1_wt=l1_wt)
+        if beta_hat is not None:
+            params_dict = {col_names[i]: float(beta_hat[i]) for i in range(len(col_names))}
 
     if params_dict is None:
         p_bar = float(np.clip(y_bin.mean(), 1e-6, 1.0 - 1e-6))
@@ -427,7 +739,7 @@ def _fit_hurdle_binary_stage(
         "Intercept": float(params_dict.get("Intercept", 0.0)),
         **{str(f): float(params_dict.get(f, 0.0)) for f in feature_cols},
     }
-    return hurdle_params, summary
+    return hurdle_params, None
 
 
 def _fit_ztp_fast(
@@ -592,6 +904,89 @@ def _fit_hurdle_count_stage(
     return count_params, alpha_val, None
 
 
+def _fit_standard_count_stage(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    model_type: str,
+    regularization_alpha: float | None = None,
+    l1_wt: float = 0.0,
+) -> tuple[dict[str, float], float | None, Any]:
+    """
+    Fits a standard (untruncated) Poisson (`model_type="poisson"`) or Negative Binomial NB2
+    (`model_type="nbinom"`) GLM on all non-missing training rows (`y >= 0`) using compiled
+    Numba analytical gradients + L-BFGS-B (`_fit_nb2_fast` or `_fit_poisson_fast`), warm-starting
+    NB2 from the fast Poisson solution and falling back gracefully if L1 regularization is
+    requested or if a subgroup is degenerate.
+    """
+    zero_coefs = {str(f): 0.0 for f in feature_cols}
+    if len(train_df) == 0:
+        return {"Intercept": -20.0, **zero_coefs}, None, None
+
+    y_vec = np.ascontiguousarray(train_df[target_col].to_numpy(dtype=np.float64, copy=False))
+    if float(y_vec.max()) <= 0.0:
+        return {"Intercept": -20.0, **zero_coefs}, None, None
+
+    X, active_features = _build_design_matrix(train_df, feature_cols)
+    col_names = ["Intercept", *active_features]
+    reg_a = float(regularization_alpha) if regularization_alpha is not None and regularization_alpha > 0.0 else 0.0
+
+    # If L1 penalty is requested, use statsmodels fit_regularized on (y_vec, X)
+    if reg_a > 0.0 and float(l1_wt) > 0.0:
+        try:
+            mod = sm.NegativeBinomial(y_vec, X) if model_type == "nbinom" else sm.Poisson(y_vec, X)
+            res = mod.fit_regularized(alpha=reg_a, L1_wt=float(l1_wt), maxiter=100, disp=False)
+            params_arr = np.asarray(res.params, dtype=np.float64)
+            if np.all(np.isfinite(params_arr)):
+                k_cols = len(col_names)
+                beta_arr = params_arr[:k_cols]
+                a_val = float(params_arr[k_cols]) if (model_type == "nbinom" and len(params_arr) > k_cols) else None
+                raw_params = {col_names[i]: float(beta_arr[i]) for i in range(k_cols)}
+                coef_dict = {
+                    "Intercept": float(raw_params.get("Intercept", 0.0)),
+                    **{str(f): float(raw_params.get(f, 0.0)) for f in feature_cols},
+                }
+                if a_val is not None and (not np.isfinite(a_val) or a_val <= 0.0 or a_val > 1e4):
+                    a_val = None
+                return coef_dict, a_val, None
+        except Exception:
+            pass
+
+    pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt)
+    beta_hat: np.ndarray | None = None
+    alpha_val: float | None = None
+
+    if model_type == "nbinom":
+        beta_hat, alpha_val = _fit_nb2_fast(
+            y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt, init_beta=pois_beta
+        )
+        if beta_hat is None and active_features:
+            X_int = np.ones((len(train_df), 1), dtype=np.float64)
+            b_int, a_int = _fit_nb2_fast(y_vec, X_int, reg_alpha=reg_a, l1_wt=l1_wt)
+            if b_int is not None:
+                return {"Intercept": float(b_int[0]), **zero_coefs}, a_int, None
+
+    if beta_hat is None:
+        beta_hat = pois_beta
+        alpha_val = None
+        if beta_hat is None and active_features:
+            X_int = np.ones((len(train_df), 1), dtype=np.float64)
+            b_int = _fit_poisson_fast(y_vec, X_int, reg_alpha=reg_a, l1_wt=l1_wt)
+            if b_int is not None:
+                return {"Intercept": float(b_int[0]), **zero_coefs}, None, None
+
+    if beta_hat is None:
+        mu_bar = max(float(y_vec.mean()), 1e-6)
+        return {"Intercept": float(np.log(mu_bar)), **zero_coefs}, None, None
+
+    raw_params = {col_names[i]: float(beta_hat[i]) for i in range(len(col_names))}
+    coef_dict = {
+        "Intercept": float(raw_params.get("Intercept", 0.0)),
+        **{str(f): float(raw_params.get(f, 0.0)) for f in feature_cols},
+    }
+    return coef_dict, alpha_val, None
+
+
 def train_single_glm(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -610,15 +1005,15 @@ def train_single_glm(
     1. Filters `df` to training rows (`is_test == 0`) where `target_col` is not `NaN`.
     2. **Standard GLM (`hurdle=False`, `model_type in ("nbinom", "poisson")`)**:
        Builds the numeric design matrix `X` (`Intercept` + active features) directly and fits
-       either `sm.NegativeBinomial` (`model_type="nbinom"`) or `sm.Poisson`
-       (`model_type="poisson"`), via MLE or penalized likelihood.
+       standard Negative Binomial NB2 (`_fit_nb2_fast`) or Poisson (`_fit_poisson_fast`) via
+       compiled Numba analytical gradients + L-BFGS-B.
     3. **Zero-Hurdle GLM (`hurdle=True` or `model_type in ("hurdle_nbinom", "hurdle_poisson")`)**:
-       Fits a two-part hurdle model:
-       - *Binary hurdle stage*: logistic regression (`sm.Logit`) on `1{target_col > 0}`
+       Fits a two-part hurdle model using compiled Numba analytical gradients + L-BFGS-B:
+       - *Binary hurdle stage*: logistic regression (`_fit_logit_fast`) on `1{target_col > 0}`
          across all training rows, producing `"hurdle_coefficients"`.
-       - *Zero-truncated count stage*: Zero-Truncated NB2 (`"hurdle_nbinom"`)
-         or Zero-Truncated Poisson (`"hurdle_poisson"`) fitted strictly on positive training
-         rows (`target_col > 0`), producing `"coefficients"` and `"alpha"`.
+       - *Zero-truncated count stage*: Zero-Truncated NB2 (`"hurdle_nbinom"`, `_fit_ztnb2_fast`)
+         or Zero-Truncated Poisson (`"hurdle_poisson"`, `_fit_ztp_fast`) fitted strictly on positive
+         training rows (`target_col > 0`), producing `"coefficients"` and `"alpha"`.
     4. Separates the Negative Binomial dispersion parameter `"alpha"` from the regression
        `"coefficients"` dictionary so `"coefficients"` strictly maps `"Intercept"` and
        covariate names to their linear weights.
@@ -666,80 +1061,14 @@ def train_single_glm(
             "'nbinom', 'poisson', 'hurdle_nbinom', 'hurdle_poisson'."
         )
 
-    zero_coefs = {str(f): 0.0 for f in feature_cols}
-    if len(train_df) == 0:
-        return {
-            "model_type": model_type,
-            "horizon": target_col,
-            "coefficients": {"Intercept": -20.0, **zero_coefs},
-            "alpha": None,
-        }, None
-
-    y_vec = train_df[target_col].to_numpy(dtype=np.float64, copy=False)
-    if float(y_vec.max()) <= 0.0:
-        return {
-            "model_type": model_type,
-            "horizon": target_col,
-            "coefficients": {"Intercept": -20.0, **zero_coefs},
-            "alpha": None,
-        }, None
-
-    X, active_features = _build_design_matrix(train_df, feature_cols)
-    col_names = ["Intercept", *active_features]
-    want_summary = logger.isEnabledFor(logging.DEBUG)
-
-    def _try_glm_fit(
-        dist_name: str, exog: np.ndarray, exog_names: list[str]
-    ) -> tuple[dict[str, float] | None, float | None, Any]:
-        try:
-            mod = sm.NegativeBinomial(y_vec, exog) if dist_name == "nbinom" else sm.Poisson(y_vec, exog)
-            if regularization_alpha is not None and regularization_alpha > 0.0:
-                res = mod.fit_regularized(
-                    alpha=float(regularization_alpha), L1_wt=float(l1_wt), maxiter=100, disp=False
-                )
-                summ = None
-            else:
-                try:
-                    res = mod.fit(maxiter=100, disp=False)
-                    summ = res.summary() if want_summary else None
-                except Exception:
-                    res = mod.fit(method="bfgs", maxiter=100, disp=False)
-                    summ = None
-            params_arr = np.asarray(res.params, dtype=np.float64)
-            k_cols = len(exog_names)
-            beta_arr = params_arr[:k_cols]
-            if not np.all(np.isfinite(beta_arr) & (np.abs(beta_arr) < 50.0)):
-                return None, None, None
-            raw = {exog_names[i]: float(beta_arr[i]) for i in range(k_cols)}
-            if dist_name == "nbinom":
-                a_val = float(params_arr[k_cols]) if len(params_arr) > k_cols else None
-                if a_val is None or not np.isfinite(a_val) or a_val <= 0.0 or a_val > 1e4:
-                    return None, None, None
-                return raw, float(a_val), summ
-            return raw, None, summ
-        except Exception:
-            return None, None, None
-
-    raw_params, alpha_val, summary = _try_glm_fit(model_type, X, col_names)
-    if raw_params is None and active_features:
-        X_int = np.ones((len(train_df), 1), dtype=np.float64)
-        raw_params, alpha_val, summary = _try_glm_fit(model_type, X_int, ["Intercept"])
-    if raw_params is None and model_type == "nbinom":
-        raw_params, alpha_val, summary = _try_glm_fit("poisson", X, col_names)
-        if raw_params is None and active_features:
-            X_int = np.ones((len(train_df), 1), dtype=np.float64)
-            raw_params, alpha_val, summary = _try_glm_fit("poisson", X_int, ["Intercept"])
-
-    if raw_params is None:
-        mu_bar = max(float(y_vec.mean()), 1e-6)
-        coef_dict = {"Intercept": float(np.log(mu_bar)), **zero_coefs}
-        alpha_val = None
-    else:
-        coef_dict = {
-            "Intercept": float(raw_params.get("Intercept", 0.0)),
-            **{str(f): float(raw_params.get(f, 0.0)) for f in feature_cols},
-        }
-
+    coef_dict, alpha_val, summary = _fit_standard_count_stage(
+        train_df,
+        feature_cols,
+        target_col,
+        model_type=model_type,
+        regularization_alpha=regularization_alpha,
+        l1_wt=l1_wt,
+    )
     prod_model = {
         "model_type": model_type,
         "horizon": target_col,
@@ -788,7 +1117,7 @@ class GLMModel:
         for group_key, horizon_dict in self.models.items():
             row: dict[str, Any] = {}
             for col_name, key_val in zip(self.train_groups, group_key):
-                if col_name in ("overdispersion", "positive_overdispersion"):
+                if col_name in ("overdispersion", "positive_overdispersion", "velocity_tier", "demand_regime"):
                     try:
                         row[col_name] = int(key_val)
                     except ValueError:
@@ -1022,10 +1351,9 @@ class ProbabilisticForecaster(ABC):
                 for k in join_keys:
                     meta_sub[k] = meta_sub[k].astype(test_data[k].dtype)
                 test_data = pd.merge(test_data, meta_sub, on=join_keys, how="left")
-                if "overdispersion" in missing_meta_cols:
-                    test_data["overdispersion"] = test_data["overdispersion"].fillna(0).astype(int)
-                if "positive_overdispersion" in missing_meta_cols:
-                    test_data["positive_overdispersion"] = test_data["positive_overdispersion"].fillna(0).astype(int)
+                for int_col in ("overdispersion", "positive_overdispersion", "velocity_tier", "demand_regime"):
+                    if int_col in missing_meta_cols and int_col in test_data.columns:
+                        test_data[int_col] = test_data[int_col].fillna(0).astype(int)
 
         return test_data, target_cols, feature_cols, period_col
 
@@ -1189,6 +1517,7 @@ class GLMForecaster(ProbabilisticForecaster):
         l1_wt: float = 0.0,
         restrict_future_leads: bool = False,
         hurdle: bool = False,
+        velocity_tiers: bool | str = False,
         n_jobs: int = -1,
     ):
         super().__init__()
@@ -1197,9 +1526,66 @@ class GLMForecaster(ProbabilisticForecaster):
         self.l1_wt = l1_wt
         self.restrict_future_leads = restrict_future_leads
         self.hurdle = bool(hurdle)
+        self.velocity_tiers = velocity_tiers
         self.n_jobs = int(n_jobs)
         self.model_data: pd.DataFrame | None = None
         self.model: GLMModel | None = None
+
+    def _resolve_velocity_col(self) -> str | None:
+        if not self.velocity_tiers:
+            return None
+        if isinstance(self.velocity_tiers, str):
+            val = self.velocity_tiers.strip().lower()
+            if val in ("demand_regime", "sbc", "syntetos_boylan"):
+                return "demand_regime"
+            if val in ("velocity_tier", "velocity", "true"):
+                return "velocity_tier"
+            if val in ("false", "none", ""):
+                return None
+            raise ValueError(
+                f"Unsupported velocity_tiers='{self.velocity_tiers}'. "
+                "Use False, True, 'velocity_tier', or 'demand_regime'."
+            )
+        return "velocity_tier"
+
+    def _ensure_tier_and_dispersion_columns(self, ts: "DiscreteTimeSeries", needed_cols: list[str]) -> None:
+        """Computes any missing `positive_overdispersion`, `velocity_tier`, or `demand_regime` columns on `ts.df`."""
+        missing = [c for c in needed_cols if c not in ts.df.columns]
+        if not missing or ts.var_col not in ts.df.columns or not ts.ts_id_cols:
+            return
+        is_train = (ts.df["is_test"] == 0) if "is_test" in ts.df.columns else np.ones(len(ts.df), dtype=bool)
+        train_vals = np.where(is_train, ts.df[ts.var_col], np.nan)
+        pos_vals = np.where(is_train & (ts.df[ts.var_col] > 0), ts.df[ts.var_col], np.nan)
+        keys = [ts.df[c] for c in ts.ts_id_cols]
+        train_s = pd.Series(train_vals, index=ts.df.index)
+        pos_s = pd.Series(pos_vals, index=ts.df.index)
+        grp_train = train_s.groupby(keys, observed=True)
+        grp_pos = pos_s.groupby(keys, observed=True)
+
+        pos_mean = grp_pos.transform("mean")
+        pos_var = grp_pos.transform("var")
+        if "positive_overdispersion" in missing:
+            ts.df["positive_overdispersion"] = (pos_var > pos_mean).fillna(False).astype(int)
+
+        if "velocity_tier" in missing or "demand_regime" in missing:
+            n_train = grp_train.transform("count")
+            n_pos = grp_pos.transform("count")
+            p_pos = (n_pos / np.maximum(n_train, 1)).fillna(0.0).to_numpy(dtype=np.float64)
+            if "velocity_tier" in missing:
+                ts.df["velocity_tier"] = np.where(p_pos >= 0.75, 2, np.where(p_pos >= 0.25, 1, 0)).astype(int)
+            if "demand_regime" in missing:
+                pos_mean_arr = pos_mean.fillna(0.0).to_numpy(dtype=np.float64)
+                pos_var_arr = pos_var.fillna(0.0).to_numpy(dtype=np.float64)
+                cv2 = np.where(pos_mean_arr > 1e-12, pos_var_arr / np.maximum(pos_mean_arr * pos_mean_arr, 1e-12), 0.0)
+                is_intermittent = p_pos <= (1.0 / 1.32)
+                is_erratic = cv2 >= 0.49
+                ts.df["demand_regime"] = (is_intermittent.astype(int) * 2 + is_erratic.astype(int)).astype(int)
+
+        if self.series_metadata_ is not None:
+            new_meta_cols = [c for c in missing if c in ts.df.columns and c not in self.series_metadata_.columns]
+            if new_meta_cols:
+                meta_sub = ts.df[list(ts.ts_id_cols) + new_meta_cols].drop_duplicates(subset=list(ts.ts_id_cols))
+                self.series_metadata_ = pd.merge(self.series_metadata_, meta_sub, on=list(ts.ts_id_cols), how="left")
 
     def _resolve_n_jobs(self, n_tasks: int) -> int:
         if n_tasks <= 1 or self.n_jobs == 1:
@@ -1219,24 +1605,21 @@ class GLMForecaster(ProbabilisticForecaster):
         t0 = time.perf_counter()
         self._bind_training_context(ts)
         dispersion_col = "positive_overdispersion" if self.hurdle else "overdispersion"
-        if dispersion_col not in ts.df.columns:
-            # Ensure positive_overdispersion is present if ts was constructed without it:
-            if self.hurdle and ts.var_col in ts.df.columns and ts.ts_id_cols:
-                tmp_pos = np.where(
-                    (ts.df["is_test"] == 0 if "is_test" in ts.df.columns else True) & (ts.df[ts.var_col] > 0),
-                    ts.df[ts.var_col],
-                    np.nan,
-                )
-                pos_s = pd.Series(tmp_pos, index=ts.df.index)
-                grp = pos_s.groupby([ts.df[c] for c in ts.ts_id_cols], observed=True)
-                ts.df["positive_overdispersion"] = (grp.transform("var") > grp.transform("mean")).fillna(False).astype(int)
-                if self.series_metadata_ is not None and "positive_overdispersion" not in self.series_metadata_.columns:
-                    meta_pos = ts.df[list(ts.ts_id_cols) + ["positive_overdispersion"]].drop_duplicates(subset=list(ts.ts_id_cols))
-                    self.series_metadata_ = pd.merge(self.series_metadata_, meta_pos, on=list(ts.ts_id_cols), how="left")
-            elif "overdispersion" in ts.df.columns:
-                dispersion_col = "overdispersion"
+        vel_col = self._resolve_velocity_col()
+
+        needed_cols = [dispersion_col]
+        if vel_col is not None:
+            needed_cols.append(vel_col)
+        for col in ("velocity_tier", "demand_regime"):
+            if col in self.train_groups and col not in needed_cols:
+                needed_cols.append(col)
+        self._ensure_tier_and_dispersion_columns(ts, needed_cols)
+        if dispersion_col not in ts.df.columns and "overdispersion" in ts.df.columns:
+            dispersion_col = "overdispersion"
 
         partition_cols = list(self.train_groups)
+        if vel_col is not None and vel_col not in partition_cols and vel_col in ts.df.columns:
+            partition_cols.append(vel_col)
         if dispersion_col not in partition_cols:
             partition_cols.append(dispersion_col)
 
@@ -1372,7 +1755,7 @@ class GLMForecaster(ProbabilisticForecaster):
             fallback_feature_cols=glm_container.feature_cols,
         )
         train_groups = [col for col in model_df.columns if col not in target_cols]
-        # Fallback if a standalone DataFrame was passed without `positive_overdispersion`:
+        # Fallback if a standalone DataFrame was passed without dispersion or velocity/regime columns:
         if "positive_overdispersion" in train_groups and "positive_overdispersion" not in test_data.columns:
             if "overdispersion" in test_data.columns:
                 test_data["positive_overdispersion"] = test_data["overdispersion"].fillna(0).astype(int)
@@ -1383,6 +1766,9 @@ class GLMForecaster(ProbabilisticForecaster):
                 test_data["overdispersion"] = test_data["positive_overdispersion"].fillna(0).astype(int)
             else:
                 test_data["overdispersion"] = 0
+        for tier_col in ("velocity_tier", "demand_regime"):
+            if tier_col in train_groups and tier_col not in test_data.columns:
+                test_data[tier_col] = 0
 
         has_hurdle = self.hurdle or any(
             isinstance(m_dict, dict)
@@ -1392,13 +1778,6 @@ class GLMForecaster(ProbabilisticForecaster):
         )
         logger.info("Generating GLM predictions for %d rows across %d horizons...", len(test_data), len(target_cols))
 
-        for target in target_cols:
-            if has_hurdle:
-                test_data[f"{target}_pi"] = np.nan
-                test_data[f"{target}_lambda"] = np.nan
-            test_data[f"{target}_mu"] = np.nan
-            test_data[f"{target}_alpha"] = np.nan
-
         model_dict_map = model_df.set_index(train_groups).to_dict(orient="index")
         # Also prepare string-keyed fallback map so loaded JSON models match categorical/int columns seamlessly:
         str_model_dict_map = {
@@ -1406,57 +1785,149 @@ class GLMForecaster(ProbabilisticForecaster):
             for k, v in model_dict_map.items()
         }
 
-        present_features = [c for c in feature_cols if c in test_data.columns]
-        for group_keys, group_df in test_data.groupby(train_groups, observed=True):
+        def _lookup_group_model(group_keys: Any) -> dict[str, Any] | None:
             lookup_key = group_keys[0] if isinstance(group_keys, tuple) and len(group_keys) == 1 else group_keys
             row_models = model_dict_map.get(lookup_key)
-            if row_models is None:
-                str_key = tuple(str(x) for x in group_keys) if isinstance(group_keys, tuple) else str(group_keys)
-                if isinstance(str_key, tuple) and len(str_key) == 1:
-                    str_key = str_key[0]
-                row_models = str_model_dict_map.get(str_key)
-            if row_models is None and train_groups and train_groups[-1] in ("overdispersion", "positive_overdispersion"):
-                if isinstance(group_keys, tuple) and len(group_keys) >= 2:
-                    try:
-                        alt_flag = 1 - int(group_keys[-1])
-                        alt_key = (*group_keys[:-1], alt_flag)
-                        row_models = model_dict_map.get(alt_key)
-                        if row_models is None:
-                            row_models = str_model_dict_map.get(tuple(str(x) for x in alt_key))
-                    except (ValueError, TypeError):
-                        pass
-            if row_models is None:
-                logger.warning("No trained GLM found for group %s; skipping %d rows", lookup_key, len(group_df))
-                continue
+            if row_models is not None:
+                return row_models
+            str_key = tuple(str(x) for x in group_keys) if isinstance(group_keys, tuple) else str(group_keys)
+            if isinstance(str_key, tuple) and len(str_key) == 1:
+                str_key = str_key[0]
+            row_models = str_model_dict_map.get(str_key)
+            if row_models is not None:
+                return row_models
+            if not isinstance(group_keys, tuple) or len(group_keys) < 2:
+                return None
 
-            group_idx = group_df.index
-            X = group_df[present_features].copy()
-            X["Intercept"] = 1.0
-            for target in target_cols:
-                model_dict = row_models.get(target)
-                if not isinstance(model_dict, dict) or "coefficients" not in model_dict:
+            # Fallback 1: flip trailing overdispersion / positive_overdispersion flag (0 <-> 1)
+            if train_groups and train_groups[-1] in ("overdispersion", "positive_overdispersion"):
+                try:
+                    alt_flag = 1 - int(group_keys[-1])
+                    alt_key = (*group_keys[:-1], alt_flag)
+                    row_models = model_dict_map.get(alt_key) or str_model_dict_map.get(tuple(str(x) for x in alt_key))
+                    if row_models is not None:
+                        return row_models
+                except (ValueError, TypeError):
+                    pass
+
+            # Fallback 2: if velocity_tier or demand_regime is in train_groups and a specific tier
+            # was unseen in training for this parent group, match the nearest available tier:
+            tier_indices = [i for i, col in enumerate(train_groups) if col in ("velocity_tier", "demand_regime")]
+            if tier_indices:
+                t_idx = tier_indices[-1]
+                for candidate_tier in (1, 0, 2, 3):
+                    cand_list = list(group_keys)
+                    cand_list[t_idx] = candidate_tier
+                    cand_key = tuple(cand_list)
+                    row_models = model_dict_map.get(cand_key) or str_model_dict_map.get(tuple(str(x) for x in cand_key))
+                    if row_models is not None:
+                        return row_models
+                    if train_groups[-1] in ("overdispersion", "positive_overdispersion"):
+                        try:
+                            cand_list[-1] = 1 - int(group_keys[-1])
+                            cand_alt = tuple(cand_list)
+                            row_models = model_dict_map.get(cand_alt) or str_model_dict_map.get(
+                                tuple(str(x) for x in cand_alt)
+                            )
+                            if row_models is not None:
+                                return row_models
+                        except (ValueError, TypeError):
+                            pass
+            return None
+
+        present_features = [c for c in feature_cols if c in test_data.columns]
+        feat_to_idx = {f: idx for idx, f in enumerate(present_features)}
+        n_rows = len(test_data)
+        n_feats = len(present_features)
+        n_horizons = len(target_cols)
+
+        if n_rows > 0:
+            X_mat = (
+                np.ascontiguousarray(test_data[present_features].fillna(0.0).to_numpy(dtype=np.float64))
+                if n_feats > 0
+                else np.empty((n_rows, 0), dtype=np.float64)
+            )
+            row_group_id = np.full(n_rows, -1, dtype=np.int64)
+            grouped_indices = test_data.groupby(train_groups, observed=True).indices
+            matched_models: list[dict[str, Any]] = []
+
+            for group_keys, pos_indices in grouped_indices.items():
+                row_models = _lookup_group_model(group_keys)
+                if row_models is None:
+                    lookup_key = (
+                        group_keys[0] if isinstance(group_keys, tuple) and len(group_keys) == 1 else group_keys
+                    )
+                    logger.warning("No trained GLM found for group %s; skipping %d rows", lookup_key, len(pos_indices))
                     continue
-                coefs = dict(model_dict["coefficients"])
-                alpha_val = model_dict.get("alpha", coefs.pop("alpha", np.nan))
-                alpha_clean = float(alpha_val) if alpha_val is not None and np.isfinite(alpha_val) else np.nan
-                coef_series = pd.Series(coefs, dtype=float)
-                X_aligned = X.reindex(columns=coef_series.index).fillna(0.0)
-                z = X_aligned.dot(coef_series)
-                lam = np.exp(np.clip(z.to_numpy(dtype=np.float64), -50.0, 50.0))
+                g_id = len(matched_models)
+                matched_models.append(row_models)
+                row_group_id[pos_indices] = g_id
 
-                if "hurdle_coefficients" in model_dict or str(model_dict.get("model_type", "")).startswith("hurdle_"):
-                    h_coefs = dict(model_dict.get("hurdle_coefficients", {"Intercept": 0.0}))
-                    h_series = pd.Series(h_coefs, dtype=float)
-                    X_h = X.reindex(columns=h_series.index).fillna(0.0)
-                    z_h = np.clip(X_h.dot(h_series).to_numpy(dtype=np.float64), -50.0, 50.0)
-                    pi = 1.0 / (1.0 + np.exp(-z_h))
-                    mu = pi * _hurdle_conditional_mean(lam, alpha_clean)
-                    test_data.loc[group_idx, f"{target}_pi"] = pi
-                    test_data.loc[group_idx, f"{target}_lambda"] = lam
-                    test_data.loc[group_idx, f"{target}_mu"] = mu
-                else:
-                    test_data.loc[group_idx, f"{target}_mu"] = lam
-                test_data.loc[group_idx, f"{target}_alpha"] = alpha_clean
+            n_groups = max(len(matched_models), 1)
+            count_intercepts = np.zeros((n_groups, n_horizons), dtype=np.float64)
+            count_weights = np.zeros((n_groups, n_horizons, n_feats), dtype=np.float64)
+            hurdle_intercepts = np.zeros((n_groups, n_horizons), dtype=np.float64)
+            hurdle_weights = np.zeros((n_groups, n_horizons, n_feats), dtype=np.float64)
+            alphas = np.full((n_groups, n_horizons), np.nan, dtype=np.float64)
+            is_hurdle_mat = np.zeros((n_groups, n_horizons), dtype=np.uint8)
+            valid_model_mat = np.zeros((n_groups, n_horizons), dtype=np.uint8)
+
+            for g_id, row_models in enumerate(matched_models):
+                for h_idx, target in enumerate(target_cols):
+                    model_dict = row_models.get(target)
+                    if not isinstance(model_dict, dict) or "coefficients" not in model_dict:
+                        continue
+                    valid_model_mat[g_id, h_idx] = 1
+                    coefs = model_dict["coefficients"]
+                    count_intercepts[g_id, h_idx] = float(coefs.get("Intercept", 0.0))
+                    for f_name, f_val in coefs.items():
+                        if f_name != "Intercept":
+                            f_idx = feat_to_idx.get(f_name)
+                            if f_idx is not None and f_val:
+                                count_weights[g_id, h_idx, f_idx] = float(f_val)
+
+                    alpha_val = model_dict.get("alpha", coefs.get("alpha", np.nan))
+                    if alpha_val is not None and np.isfinite(alpha_val):
+                        alphas[g_id, h_idx] = float(alpha_val)
+
+                    if "hurdle_coefficients" in model_dict or str(model_dict.get("model_type", "")).startswith(
+                        "hurdle_"
+                    ):
+                        is_hurdle_mat[g_id, h_idx] = 1
+                        h_coefs = model_dict.get("hurdle_coefficients", {"Intercept": 0.0})
+                        hurdle_intercepts[g_id, h_idx] = float(h_coefs.get("Intercept", 0.0))
+                        for f_name, f_val in h_coefs.items():
+                            if f_name != "Intercept":
+                                f_idx = feat_to_idx.get(f_name)
+                                if f_idx is not None and f_val:
+                                    hurdle_weights[g_id, h_idx, f_idx] = float(f_val)
+
+            mu_out, alpha_out, pi_out, lam_out = _predict_glm_batch_numba(
+                X_mat,
+                row_group_id,
+                count_intercepts,
+                count_weights,
+                hurdle_intercepts,
+                hurdle_weights,
+                alphas,
+                is_hurdle_mat,
+                valid_model_mat,
+                has_hurdle,
+            )
+
+            for h_idx, target in enumerate(target_cols):
+                if has_hurdle:
+                    test_data[f"{target}_pi"] = pi_out[:, h_idx]
+                    test_data[f"{target}_lambda"] = lam_out[:, h_idx]
+                test_data[f"{target}_mu"] = mu_out[:, h_idx]
+                test_data[f"{target}_alpha"] = alpha_out[:, h_idx]
+        else:
+            for target in target_cols:
+                if has_hurdle:
+                    test_data[f"{target}_pi"] = np.nan
+                    test_data[f"{target}_lambda"] = np.nan
+                test_data[f"{target}_mu"] = np.nan
+                test_data[f"{target}_alpha"] = np.nan
 
         compute_forecasting_metrics(test_data, target_cols, [f"{target}_mu" for target in target_cols])
         logger.info("GLM predictions completed in %.2fs", time.perf_counter() - t0)
@@ -1522,6 +1993,7 @@ class GLMForecaster(ProbabilisticForecaster):
                 "l1_wt": self.l1_wt,
                 "restrict_future_leads": self.restrict_future_leads,
                 "hurdle": self.hurdle,
+                "velocity_tiers": self.velocity_tiers,
                 "prefix": prefix,
             },
         )
@@ -1542,15 +2014,25 @@ class GLMForecaster(ProbabilisticForecaster):
             for h_dict in glm_model.models.values()
             for m_dict in h_dict.values()
         )
+        inferred_vel: bool | str = False
+        if "demand_regime" in glm_model.train_groups:
+            inferred_vel = "demand_regime"
+        elif "velocity_tier" in glm_model.train_groups:
+            inferred_vel = True
         forecaster = cls(
             train_groups=meta.get(
                 "train_groups",
-                [c for c in glm_model.train_groups if c not in ("overdispersion", "positive_overdispersion")],
+                [
+                    c
+                    for c in glm_model.train_groups
+                    if c not in ("overdispersion", "positive_overdispersion", "velocity_tier", "demand_regime")
+                ],
             ),
             regularization_alpha=meta.get("regularization_alpha"),
             l1_wt=float(meta.get("l1_wt", 0.0)),
             restrict_future_leads=bool(meta.get("restrict_future_leads", False)),
             hurdle=bool(meta.get("hurdle", inferred_hurdle)),
+            velocity_tiers=meta.get("velocity_tiers", inferred_vel),
         )
         forecaster.model = glm_model
         forecaster.model_data = glm_model.to_dataframe()

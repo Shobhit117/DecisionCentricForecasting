@@ -36,3 +36,6 @@ docs/slides/*.synctex.gz
 docs/slides/*.synctex.gz.sum.synctex
 docs/slides/*.fdb_latexmk
 docs/slides/*.fls
+
+# R code
+src/probabilistic_modeling/models/r_glmtree
