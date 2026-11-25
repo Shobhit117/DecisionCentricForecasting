@@ -405,6 +405,11 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save simulation benchmark CSV tables and logs.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Save per-(store, section) checkpoints and resume from already-completed sections if interrupted.",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -461,8 +466,12 @@ def main() -> None:
         args.kings_window,
         args.initial_inventory_mode,
     )
-    logger.info("  Output directory       : %s", output_dir)
+    logger.info("  Output directory       : %s (resume=%s)", output_dir, args.resume)
     logger.info("=====================================================================")
+
+    ckpt_dir = output_dir / "checkpoints"
+    if args.resume:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     calendar_df = load_enriched_calendar(data_dir)
     prices_df = pd.read_parquet(data_dir / "price.parquet")
@@ -516,6 +525,20 @@ def main() -> None:
                 sec.test_end_day,
                 sec.test_days,
             )
+
+            ckpt_prefix = ckpt_dir / f"{store_id}_{sec.name}"
+            if args.resume and ckpt_prefix.with_name(f"{ckpt_prefix.name}_done.flag").exists():
+                logger.info("Resuming: loading completed checkpoint for [%s | %s]", store_id, sec.name)
+                sec_overall_frames.append(
+                    pd.read_csv(ckpt_prefix.with_name(f"{ckpt_prefix.name}_overall.csv"))
+                )
+                cat_ckpt = ckpt_prefix.with_name(f"{ckpt_prefix.name}_cat.csv")
+                if cat_ckpt.exists():
+                    sec_cat_frames.append(pd.read_csv(cat_ckpt))
+                continue
+
+            sec_overall_list: list[pd.DataFrame] = []
+            sec_cat_list: list[pd.DataFrame] = []
 
             slice_end_day = min(max_day, sec.test_end_day + args.horizon - 1)
             day_mask = (sales_df["day"] >= sec.train_start_day) & (sales_df["day"] <= slice_end_day)
@@ -610,6 +633,7 @@ def main() -> None:
                 s_df.insert(0, "section_id", sec.section_id)
                 s_df.insert(0, "store_id", store_id)
                 sec_overall_frames.append(s_df)
+                sec_overall_list.append(s_df)
 
                 if sim_res.group_summary_df is not None:
                     c_df = sim_res.group_summary_df.copy()
@@ -630,6 +654,7 @@ def main() -> None:
                     c_df.insert(0, "section_id", sec.section_id)
                     c_df.insert(0, "store_id", store_id)
                     sec_cat_frames.append(c_df)
+                    sec_cat_list.append(c_df)
 
             # 1. Evaluate King's Formula Baselines across all lead-time profiles and target quantiles
             init_inv_by_profile: dict[str, str | np.ndarray] = {}
@@ -809,6 +834,15 @@ def main() -> None:
             if ts_glm is not None:
                 del ts_glm
             gc.collect()
+            if args.resume:
+                pd.concat(sec_overall_list, ignore_index=True).to_csv(
+                    ckpt_prefix.with_name(f"{ckpt_prefix.name}_overall.csv"), index=False
+                )
+                if sec_cat_list:
+                    pd.concat(sec_cat_list, ignore_index=True).to_csv(
+                        ckpt_prefix.with_name(f"{ckpt_prefix.name}_cat.csv"), index=False
+                    )
+                ckpt_prefix.with_name(f"{ckpt_prefix.name}_done.flag").write_text("ok", encoding="utf-8")
             logger.info("Completed section %s / %s in %.2fs", store_id, sec.name, time.perf_counter() - sec_t0)
 
     by_sec_df = pd.concat(sec_overall_frames, ignore_index=True)
