@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Sequence
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -332,8 +333,10 @@ def populate_model_quantiles(
                 new_cols[col] = q_tensor[:, h, k]
 
     if new_cols:
-        for col, vals in new_cols.items():
-            out[col] = vals
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", pd.errors.PerformanceWarning)
+            for col, vals in new_cols.items():
+                out[col] = vals
     return out
 
 

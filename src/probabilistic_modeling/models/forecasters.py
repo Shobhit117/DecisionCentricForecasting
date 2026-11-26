@@ -960,6 +960,18 @@ def _fit_standard_count_stage(
             pass
 
     pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt)
+    # Guard against collinearity / quasi-separation slope explosion on sparse count subsets
+    # (e.g. log1p(rolling_mean_w) vs. zero_freq_w when positive counts are rare {0, 1} events):
+    if reg_a == 0.0 and len(active_features) > 0:
+        needs_ridge = (
+            pois_beta is None
+            or float(np.max(np.abs(pois_beta[1:]))) > 5.0
+            or n_pos < 20 * len(active_features)
+        )
+        if needs_ridge:
+            reg_a = max(1e-3, 1.0 / max(len(train_df), 1))
+            pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=0.0)
+
     beta_hat: np.ndarray | None = None
     alpha_val: float | None = None
 
@@ -967,6 +979,17 @@ def _fit_standard_count_stage(
         beta_hat, alpha_val = _fit_nb2_fast(
             y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt, init_beta=pois_beta
         )
+        if (
+            reg_a == 0.0
+            and len(active_features) > 0
+            and (beta_hat is None or float(np.max(np.abs(beta_hat[1:]))) > 5.0)
+        ):
+            reg_a = max(1e-3, 1.0 / max(len(train_df), 1))
+            if pois_beta is None or float(np.max(np.abs(pois_beta[1:]))) > 5.0:
+                pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=0.0)
+            beta_hat, alpha_val = _fit_nb2_fast(
+                y_vec, X, reg_alpha=reg_a, l1_wt=0.0, init_beta=pois_beta
+            )
         if beta_hat is None and active_features:
             X_int = np.ones((len(train_df), 1), dtype=np.float64)
             b_int, a_int = _fit_nb2_fast(y_vec, X_int, reg_alpha=reg_a, l1_wt=l1_wt)
@@ -1679,12 +1702,17 @@ class GLMForecaster(ProbabilisticForecaster):
                 n_horizons,
                 target,
             )
+            effective_reg_alpha = (
+                self.regularization_alpha
+                if self.regularization_alpha is not None
+                else (None if self.hurdle else 1e-3)
+            )
             model_dict, summary = train_single_glm(
                 g_df,
                 h_features,
                 target,
                 model_type,
-                regularization_alpha=self.regularization_alpha,
+                regularization_alpha=effective_reg_alpha,
                 l1_wt=self.l1_wt,
                 hurdle=self.hurdle,
             )

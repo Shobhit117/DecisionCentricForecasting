@@ -570,5 +570,50 @@ def test_base_glm_numba_kernels_match_statsmodels_mle():
     )
 
 
+def test_standard_glm_stabilizes_collinear_sparse_subgroups():
+    """
+    Regression test for log-link explosion on ultra-sparse `{0, 1}` count subgroups where
+    `rolling_mean_28 = log1p(m_28)` and `zero_freq_28 = 1 - m_28` are nearly collinear on
+    training rows (`m_28 <= 0.07`), followed by a test-window product launch (`m_28 >> 1`).
+    """
+    rng = np.random.default_rng(42)
+    n_train = 2000
+    # Rare binary {0, 1} events in training (m_28 in [0, 0.07], so log1p(m_28) + zero_freq_28 ~= 1):
+    m_28_tr = rng.choice([0.0, 1.0 / 28.0, 2.0 / 28.0], size=n_train, p=[0.92, 0.06, 0.02])
+    rolling_mean_28_tr = np.log1p(m_28_tr)
+    zero_freq_28_tr = 1.0 - m_28_tr + rng.normal(0.0, 1e-4, size=n_train)
+    rolling_mean_7_tr = np.log1p(np.minimum(m_28_tr * 2.0, 2.0 / 7.0))
+    y_tr = rng.binomial(1, np.clip(m_28_tr * 0.8 + 0.001, 0.0, 0.2)).astype(np.float64)
+
+    df_tr = pd.DataFrame({
+        "rolling_mean_28": rolling_mean_28_tr,
+        "zero_freq_28": zero_freq_28_tr,
+        "rolling_mean_7": rolling_mean_7_tr,
+        "target_t_plus_0": y_tr,
+        "is_test": 0,
+    })
+    m_pois, _ = train_single_glm(
+        df_tr,
+        ["rolling_mean_28", "zero_freq_28", "rolling_mean_7"],
+        "target_t_plus_0",
+        model_type="poisson",
+        hurdle=False,
+    )
+    coefs = m_pois["coefficients"]
+    # Slopes must be stabilized by L2 ridge rather than exploding to +20..+30:
+    for feat in ("rolling_mean_28", "zero_freq_28", "rolling_mean_7"):
+        assert abs(coefs[feat]) < 5.0
+
+    # Simulate a newly-launched SKU in the test window with high rolling demand (~40 units/day):
+    test_row = pd.Series({
+        "rolling_mean_28": float(np.log1p(15.0)),
+        "zero_freq_28": 0.60,
+        "rolling_mean_7": float(np.log1p(38.0)),
+    })
+    mu_pred, _ = predict_glm(m_pois, test_row)
+    assert np.isfinite(mu_pred) and mu_pred < 100.0
+
+
+
 
 
