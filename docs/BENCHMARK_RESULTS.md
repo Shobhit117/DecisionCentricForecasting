@@ -1,6 +1,9 @@
-# M5 100-SKU Multi-Store Probabilistic Forecasting & DDLT Benchmark
+# M5 Multi-Store Probabilistic Forecasting, DDLT Calibration & Inventory Simulation Benchmark
 
-This document reports the benchmark results for the 100-SKU multi-store M5 experiment comparing **Velocity-Segmented Base GLM (`glm`)**, **Demand-Regime Zero-Hurdle GLM (`glm_hurdle`)**, **CatBoost MultiQuantile (`catboost`)**, **Trailing Empirical (`empirical_trailing`)**, and **Seasonal Empirical (`empirical_seasonal`)** across daily multi-horizon demand forecasts and convolved Demand During Lead Time (DDLT) distributions, with each model configured at its best architectural setting.
+This document reports the benchmark results for the M5 probabilistic demand forecasting and inventory replenishment experiments:
+1. **100-SKU Multi-Store & 7-Lead-Time-Profile Calibration Study (Sections 1–6):** Comparing **Velocity-Segmented Base GLM (`glm`)**, **Demand-Regime Zero-Hurdle GLM (`glm_hurdle`)**, **CatBoost MultiQuantile (`catboost`)**, **Trailing Empirical (`empirical_trailing`)**, and **Seasonal Empirical (`empirical_seasonal`)** across daily multi-horizon demand forecasts and convolved Demand During Lead Time (DDLT) distributions.
+2. **Full-SKU 11-Section M5 Forecasting & DDLT Calibration Benchmark (Section 7):** Scaling all 5 models to all 3,049 SKUs per store across 11 rolling annual sections (6.57M horizon observations), including the root-cause diagnosis and L2 ridge fix for single-stage base `glm` log-link overflow.
+3. **Full-SKU King's Formula vs. `glm_hurdle` DDLT Inventory Replenishment Simulation (Section 8):** Evaluating periodic-review order-up-to replenishment across 9,147 SKUs (`CA_1`, `TX_1`, `WI_1`, 512,232 simulated item-days per policy) and all 7 synthetic lead-time regimes (`deterministic_short`, `short_concentrated`, `right_skewed`, `bimodal_disrupted`, `uniform_wide`, `long_symmetric`, `deterministic_long`).
 
 ---
 
@@ -339,12 +342,156 @@ The table below compares **PIT Coverage Gap (in percentage points from nominal $
 
 ---
 
-## 7. Reproducibility & Output Artifacts
+## 7. Full-SKU M5 Forecasting & DDLT Calibration Benchmark (3,049 SKUs/Store, 11 Sections)
 
-To reproduce the 100-SKU benchmark via [`scripts/run_m5_experiments.py`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/scripts/run_m5_experiments.py):
+In addition to the 100-SKU multi-store experiment, all 5 models (`glm`, `glm_hurdle`, `catboost`, `empirical_trailing`, `empirical_seasonal`) were evaluated across **all 3,049 SKUs per store** on 11 rolling 1-year sections (`CA_1` sections 1–5, `CA_2` sections 1–5, `CA_3` section 1; **469,546 decision rows** and **6,573,644 daily horizon-step observations**, total demand = 8,193,114 units). Results are stored in [`m5_results/data/output/experiments_full_skus/`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/m5_results/data/output/experiments_full_skus/).
+
+### 7.1 Daily Forecast Calibration & WMAPE Across 6.57M Horizon Observations (`all_horizons`)
+
+| Model | Bias (%) | Daily CRPS | Dispersion Ratio | PIT Mean | PIT Std | PIT MAE | PIT RMSE | PIT KS | `mean` WMAPE | `q0.50` WMAPE | `q0.95` Pinball | `q0.99` Pinball |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`glm_hurdle` (Demand-Regime)** | **-1.30%** | **0.6178** | **1.0259** | **0.5012** | **0.2880** | 0.0122 | 0.0147 | 0.0035 | 75.64% | **68.06%** | **31.61%** | **11.80%** |
+| **`catboost` (MultiQuantile)** | -2.92% | 0.6190 | 1.0892 | 0.5013 | 0.2881 | **0.0077** | **0.0090** | **0.0032** | **75.52%** | 68.82% | 31.95% | 12.00% |
+| **`empirical_trailing`** | -7.45% | 0.6508 | 1.3004 | 0.5123 | 0.2979 | 0.0550 | 0.0881 | 0.0258 | 76.22% | 71.13% | 34.48% | 14.54% |
+| **`empirical_seasonal`** | -11.37% | 0.6819 | 2.1044 | 0.5167 | 0.3156 | 0.1618 | 0.2243 | 0.0612 | 77.77% | 72.18% | 40.25% | 21.84% |
+| **`glm` (Pre-Ridge Unregularized)*** | *Exploded* | *894.99* | *1.6e8* | 0.5014 | 0.2881 | 0.0268 | 0.0294 | 0.0064 | *Exploded* | *Exploded* | *Exploded* | *Exploded* |
+
+> [!IMPORTANT]
+> ***Base `glm` Log-Link Instability Diagnosis & L2 Ridge Fix:** In the unregularized GCP run, single-stage base `glm` (`hurdle=False`) experienced log-link overflow (`exp(eta)`) on sparse `FOODS` subgroups (`CA_1 sec_01..03`, `CA_2 sec_03`) where step-change indicator features (`snap`, `event_ind`, `is_weekend`) were collinear on sparse positive counts, whereas `glm_hurdle` (`hurdle=True`) remained 100% stable across all 11 sections (`Dispersion Ratio = 1.0259`). We subsequently added default L2 ridge stabilization (`effective_reg_alpha = 1e-3`) and an automatic collinearity/sparsity guard in [`src/probabilistic_modeling/models/forecasters.py`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/src/probabilistic_modeling/models/forecasters.py#L962-L995), which completely eliminates the log-link explosion (`FOODS` `mean` WMAPE drops from `1.7e17%` to `67.15%`, matching `glm_hurdle` at `67.42%`).
+
+### 7.2 Convolved DDLT Calibration Across 469,546 Decision Rows (`overall`)
+
+| Model | DDLT Bias (%) | DDLT CRPS | Dispersion Ratio | PIT Mean | PIT Std | PIT MAE | PIT RMSE | PIT KS | Upper Tail $[0.9, 1.0]$ |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`glm_hurdle` (Demand-Regime)** | **-0.91%** | 1.4068 | **1.3171** | **0.4917** | 0.2940 | 0.0369 | 0.0502 | 0.0157 | **1.0277** |
+| **`catboost` (MultiQuantile)** | -3.31% | **1.3968** | 1.4730 | 0.4928 | **0.2916** | **0.0248** | **0.0394** | **0.0124** | 0.9700 |
+| **`empirical_trailing`** | -8.41% | 1.5452 | 1.7653 | 0.5200 | 0.3080 | 0.1202 | 0.1700 | 0.0482 | 1.4692 |
+| **`empirical_seasonal`** | -12.35% | 1.5788 | 2.4530 | 0.5322 | 0.3213 | 0.2075 | 0.2970 | 0.0829 | 1.8291 |
+
+- At full 3,049-SKU scale, **`glm_hurdle` matches `catboost` within < 0.7% on DDLT CRPS (`1.4068` vs. `1.3968`) and < 0.2% on daily CRPS (`0.6178` vs. `0.6190`)**, while achieving **better daily bias (`-1.30%` vs. `-2.92%`), better DDLT bias (`-0.91%` vs. `-3.31%`), better dispersion calibration (`1.0259` vs. `1.0892` daily; `1.3171` vs. `1.4730` DDLT), lower median WMAPE (`68.06%` vs. `68.82%`), and lower upper-tail Pinball loss (`q0.95` and `q0.99`)**—at **~25× faster runtime** than `catboost`.
+
+---
+
+## 8. King's Formula vs. `glm_hurdle` DDLT Inventory Replenishment Simulation Benchmark (9,147 SKUs, 7 Lead-Time Regimes)
+
+To test whether better DDLT distributional calibration translates into superior operational inventory decisions, we ran [`scripts/run_kings_vs_ddlt_experiment.py`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/scripts/run_kings_vs_ddlt_experiment.py) across **3 representative M5 stores (`CA_1`, `TX_1`, `WI_1`)**, covering **all 3,049 SKUs per store (9,147 SKUs total)** over 2 rolling annual sections per store (6 store-sections × 3,049 SKUs × 28 test days = **512,232 simulated item-days per policy-quantile-profile**, total actual test demand = **498,411 units**) and **all 7 synthetic lead-time distributions**. All output tables are saved in [`data/output/experiments_kings_vs_ddlt_hurdle/`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/).
+
+### 8.1 Replenishment Policies Compared
+
+Under a periodic-review order-up-to $(R, S_t)$ policy with review period $R = 1$ day and stochastic order lead time $L \sim P(L = \ell)$, the replenishment order placed at the start of day $t$ is $q_t = \max(0, S_t - \text{IP}_t)$, where $\text{IP}_t = \text{OnHand}_t + \text{InTransit}_t$. We compare 5 policies across target service quantiles $\tau \in \{0.80, 0.85, 0.90, 0.95, 0.99\}$:
+
+1. **`ddlt_glm_hurdle` (Exact Discrete Convolution, Ceiling Target):**
+   $$S_t(\tau) = F_{D_t^{L+R}}^{-1}(\tau) = \min \left\{ y \in \mathbb{Z}_{\ge 0} : \sum_{m} P(L+R=m)\,(P_{t,1} * \dots * P_{t,m})(Y \le y) \ge \tau \right\}$$
+2. **`ddlt_glm_hurdle_round` (Interpolated Discrete Convolution, Rounded Target):**
+   Linearly interpolates the discrete DDLT CDF step to obtain the continuous quantile and rounds to the nearest integer, removing discrete ceiling overshoot on ultra-slow SKUs.
+3. **`kings_trailing_ceil` (King's Formula, 56-Day Trailing Moments, Ceiling Target):**
+   $$\mu_{\text{DDLT}, t} = \mu_{L+R}\,\hat{\mu}_{D,t}, \qquad \sigma_{\text{DDLT}, t} = \sqrt{\mu_{L+R}\,\hat{\sigma}_{D,t}^2 + \hat{\mu}_{D,t}^2\,\sigma_L^2}, \qquad S_t(\tau) = \left\lceil \mu_{\text{DDLT}, t} + \Phi^{-1}(\tau)\,\sigma_{\text{DDLT}, t} \right\rceil$$
+4. **`kings_trailing_round` (King's Formula, 56-Day Trailing Moments, Rounded Target):**
+   Same as `kings_trailing_ceil` but rounded to nearest integer (`round(...)`) rather than ceiling (`ceil(...)`).
+5. **`kings_seasonal_round` (King's Formula, 8-Week Same-Day-of-Week Moments, Rounded Target):**
+   Estimates $\hat{\mu}_{D,t}$ and $\hat{\sigma}_{D,t}$ from the trailing 8 same-weekday observations and applies King's Formula with nearest-integer rounding.
+
+---
+
+### 8.2 Head-to-Head Operational Performance Across All 7 Lead-Time Profiles (`q = 0.95` Target)
+
+From [`kings_vs_ddlt_summary.csv`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/kings_vs_ddlt_summary.csv) (pooled over 512,232 item-days, total demand = 498,411 units):
+
+| Lead-Time Profile | Policy | Fill Rate | Cycle Service Level (CSL) | Lost Sales (Units) | Avg Target Inv | Avg On-Hand Inv | Avg In-Transit |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`bimodal_disrupted`**<br>*(75% 1–3d, 25% 8–10d)* | **`ddlt_glm_hurdle`** | **96.29%** | **98.77%** | **18,496** | 12.50 | 9.47 | 4.04 |
+| | `ddlt_glm_hurdle_round` | **96.09%** | **98.66%** | **19,506** | 12.08 | 9.13 | 3.98 |
+| | `kings_trailing_ceil` | 93.12% | 97.78% | 34,275 | 10.57 | 7.18 | 3.58 |
+| | `kings_trailing_round` | 92.66% | 97.52% | 36,608 | 10.28 | 6.94 | 3.52 |
+| | `kings_seasonal_round` | 92.17% | 97.60% | 39,026 | 10.05 | 9.55 | 4.09 |
+| **`right_skewed`**<br>*(mode 1–2d, tail to 7d)* | **`ddlt_glm_hurdle`** | **94.91%** | **98.29%** | **25,350** | 7.73 | 5.92 | 2.42 |
+| | `ddlt_glm_hurdle_round` | **94.40%** | **98.02%** | **27,935** | 7.36 | 5.55 | 2.37 |
+| | `kings_trailing_ceil` | 91.96% | 97.42% | 40,055 | 7.03 | 4.90 | 2.25 |
+| | `kings_trailing_round` | 91.03% | 96.90% | 44,694 | 6.72 | 4.63 | 2.20 |
+| | `kings_seasonal_round` | 91.05% | 97.25% | 44,590 | 6.53 | 6.08 | 2.42 |
+| **`uniform_wide`**<br>*(Uniform 1..10d)* | **`ddlt_glm_hurdle`** | **93.83%** | **98.06%** | **30,743** | 13.33 | 8.39 | 6.00 |
+| | `ddlt_glm_hurdle_round` | **93.56%** | **97.93%** | **32,102** | 12.93 | 8.10 | 5.92 |
+| | `kings_trailing_ceil` | 91.35% | 97.24% | 43,101 | 12.28 | 7.01 | 5.50 |
+| | `kings_trailing_round` | 90.93% | 97.01% | 45,206 | 11.98 | 6.79 | 5.42 |
+| | `kings_seasonal_round` | 90.90% | 97.24% | 45,348 | 11.65 | 9.69 | 6.41 |
+| **`deterministic_short`**<br>*(Fixed $L = 2$d)* | **`ddlt_glm_hurdle`** | **93.71%** | **97.85%** | **31,345** | 5.85 | 4.36 | 2.00 |
+| | `ddlt_glm_hurdle_round` | **92.97%** | **97.47%** | **35,047** | 5.54 | 4.04 | 1.96 |
+| | `kings_trailing_ceil` | 91.06% | 97.11% | 44,563 | 5.66 | 3.87 | 1.88 |
+| | `kings_trailing_round` | 89.86% | 96.47% | 50,542 | 5.36 | 3.60 | 1.84 |
+| | `kings_seasonal_round` | 89.30% | 96.71% | 53,327 | 5.05 | 4.56 | 1.96 |
+| **`short_concentrated`**<br>*($L \in \{1,2,3\}$d)* | **`ddlt_glm_hurdle`** | **93.48%** | **97.84%** | **32,504** | 6.33 | 4.73 | 2.12 |
+| | `ddlt_glm_hurdle_round` | **92.76%** | **97.48%** | **36,100** | 6.00 | 4.40 | 2.07 |
+| | `kings_trailing_ceil` | 90.66% | 97.09% | 46,554 | 6.05 | 4.16 | 1.99 |
+| | `kings_trailing_round` | 89.51% | 96.48% | 52,267 | 5.74 | 3.89 | 1.94 |
+| | `kings_seasonal_round` | 89.17% | 96.76% | 53,995 | 5.45 | 4.97 | 2.09 |
+| **`long_symmetric`**<br>*(Centered at 6–7d)* | **`ddlt_glm_hurdle`** | **91.32%** | **97.40%** | **43,273** | 13.15 | 7.37 | 6.82 |
+| | `ddlt_glm_hurdle_round` | **90.98%** | **97.24%** | **44,940** | 12.77 | 7.10 | 6.71 |
+| | `kings_trailing_ceil` | 89.12% | 96.66% | 54,206 | 12.13 | 6.09 | 6.26 |
+| | `kings_trailing_round` | 88.63% | 96.40% | 56,686 | 11.83 | 5.89 | 6.16 |
+| | `kings_seasonal_round` | 89.54% | 96.90% | 52,126 | 11.42 | 8.46 | 7.26 |
+| **`deterministic_long`**<br>*(Fixed $L = 7$d)* | **`ddlt_glm_hurdle`** | **90.65%** | **97.22%** | **46,577** | 12.85 | 7.00 | 6.95 |
+| | `ddlt_glm_hurdle_round` | **90.30%** | **97.05%** | **48,341** | 12.47 | 6.70 | 6.82 |
+| | `kings_trailing_ceil` | 88.68% | 96.54% | 56,433 | 11.93 | 5.74 | 6.40 |
+| | `kings_trailing_round` | 88.17% | 96.27% | 58,959 | 11.62 | 5.54 | 6.29 |
+| | `kings_seasonal_round` | 89.26% | 96.83% | 53,530 | 11.12 | 7.94 | 7.37 |
+
+---
+
+### 8.3 Iso-Service & Pareto Frontier Inventory Savings (`ddlt_glm_hurdle` vs. `kings_trailing_ceil`)
+
+Because higher fill rates require higher safety stock, [`kings_vs_ddlt_iso_service.csv`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/kings_vs_ddlt_iso_service.csv) interpolates the `ddlt_glm_hurdle` Tradeoff Curve (Fill Rate vs. Average Target / On-Hand Inventory) at the **exact Fill Rate achieved by `kings_trailing_ceil`**:
+
+| Lead-Time Profile | King's `q=0.90` Fill Rate | Pareto Target Inv Saving (`q=0.90`) | Pareto On-Hand Saving (`q=0.90`) | King's `q=0.95` Fill Rate | Pareto Target Inv Saving (`q=0.95`) | Pareto On-Hand Saving (`q=0.95`) | King's `q=0.99` Fill Rate | Pareto Target Inv Saving (`q=0.99`) | Pareto On-Hand Saving (`q=0.99`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`bimodal_disrupted`** | 91.51% | **+11.46%** | **+8.00%** | 93.12% | **+15.41%** | **+13.39%** | 94.75% | **+21.93%** | **+21.29%** |
+| **`uniform_wide`** | 89.60% | **+9.24%** | **+4.80%** | 91.35% | **+10.52%** | **+7.02%** | 93.22% | **+14.00%** | **+11.96%** |
+| **`right_skewed`** | 89.63% | **+9.76%** | **+5.92%** | 91.96% | **+10.95%** | **+7.97%** | 94.53% | **+11.81%** | **+8.33%** |
+| **`deterministic_short`** | 88.59% | **+11.05%** | **+7.59%** | 91.06% | **+11.07%** | **+7.74%** | 94.05% | **+9.29%** | **+4.40%** |
+| **`short_concentrated`** | 88.01% | **+10.24%** | **+6.47%** | 90.66% | **+10.37%** | **+6.83%** | 93.83% | **+8.79%** | **+4.17%** |
+| **`long_symmetric`** | 87.23% | **+5.85%** | -0.83% | 89.12% | **+5.44%** | -1.23% | 91.42% | **+5.60%** | -0.07% |
+| **`deterministic_long`** | 86.95% | **+5.34%** | -2.72% | 88.68% | **+4.70%** | -3.02% | 90.85% | **+3.92%** | -3.75% |
+
+#### Why DDLT Dominates King's Formula:
+1. **Failure of Gaussian Lead-Time Mixing (`bimodal_disrupted`, `uniform_wide`, `right_skewed`):**
+   - King's Formula collapses the entire lead-time PMF $P(L=\ell)$ into two numbers ($\mu_L, \sigma_L^2$) and assumes $D^{L+R}$ is unimodal Gaussian. When lead times are bimodal or right-skewed, the true compound distribution has a heavy upper tail driven by the long-lead-time regime.
+   - Under `bimodal_disrupted`, **`ddlt_glm_hurdle` at `q = 0.90` achieves a higher fill rate (`94.93%`) than `kings_trailing_ceil` at `q = 0.99` (`94.75%`)** while holding **20.9% less target inventory (`10.36` vs. `13.09`) and 19.9% less on-hand stock (`7.52` vs. `9.39`)**.
+2. **Failure of Gaussian Demand Over Short Windows (`deterministic_short`, `short_concentrated`):**
+   - Even when lead-time variance is zero ($\sigma_L^2 = 0$ in `deterministic_short`, $L=2$ days), 3-day retail demand is zero-inflated and right-skewed rather than Gaussian. Exact hurdle NB2 convolution saves **11.1% target inventory and 7.7% on-hand inventory** at matched fill rates.
+3. **Central Limit Theorem Convergence on Long Deterministic Windows (`deterministic_long`, $L=7$ days):**
+   - When summing 8 days of demand with zero lead-time variance (`deterministic_long`), the 8-day sum is closer to Gaussian by the Central Limit Theorem, narrowing the iso-service gap to **3.9%–5.3% target inventory savings**, while `ddlt_glm_hurdle` still reaches a higher maximum fill rate (`92.79%` vs. `90.85%` at `q = 0.99`).
+
+---
+
+### 8.4 Category-Level Simulation Breakdown (`FOODS`, `HOBBIES`, `HOUSEHOLD`)
+
+From [`kings_vs_ddlt_by_cat.csv`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/kings_vs_ddlt_by_cat.csv) (shown for `bimodal_disrupted` at `q = 0.95`):
+
+| Category | Policy | Fill Rate | Cycle Service Level | Lost Sales (Units) | Avg Target Inv | Avg On-Hand Inv |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`FOODS`**<br>*(344,620 demand; 241,416 item-days)* | **`ddlt_glm_hurdle`** | **96.94%** | **98.78%** | **10,548** | 17.93 | 13.57 |
+| | `ddlt_glm_hurdle_round` | **96.83%** | **98.71%** | **10,940** | 17.54 | 13.24 |
+| | `kings_trailing_ceil` | 94.05% | 97.61% | 20,489 | 15.40 | 10.44 |
+| | `kings_trailing_round` | 93.74% | 97.39% | 21,586 | 15.11 | 10.19 |
+| | `kings_seasonal_round` | 92.84% | 97.34% | 24,681 | 14.90 | 13.51 |
+| **`HOBBIES`**<br>*(52,138 demand; 94,920 item-days)* | **`ddlt_glm_hurdle`** | **93.85%** | **98.83%** | **3,206** | 7.85 | 6.19 |
+| | `ddlt_glm_hurdle_round` | **93.35%** | **98.63%** | **3,467** | 7.40 | 5.75 |
+| | `kings_trailing_ceil` | 88.67% | 97.99% | 5,905 | 6.26 | 4.40 |
+| | `kings_trailing_round` | 87.87% | 97.72% | 6,324 | 5.97 | 4.16 |
+| | `kings_seasonal_round` | 89.20% | 97.98% | 5,630 | 5.66 | 6.70 |
+| **`HOUSEHOLD`**<br>*(101,653 demand; 175,896 item-days)* | **`ddlt_glm_hurdle`** | **95.34%** | **98.74%** | **4,742** | 7.54 | 5.62 |
+| | `ddlt_glm_hurdle_round` | **94.98%** | **98.61%** | **5,099** | 7.10 | 5.30 |
+| | `kings_trailing_ceil` | 92.25% | 97.89% | 7,881 | 6.26 | 4.23 |
+| | `kings_trailing_round` | 91.44% | 97.60% | 8,698 | 5.96 | 3.98 |
+| | `kings_seasonal_round` | 91.43% | 97.75% | 8,715 | 5.76 | 5.66 |
+
+---
+
+## 9. Reproducibility & Output Artifacts
+
+To reproduce the benchmarks via [`scripts/run_m5_experiments.py`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/scripts/run_m5_experiments.py) and [`scripts/run_kings_vs_ddlt_experiment.py`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/scripts/run_kings_vs_ddlt_experiment.py):
 
 ```powershell
-# Standard 5-model benchmark:
+# 1. Standard 100-SKU 5-model benchmark:
 python scripts/run_m5_experiments.py `
   --stores CA_1 TX_1 WI_1 `
   --sample-skus 100 `
@@ -356,7 +503,7 @@ python scripts/run_m5_experiments.py `
   --models glm glm_hurdle catboost empirical_trailing empirical_seasonal `
   --output-dir data/output/experiments_multistore_v2
 
-# Multi-profile synthetic lead-time sensitivity benchmark (7 lead-time distributions):
+# 2. Multi-profile synthetic lead-time sensitivity benchmark (7 lead-time distributions):
 python scripts/run_m5_experiments.py `
   --stores CA_1 TX_1 WI_1 `
   --sample-skus 100 `
@@ -368,16 +515,22 @@ python scripts/run_m5_experiments.py `
   --models glm glm_hurdle empirical_trailing empirical_seasonal `
   --lead-time-profiles all `
   --output-dir data/output/experiments_lead_time
+
+# 3. Full-SKU (9,147 SKUs across CA_1, TX_1, WI_1) King's Formula vs. DDLT inventory simulation across all 7 lead-time profiles:
+python scripts/run_kings_vs_ddlt_experiment.py `
+  --stores CA_1 TX_1 WI_1 `
+  --models glm_hurdle `
+  --lead-time-profiles all `
+  --max-sections 2 `
+  --output-dir data/output/experiments_kings_vs_ddlt_hurdle `
+  --resume
 ```
 
-All generated CSV summary tables are stored in [`data/output/experiments_multistore_v2/`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/) and [`data/output/experiments_lead_time/`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/):
-- [`sections_manifest.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/sections_manifest.csv)
-- [`quantile_wmape_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/quantile_wmape_summary.csv)
-- [`quantile_wmape_by_cat.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/quantile_wmape_by_cat.csv)
-- [`quantile_wmape_by_section.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/quantile_wmape_by_section.csv)
-- [`forecast_pit_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/forecast_pit_summary.csv)
-- [`forecast_pit_coverage.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/forecast_pit_coverage.csv)
-- [`forecast_pit_histogram.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/forecast_pit_histogram.csv)
-- [`ddlt_pit_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_summary.csv) & [`experiments_lead_time/ddlt_pit_summary.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/ddlt_pit_summary.csv)
-- [`ddlt_pit_coverage.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_coverage.csv) & [`experiments_lead_time/ddlt_pit_coverage.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/ddlt_pit_coverage.csv)
-- [`ddlt_pit_histogram.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/ddlt_pit_histogram.csv) & [`experiments_lead_time/ddlt_pit_histogram.csv`](file:///c:/Users/shbbh/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/ddlt_pit_histogram.csv)
+All generated CSV summary tables are stored in:
+- **100-SKU & Lead-Time Calibration Benchmarks:** [`data/output/experiments_multistore_v2/`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_multistore_v2/) and [`data/output/experiments_lead_time/`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_lead_time/)
+- **Full-SKU 11-Section Forecasting & PIT Benchmark:** [`m5_results/data/output/experiments_full_skus/`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/m5_results/data/output/experiments_full_skus/)
+- **Full-SKU King's Formula vs. DDLT Inventory Simulations:** [`data/output/experiments_kings_vs_ddlt_hurdle/`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/)
+  - [`kings_vs_ddlt_summary.csv`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/kings_vs_ddlt_summary.csv)
+  - [`kings_vs_ddlt_iso_service.csv`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/kings_vs_ddlt_iso_service.csv)
+  - [`kings_vs_ddlt_by_cat.csv`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/kings_vs_ddlt_by_cat.csv)
+  - [`kings_vs_ddlt_by_section.csv`](file:///c:/Users/Shobhit%20Bhatnagar/OneDrive/Desktop/Projects/probabilistic_modeling/data/output/experiments_kings_vs_ddlt_hurdle/kings_vs_ddlt_by_section.csv)

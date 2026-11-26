@@ -656,6 +656,30 @@ def main() -> None:
                     sec_cat_frames.append(c_df)
                     sec_cat_list.append(c_df)
 
+            # Precompute trailing and seasonal daily demand moments once per section for King's Formula:
+            from probabilistic_modeling._panel import DenseHistory
+            dense_hist = DenseHistory.from_frame(sales_slice, ["store_id", "item_id"], "day", "demand")
+            r_idx, c_idx = dense_hist.locate(base_test_df)
+            hist_mat = dense_hist.matrix
+            for k_m in ("trailing", "seasonal"):
+                if k_m == "seasonal":
+                    n_wks = max(2, int(args.kings_window) // 7)
+                    offs = -7 * np.arange(1, n_wks + 1)
+                else:
+                    offs = np.arange(-max(2, int(args.kings_window)), 0)
+                idx_m = c_idx[:, None] + offs[None, :]
+                val_mask = (idx_m >= 0) & (idx_m < hist_mat.shape[1]) & (r_idx[:, None] >= 0) & (c_idx[:, None] >= 0)
+                vals_m = np.where(
+                    val_mask,
+                    hist_mat[np.clip(r_idx, 0, None)[:, None], np.clip(idx_m, 0, hist_mat.shape[1] - 1)],
+                    np.nan,
+                )
+                n_v = np.sum(np.isfinite(vals_m), axis=1)
+                mu_d_m = np.nan_to_num(np.where(n_v > 0, np.nanmean(vals_m, axis=1), 0.0), nan=0.0, posinf=0.0, neginf=0.0)
+                std_d_m = np.nan_to_num(np.where(n_v > 1, np.nanstd(vals_m, axis=1, ddof=1), 0.0), nan=0.0, posinf=0.0, neginf=0.0)
+                base_test_df[f"_kings_mu_d_{k_m}_{int(args.kings_window)}"] = mu_d_m
+                base_test_df[f"_kings_std_d_{k_m}_{int(args.kings_window)}"] = std_d_m
+
             # 1. Evaluate King's Formula Baselines across all lead-time profiles and target quantiles
             init_inv_by_profile: dict[str, str | np.ndarray] = {}
             for lt_prof_name, lt_map in lead_time_maps.items():
@@ -771,16 +795,17 @@ def main() -> None:
                     else:
                         raise ValueError(f"Unknown model: {model_name}")
 
+                    pred_eval_df = forecaster.predict(active_ts, period=eval_period)
                     for lt_prof_name, lt_map in lead_time_maps.items():
                         init_inv = init_inv_by_profile[lt_prof_name]
                         ddlt_dist_df = forecaster.compute_ddlt(
                             active_ts,
+                            df=pred_eval_df,
                             lead_time=lt_map,
                             lead_time_keys=["store_id", "cat_id"],
                             cycle_time=args.cycle_time,
                             return_distribution=True,
                             pred_first_day=False,
-                            period=eval_period,
                         )
 
                         # Standard discrete quantile F^{-1}(q) = min{k : F(k) >= q}

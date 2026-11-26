@@ -24,6 +24,7 @@ Sales history + calendar / price / promo covariates
 
 📖 **Full documentation (architecture, models, tutorials):** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md)
 🔍 **Codebase & algorithm deep-dive guide (what/where/why for every module & `ddlt.py` internals):** [`docs/CODEBASE_GUIDE.md`](docs/CODEBASE_GUIDE.md)
+📊 **Benchmark results (M5 forecasting, PIT calibration & King's Formula vs. DDLT simulations):** [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md)
 🎓 **Theory slides (LaTeX/Beamer):** [`docs/slides/prob_forecasting_main.pdf`](docs/slides/prob_forecasting_main.pdf)
 
 ---

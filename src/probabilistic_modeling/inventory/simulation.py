@@ -500,6 +500,11 @@ def compute_kings_target_inventory(
         distrs = list(out[dist_col])
         mu_ddlt = np.array([float(d.mean()) for d in distrs], dtype=np.float64)
         sigma_king = np.array([float(d.std()) for d in distrs], dtype=np.float64)
+    elif f"_kings_mu_d_{method_norm}_{int(window)}" in out.columns and f"_kings_std_d_{method_norm}_{int(window)}" in out.columns:
+        mu_d = out[f"_kings_mu_d_{method_norm}_{int(window)}"].to_numpy(dtype=np.float64)
+        std_d = out[f"_kings_std_d_{method_norm}_{int(window)}"].to_numpy(dtype=np.float64)
+        mu_ddlt = exposure_mean * mu_d
+        sigma_king = np.sqrt(np.maximum(0.0, exposure_mean * (std_d ** 2) + var_lt * (mu_d ** 2)))
     else:
         if history is None:
             raise ValueError(f"'history' DataFrame is required when method='{method_norm}' and '{dist_col}' is absent.")
@@ -1194,9 +1199,56 @@ class InventorySimulator:
         summary_df = compute_simulation_kpis(
             df, group_cols=None, item_id_cols=item_id_cols, period_col=period_col
         )
-        item_summary_df = compute_simulation_kpis(
-            df, group_cols=item_id_cols, item_id_cols=item_id_cols, period_col=period_col
+        # Fast vectorized per-item KPI summary directly from the (n_items, n_days) trajectory matrices:
+        has_econ = all(
+            c in df.columns
+            for c in ("revenue", "purchase_spend", "holding_cost", "shortage_cost", "net_profit")
         )
+        tot_d_item = demand_mat.sum(axis=1)
+        tot_s_item = sold.sum(axis=1)
+        tot_l_item = lost_sales.sum(axis=1)
+        tot_o_item = order_placed.sum(axis=1)
+        tot_a_item = arrivals_out.sum(axis=1)
+        fr_item = np.where(tot_d_item > 0, tot_s_item / np.maximum(tot_d_item, 1), 1.0)
+        so_item = (lost_sales > 0).mean(axis=1) if n_days > 0 else np.zeros(n_items, dtype=np.float64)
+        csl_item = 1.0 - so_item
+        avg_t_item = target_mat.mean(axis=1) if n_days > 0 else np.zeros(n_items, dtype=np.float64)
+        avg_c_item = closing_inv.mean(axis=1) if n_days > 0 else np.zeros(n_items, dtype=np.float64)
+        avg_oh_item = on_hand_before_demand.mean(axis=1) if n_days > 0 else np.zeros(n_items, dtype=np.float64)
+        avg_it_item = in_transit_end.mean(axis=1) if n_days > 0 else np.zeros(n_items, dtype=np.float64)
+        turn_item = np.where(avg_c_item > 0.0, tot_s_item / np.where(avg_c_item > 0.0, avg_c_item, 1.0), np.nan)
+
+        item_summary_df = items_df[item_id_cols].copy()
+        item_summary_df["n_items"] = 1
+        item_summary_df["n_days"] = int(n_days)
+        item_summary_df["n_item_days"] = int(n_days)
+        item_summary_df["total_demand"] = tot_d_item.astype(np.int64)
+        item_summary_df["total_sold"] = tot_s_item.astype(np.int64)
+        item_summary_df["total_lost_sales"] = tot_l_item.astype(np.int64)
+        item_summary_df["total_ordered"] = tot_o_item.astype(np.int64)
+        item_summary_df["total_arrivals"] = tot_a_item.astype(np.int64)
+        item_summary_df["fill_rate"] = np.round(fr_item, 4)
+        item_summary_df["cycle_service_level"] = np.round(csl_item, 4)
+        item_summary_df["stockout_frequency"] = np.round(so_item, 4)
+        item_summary_df["avg_target_inventory"] = np.round(avg_t_item, 2)
+        item_summary_df["avg_closing_inv"] = np.round(avg_c_item, 2)
+        item_summary_df["avg_on_hand"] = np.round(avg_oh_item, 2)
+        item_summary_df["avg_in_transit"] = np.round(avg_it_item, 2)
+        item_summary_df["inventory_turnover"] = np.round(turn_item, 4)
+        if has_econ:
+            rev_item = df["revenue"].to_numpy(dtype=np.float64).reshape(n_items, n_days).sum(axis=1)
+            pur_item = df["purchase_spend"].to_numpy(dtype=np.float64).reshape(n_items, n_days).sum(axis=1)
+            hld_item = df["holding_cost"].to_numpy(dtype=np.float64).reshape(n_items, n_days).sum(axis=1)
+            sht_item = df["shortage_cost"].to_numpy(dtype=np.float64).reshape(n_items, n_days).sum(axis=1)
+            prf_item = df["net_profit"].to_numpy(dtype=np.float64).reshape(n_items, n_days).sum(axis=1)
+            item_summary_df["total_revenue"] = np.round(rev_item, 2)
+            item_summary_df["total_purchase_cost"] = np.round(pur_item, 2)
+            item_summary_df["total_holding_cost"] = np.round(hld_item, 2)
+            item_summary_df["total_shortage_cost"] = np.round(sht_item, 2)
+            item_summary_df["total_profit"] = np.round(prf_item, 2)
+            item_summary_df["profit_margin_pct"] = np.round(
+                np.where(rev_item > 0.0, 100.0 * prf_item / np.where(rev_item > 0.0, rev_item, 1.0), np.nan), 2
+            )
         group_summary_df = (
             compute_simulation_kpis(df, group_cols=group_cols, item_id_cols=item_id_cols, period_col=period_col)
             if group_cols
