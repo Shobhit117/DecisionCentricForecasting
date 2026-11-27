@@ -127,7 +127,12 @@ class EmpiricalQuantileForecaster(ProbabilisticForecaster):
             self.feature_cols_ = []
             self.cat_feature_cols_ = []
             self.horizon = len(self.target_cols_)
-            hist = history if history is not None else ts.df
+            if history is not None:
+                hist = history
+            elif hasattr(ts, "raw_df") and isinstance(ts.raw_df, pd.DataFrame) and not ts.raw_df.empty:
+                hist = ts.raw_df
+            else:
+                hist = ts.df
         self.history_ = DenseHistory.from_frame(hist, self.ts_id_cols_, self.period_col_, self.var_col_)
         return self
 

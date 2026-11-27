@@ -414,19 +414,152 @@ def _lead_time_mean_var_vectors(
     return mu_vec, var_vec
 
 
+# Preset rounding map for `quantile_rounding="regime_adaptive"` (or `kings_rounding="regime_adaptive"`):
+# uses nearest-integer `"round"` on `intermittent` series to prevent discrete `+1` ceiling dead-stock
+# bloat across slow-moving C-items, while keeping conservative `"ceil"` on `smooth`, `erratic`, and `lumpy`.
+REGIME_ADAPTIVE_ROUNDING: dict[str, str] = {
+    "smooth": "ceil",
+    "erratic": "ceil",
+    "lumpy": "ceil",
+    "intermittent": "round",
+}
+
+
+def _resolve_row_regime_names(df: pd.DataFrame) -> np.ndarray:
+    """Return lowercase SBC regime name (`'smooth'`, `'erratic'`, `'intermittent'`, `'lumpy'`) per row."""
+    from probabilistic_modeling.time_series import DEMAND_REGIME_NAMES
+
+    if "demand_regime_name" in df.columns:
+        return (
+            df["demand_regime_name"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .replace({"nan": "intermittent", "none": "intermittent"})
+            .to_numpy(dtype=object)
+        )
+    if "demand_regime" in df.columns:
+        codes = df["demand_regime"].fillna(2).to_numpy(dtype=int)
+        return np.array([DEMAND_REGIME_NAMES.get(int(c), "intermittent") for c in codes], dtype=object)
+    raise ValueError(
+        "Regime-specific inventory policy requires 'demand_regime_name' or 'demand_regime' on the DataFrame."
+    )
+
+
+def _resolve_per_row_service_levels(
+    df: pd.DataFrame,
+    service_level: float | dict[Any, float] | None,
+    default_sl: float = 0.95,
+    strict_open_interval: bool = False,
+) -> np.ndarray:
+    """
+    Resolve a 1D float64 vector of target service levels ``alphas`` of length ``len(df)`` from:
+    - a per-regime dictionary ``dict[str | int, float]`` (e.g. ``{"smooth": 0.98, "intermittent": 0.85}``),
+    - an existing ``df["service_level"]`` column when ``service_level is None``, or
+    - a scalar float.
+    """
+    from probabilistic_modeling.time_series import DEMAND_REGIME_NAMES
+
+    n = len(df)
+    if isinstance(service_level, dict):
+        norm_map: dict[str, float] = {}
+        fallback_val = float(service_level.get("default", default_sl))
+        for k, v in service_level.items():
+            fv = float(v)
+            if isinstance(k, (int, np.integer)):
+                rname = DEMAND_REGIME_NAMES.get(int(k))
+                if rname is None:
+                    raise ValueError(f"Unknown demand_regime code {k} in service_level dict.")
+                norm_map[rname] = fv
+            else:
+                ks = str(k).strip().lower()
+                if ks != "default" and ks not in DEMAND_REGIME_NAMES.values():
+                    raise ValueError(
+                        f"Unknown demand regime {k!r} in service_level dict. "
+                        f"Expected {list(DEMAND_REGIME_NAMES.values())} or 'default'."
+                    )
+                norm_map[ks] = fv
+        reg_names = _resolve_row_regime_names(df)
+        alphas = np.array([norm_map.get(str(r), fallback_val) for r in reg_names], dtype=np.float64)
+    elif service_level is None and "service_level" in df.columns:
+        alphas = df["service_level"].to_numpy(dtype=np.float64)
+    else:
+        sl = float(default_sl if service_level is None else service_level)
+        alphas = np.full(n, sl, dtype=np.float64)
+
+    if strict_open_interval:
+        if np.any((alphas <= 0.0) | (alphas >= 1.0)):
+            raise ValueError("'service_level' values must lie strictly between 0 and 1 for King's formula.")
+    else:
+        if np.any((alphas < 0.0) | (alphas > 1.0)):
+            raise ValueError("'service_level' values must lie between 0 and 1.")
+    return alphas
+
+
+def _resolve_per_row_rounding_is_round(
+    df: pd.DataFrame,
+    rounding: str | dict[Any, str],
+    param_name: str = "quantile_rounding",
+) -> np.ndarray:
+    """
+    Return a boolean mask of length ``len(df)`` that is ``True`` where nearest-integer ``"round"``
+    is requested and ``False`` where ceiling ``"ceil"`` is requested.
+
+    Supports ``"ceil"``, ``"round"``, ``"regime_adaptive"`` (:data:`REGIME_ADAPTIVE_ROUNDING`),
+    or a custom per-regime ``dict[str | int, str]``.
+    """
+    from probabilistic_modeling.time_series import DEMAND_REGIME_NAMES
+
+    n = len(df)
+    if isinstance(rounding, str):
+        r_norm = rounding.strip().lower()
+        if r_norm == "ceil":
+            return np.zeros(n, dtype=bool)
+        if r_norm == "round":
+            return np.ones(n, dtype=bool)
+        if r_norm == "regime_adaptive":
+            rounding_map = dict(REGIME_ADAPTIVE_ROUNDING)
+        else:
+            raise ValueError(
+                f"Unsupported {param_name} '{rounding}'. Choose from 'ceil', 'round', 'regime_adaptive', or a dict."
+            )
+    elif isinstance(rounding, dict):
+        rounding_map = {}
+        for k, v in rounding.items():
+            vs = str(v).strip().lower()
+            if vs not in ("ceil", "round"):
+                raise ValueError(f"Invalid rounding mode {v!r} in {param_name}; expected 'ceil' or 'round'.")
+            if isinstance(k, (int, np.integer)):
+                rname = DEMAND_REGIME_NAMES.get(int(k))
+                if rname is None:
+                    raise ValueError(f"Unknown demand_regime code {k} in {param_name}.")
+                rounding_map[rname] = vs
+            else:
+                ks = str(k).strip().lower()
+                if ks != "default" and ks not in DEMAND_REGIME_NAMES.values():
+                    raise ValueError(f"Unknown demand regime {k!r} in {param_name}.")
+                rounding_map[ks] = vs
+    else:
+        raise TypeError(f"'{param_name}' must be a str or dict.")
+
+    default_mode = rounding_map.get("default", "ceil")
+    reg_names = _resolve_row_regime_names(df)
+    return np.array([rounding_map.get(str(r), default_mode) == "round" for r in reg_names], dtype=bool)
+
+
 def compute_kings_target_inventory(
     df: pd.DataFrame,
     lead_time: DiscreteDistribution | dict[Any, DiscreteDistribution] | int = 1,
     lead_time_keys: list[str] | None = None,
     cycle_time: int = 1,
-    service_level: float = 0.95,
+    service_level: float | dict[Any, float] = 0.95,
     history: pd.DataFrame | None = None,
     ts_id_cols: list[str] | None = None,
     period_col: str = "day",
     var_col: str = "demand",
     window: int = 56,
     method: str = "trailing",
-    rounding: str = "round",
+    rounding: str | dict[Any, str] = "round",
     target_col: str = "target_inventory",
     dist_col: str = "demand_distribution",
 ) -> pd.DataFrame:
@@ -482,19 +615,16 @@ def compute_kings_target_inventory(
         Copy of ``df`` with ``target_col``, ``kings_cycle_stock``, ``kings_safety_stock``,
         and ``kings_sigma`` columns populated.
     """
-    if not (0.0 < float(service_level) < 1.0):
-        raise ValueError("'service_level' must be strictly between 0 and 1 for King's formula.")
     method_norm = method.lower().strip()
     if method_norm not in ("trailing", "seasonal", "model"):
         raise ValueError(f"Unsupported King's formula method '{method}'. Choose from 'trailing', 'seasonal', 'model'.")
-    round_norm = rounding.lower().strip()
-    if round_norm not in ("round", "ceil"):
-        raise ValueError(f"Unsupported rounding '{rounding}'. Choose from 'round', 'ceil'.")
 
     out = df.copy()
+    alphas = _resolve_per_row_service_levels(out, service_level, default_sl=0.95, strict_open_interval=True)
+    use_round_mask = _resolve_per_row_rounding_is_round(out, rounding, param_name="rounding")
     mu_lt, var_lt = _lead_time_mean_var_vectors(out, lead_time, lead_time_keys)
     exposure_mean = mu_lt + float(cycle_time)
-    z_alpha = float(norm.ppf(float(service_level)))
+    z_alpha = norm.ppf(alphas)
 
     if method_norm == "model" and dist_col in out.columns and out[dist_col].notna().all():
         distrs = list(out[dist_col])
@@ -549,10 +679,12 @@ def compute_kings_target_inventory(
 
     safety_stock = z_alpha * sigma_king
     raw_target = np.maximum(0.0, mu_ddlt + safety_stock)
-    if round_norm == "ceil":
+    if np.all(use_round_mask):
+        target_inv = np.round(raw_target).astype(np.int64)
+    elif not np.any(use_round_mask):
         target_inv = np.ceil(raw_target).astype(np.int64)
     else:
-        target_inv = np.round(raw_target).astype(np.int64)
+        target_inv = np.where(use_round_mask, np.round(raw_target), np.ceil(raw_target)).astype(np.int64)
 
     out["kings_cycle_stock"] = mu_ddlt
     out["kings_safety_stock"] = safety_stock
@@ -564,12 +696,12 @@ def compute_kings_target_inventory(
 def resolve_target_inventory(
     df: pd.DataFrame,
     policy: str = "auto",
-    service_level: float = 0.95,
+    service_level: float | dict[Any, float] | None = 0.95,
     budget: float | None = None,
     target_col: str = "target_inventory",
     dist_col: str = "demand_distribution",
     group_cols: list[str] | None = None,
-    quantile_rounding: str = "ceil",
+    quantile_rounding: str | dict[Any, str] = "ceil",
     lead_time: DiscreteDistribution | dict[Any, DiscreteDistribution] | int = 1,
     lead_time_keys: list[str] | None = None,
     cycle_time: int = 1,
@@ -579,7 +711,7 @@ def resolve_target_inventory(
     var_col: str = "demand",
     kings_window: int = 56,
     kings_method: str = "trailing",
-    kings_rounding: str = "round",
+    kings_rounding: str | dict[Any, str] = "round",
 ) -> pd.DataFrame:
     """
     Computes or validates `target_col` on `df` according to `policy`:
@@ -636,13 +768,12 @@ def resolve_target_inventory(
         return out
 
     if policy_norm == "kings":
-        sl = 0.95 if service_level is None else float(service_level)
         return compute_kings_target_inventory(
             out,
             lead_time=lead_time,
             lead_time_keys=lead_time_keys,
             cycle_time=cycle_time,
-            service_level=sl,
+            service_level=0.95 if service_level is None else service_level,
             history=history,
             ts_id_cols=ts_id_cols,
             period_col=period_col,
@@ -661,17 +792,13 @@ def resolve_target_inventory(
         raise ValueError(f"Column '{dist_col}' is required to compute target inventory with policy='{policy_norm}'.")
 
     if policy_norm == "quantile":
-        if "service_level" in out.columns and service_level is None:
-            alphas = out["service_level"].to_numpy(dtype=np.float64)
-        else:
-            sl = 0.95 if service_level is None else float(service_level)
-            if not (0.0 <= sl <= 1.0):
-                raise ValueError("'service_level' must be between 0 and 1.")
-            alphas = np.full(len(out), sl, dtype=np.float64)
-
-        q_round = quantile_rounding.lower().strip()
-        if q_round not in ("ceil", "round"):
-            raise ValueError(f"Unsupported quantile_rounding '{quantile_rounding}'. Choose from 'ceil', 'round'.")
+        alphas = np.ascontiguousarray(
+            _resolve_per_row_service_levels(out, service_level, default_sl=0.95, strict_open_interval=False),
+            dtype=np.float64,
+        )
+        use_round_mask = _resolve_per_row_rounding_is_round(
+            out, quantile_rounding, param_name="quantile_rounding"
+        )
 
         distrs = list(out[dist_col])
         pmfs = NumbaList()
@@ -682,10 +809,14 @@ def resolve_target_inventory(
             mins[idx] = int(d.min)
             bin_sizes[idx] = int(d.bin_size)
 
-        if q_round == "round":
+        if np.all(use_round_mask):
             out[target_col] = _batch_pmf_quantiles_round_numba(pmfs, mins, bin_sizes, alphas)
-        else:
+        elif not np.any(use_round_mask):
             out[target_col] = _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alphas)
+        else:
+            q_ceil = _batch_pmf_quantiles_numba(pmfs, mins, bin_sizes, alphas)
+            q_round = _batch_pmf_quantiles_round_numba(pmfs, mins, bin_sizes, alphas)
+            out[target_col] = np.where(use_round_mask, q_round, q_ceil)
         return out
 
     # policy_norm == "newsvendor":
@@ -1075,6 +1206,9 @@ class InventorySimulator:
             for k_col in self.lead_time_keys:
                 if k_col not in item_meta_cols and k_col in df.columns:
                     item_meta_cols.append(k_col)
+        for extra_meta in ("demand_regime", "demand_regime_name", "velocity_tier", "cat_id", "dept_id", "store_id", "state_id"):
+            if extra_meta not in item_meta_cols and extra_meta in df.columns:
+                item_meta_cols.append(extra_meta)
         items_df = df[item_meta_cols].drop_duplicates(subset=item_id_cols).reset_index(drop=True)
         n_items = len(items_df)
 
@@ -1218,7 +1352,19 @@ class InventorySimulator:
         avg_it_item = in_transit_end.mean(axis=1) if n_days > 0 else np.zeros(n_items, dtype=np.float64)
         turn_item = np.where(avg_c_item > 0.0, tot_s_item / np.where(avg_c_item > 0.0, avg_c_item, 1.0), np.nan)
 
-        item_summary_df = items_df[item_id_cols].copy()
+        summary_cols_keep = list(
+            dict.fromkeys(
+                [
+                    *item_id_cols,
+                    *[
+                        c
+                        for c in ("demand_regime", "demand_regime_name", "velocity_tier", "cat_id")
+                        if c in items_df.columns
+                    ],
+                ]
+            )
+        )
+        item_summary_df = items_df[summary_cols_keep].copy()
         item_summary_df["n_items"] = 1
         item_summary_df["n_days"] = int(n_days)
         item_summary_df["n_item_days"] = int(n_days)

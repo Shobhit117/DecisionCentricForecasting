@@ -56,6 +56,116 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Syntetos-Boylan-Croston (2005) demand classification constants (ADI cutoff = 1.32, CV^2 cutoff = 0.49)
+SBC_ADI_THRESHOLD: float = 1.32
+SBC_CV2_THRESHOLD: float = 0.49
+
+DEMAND_REGIME_NAMES: dict[int, str] = {
+    0: "smooth",
+    1: "erratic",
+    2: "intermittent",
+    3: "lumpy",
+}
+DEMAND_REGIME_CODES: dict[str, int] = {v: k for k, v in DEMAND_REGIME_NAMES.items()}
+
+
+def classify_demand_regimes(
+    df: pd.DataFrame,
+    ts_id_cols: list[str] | tuple[str, ...],
+    period_col: str = "day",
+    var_col: str = "demand",
+    adi_threshold: float = SBC_ADI_THRESHOLD,
+    cv2_threshold: float = SBC_CV2_THRESHOLD,
+    train_end_period: Any = None,
+) -> pd.DataFrame:
+    """
+    Classify each series into Syntetos-Boylan-Croston (SBC) demand categories (`smooth`,
+    `erratic`, `intermittent`, `lumpy`) strictly on post-first-sale training observations.
+
+    Following Long et al. (2023, Eq. 1) and Syntetos, Boylan & Croston (2005):
+    - ``ADI = Days available since first sale / Days with sale`` (cutoff ``1.32``)
+    - ``CV^2 = Var(Y | Y > 0) / E[Y | Y > 0]^2`` (cutoff ``0.49``)
+
+    Pre-launch leading zeros prior to a series' first positive sale are excluded from
+    ``Days available since first sale`` so newly launched fast-moving SKUs are not
+    misclassified as intermittent or lumpy. Series with at most 1 positive sale over a
+    multi-period panel (`n_total_periods > 7` and `n_pos <= 1`) are assigned to
+    ``intermittent`` (`demand_regime = 2`) since a single observation cannot establish
+    smooth demand.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per unique ``ts_id_cols`` with columns ``[*ts_id_cols, "days_available",
+        "days_with_sale", "adi", "cv2", "zero_rate", "overdispersion",
+        "positive_overdispersion", "velocity_tier", "demand_regime", "demand_regime_name"]``.
+    """
+    id_cols = list(ts_id_cols)
+    work = df[id_cols + [period_col, var_col]].copy()
+    if train_end_period is not None:
+        work = work[work[period_col] <= train_end_period].copy()
+    work.sort_values(by=id_cols + [period_col], inplace=True)
+
+    vals = work[var_col].fillna(0.0).to_numpy(dtype=np.float64)
+    is_pos = (vals > 0.0).astype(np.int64)
+    group_keys = [work[c] for c in id_cols]
+
+    cum_pos = pd.Series(is_pos, index=work.index).groupby(group_keys, observed=True).cumsum().to_numpy()
+    has_any_pos = (
+        pd.Series(is_pos, index=work.index).groupby(group_keys, observed=True).transform("max").to_numpy() > 0
+    )
+    in_active_window = (cum_pos > 0) | (~has_any_pos)
+
+    work["_active_val"] = np.where(in_active_window, vals, np.nan)
+    work["_pos_val"] = np.where(vals > 0.0, vals, np.nan)
+
+    grp = work.groupby(id_cols, observed=True, as_index=False)
+    agg = grp.agg(
+        n_total_periods=(var_col, "count"),
+        days_available=("_active_val", "count"),
+        active_mean=("_active_val", "mean"),
+        active_var=("_active_val", "var"),
+        days_with_sale=("_pos_val", "count"),
+        pos_mean=("_pos_val", "mean"),
+        pos_var=("_pos_val", "var"),
+    )
+
+    days_avail = agg["days_available"].to_numpy(dtype=np.float64)
+    days_sale = agg["days_with_sale"].to_numpy(dtype=np.float64)
+    n_tot = agg["n_total_periods"].to_numpy(dtype=np.float64)
+    act_mean = agg["active_mean"].fillna(0.0).to_numpy(dtype=np.float64)
+    act_var = agg["active_var"].fillna(0.0).to_numpy(dtype=np.float64)
+    p_mean = agg["pos_mean"].fillna(0.0).to_numpy(dtype=np.float64)
+    p_var = agg["pos_var"].fillna(0.0).to_numpy(dtype=np.float64)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        adi = np.where(days_sale > 0.0, days_avail / days_sale, np.inf)
+        p_pos = np.where(days_avail > 0.0, days_sale / days_avail, 0.0)
+        cv2 = np.where(p_mean > 1e-12, p_var / (p_mean * p_mean), 0.0)
+
+    # Guard single-sale series in panels > 7 periods from appearing artificially "smooth" (ADI=1/1):
+    sparse_single_sale = (days_sale <= 1.0) & (n_tot > 7.0)
+    p_pos_eff = np.where(sparse_single_sale, np.minimum(p_pos, 1.0 / np.maximum(n_tot, 1.0)), p_pos)
+    adi_eff = np.where(sparse_single_sale & (days_sale == 1.0), np.maximum(adi, n_tot), adi)
+
+    is_intermittent = adi_eff >= float(adi_threshold)
+    is_erratic = cv2 >= float(cv2_threshold)
+    regime_code = (is_intermittent.astype(int) * 2 + is_erratic.astype(int)).astype(int)
+    vel_tier = np.where(p_pos_eff >= 0.75, 2, np.where(p_pos_eff >= 0.25, 1, 0)).astype(int)
+
+    out = agg[id_cols].copy()
+    out["days_available"] = agg["days_available"].astype(int)
+    out["days_with_sale"] = agg["days_with_sale"].astype(int)
+    out["adi"] = adi_eff
+    out["cv2"] = cv2
+    out["zero_rate"] = np.clip(1.0 - p_pos_eff, 0.0, 1.0)
+    out["overdispersion"] = (act_var > act_mean).astype(int)
+    out["positive_overdispersion"] = (p_var > p_mean).astype(int)
+    out["velocity_tier"] = vel_tier
+    out["demand_regime"] = regime_code
+    out["demand_regime_name"] = pd.Series(regime_code, index=out.index).map(DEMAND_REGIME_NAMES).astype("category")
+    return out
+
 
 def _parse_serialized_dict(val: Any) -> Any:
     """
@@ -608,6 +718,11 @@ class DiscreteTimeSeries:
         self.df = pd.merge(
             unique_ts_id_period, self.df, on=self.ts_id_cols + [period_col], how="left"
         ).fillna({var_col: default_value})
+        self.df.sort_values(by=self.ts_id_cols + [period_col], inplace=True, ignore_index=True)
+
+        # Retain lightweight balanced raw panel before pre-launch trimming, lag warm-up dropping,
+        # or zero-row downsampling so EmpiricalQuantileForecaster and WSPL have full history:
+        self.raw_df: pd.DataFrame = self.df[self.ts_id_cols + [period_col, var_col]].copy()
 
         # Step 2: Optionally drop pre-launch leading zeros for each series:
         if self.trim_leading_zeros:
@@ -623,6 +738,7 @@ class DiscreteTimeSeries:
             grouped = self.df.groupby(self.ts_id_cols, observed=True)
             self._add_overdispersion_flag(grouped)
             if fit_historical_distributions or use_best_fit_feature:
+                grouped = self.df.groupby(self.ts_id_cols, observed=True)
                 self._fit_distributions(grouped, use_best_fit_feature, use_one_hot_encoding)
             self._extract_series_metadata()
 
@@ -667,8 +783,8 @@ class DiscreteTimeSeries:
     def _extract_series_metadata(self):
         """
         Extracts one row per series containing static training metadata (`overdispersion`,
-        `positive_overdispersion`, `velocity_tier`, `demand_regime`, `best_fit`,
-        `distr_param_0..2`) into `self.series_metadata`.
+        `positive_overdispersion`, `velocity_tier`, `demand_regime`, `demand_regime_name`,
+        `adi`, `cv2`, `zero_rate`, `best_fit`, `distr_param_0..2`) into `self.series_metadata`.
 
         Why it is needed
         ----------------
@@ -682,6 +798,10 @@ class DiscreteTimeSeries:
             "positive_overdispersion",
             "velocity_tier",
             "demand_regime",
+            "demand_regime_name",
+            "adi",
+            "cv2",
+            "zero_rate",
             "best_fit",
             "distr_param_0",
             "distr_param_1",
@@ -717,6 +837,10 @@ class DiscreteTimeSeries:
                 "positive_overdispersion",
                 "velocity_tier",
                 "demand_regime",
+                "demand_regime_name",
+                "adi",
+                "cv2",
+                "zero_rate",
                 "best_fit",
                 "distr_param_0",
                 "distr_param_1",
@@ -733,6 +857,10 @@ class DiscreteTimeSeries:
         for int_meta_col in ("overdispersion", "positive_overdispersion", "velocity_tier", "demand_regime"):
             if int_meta_col in self.df.columns:
                 self.df[int_meta_col] = self.df[int_meta_col].fillna(0).astype(int)
+        if "demand_regime_name" in self.df.columns:
+            self.df["demand_regime_name"] = (
+                self.df["demand_regime_name"].astype(str).replace({"nan": "intermittent", "None": "intermittent"}).astype("category")
+            )
         if "best_fit" in self.df.columns:
             self.df["best_fit"] = self.df["best_fit"].astype("category")
             if use_best_fit_feature:
@@ -960,7 +1088,9 @@ class DiscreteTimeSeries:
         # Remove warm-up rows at the start of each series where lag features are NaN:
         feature_df = feature_df[feature_df[self.feature_cols].isna().sum(axis=1) == 0]
 
-        # Optionally downsample rows where both demand level features and targets are all 0s in training data:
+        # Optionally downsample rows where both demand level features and targets are all 0s in training data,
+        # attaching reciprocal importance weights w_i = 1 / downsample_zeros_frac so MLE & MultiQuantile
+        # loss functions remain unbiased on the true population scale:
         if self.downsample_zeros_frac is not None and 0.0 < self.downsample_zeros_frac < 1.0:
             rows_before = len(feature_df)
             check_cols = demand_level_cols if demand_level_cols else self.feature_cols
@@ -972,87 +1102,107 @@ class DiscreteTimeSeries:
             else:
                 # In production mode, always keep the latest period intact for inference
                 mask = mask & (feature_df[self.period_col] != self.end_period)
-            zero_rows = feature_df[mask].sample(frac=self.downsample_zeros_frac, random_state=42)
-            non_zero_rows = feature_df[~mask]
-            feature_df = pd.concat([zero_rows, non_zero_rows])
+            zero_rows = feature_df[mask].sample(frac=self.downsample_zeros_frac, random_state=42).copy()
+            non_zero_rows = feature_df[~mask].copy()
+            zero_rows["sample_weight"] = 1.0 / float(self.downsample_zeros_frac)
+            non_zero_rows["sample_weight"] = 1.0
+            feature_df = pd.concat([zero_rows, non_zero_rows]).sort_values(
+                by=self.ts_id_cols + [self.period_col]
+            )
             self.logger.info(
-                "Downsampled all-zero training rows (frac=%.2f): %d -> %d rows in %.2fs",
+                "Downsampled all-zero training rows (frac=%.2f, weight=%.2f): %d -> %d rows in %.2fs",
                 self.downsample_zeros_frac,
+                1.0 / float(self.downsample_zeros_frac),
                 rows_before,
                 len(feature_df),
                 time.perf_counter() - t0,
             )
         self.df = feature_df
 
-    def _create_tmp_col_for_train(self, col_name: str) -> str:
+    def _create_tmp_col_for_train(self, col_name: str, post_first_sale: bool = True) -> str:
         """
         Creates a temporary column `tmp_<col_name>` on `self.df` whose values are masked
-        to `NaN` on all test rows (`period >= test_start_period`).
+        to `NaN` on all test rows (`period >= test_start_period`) and, when
+        `post_first_sale=True` (default), also masked to `NaN` on pre-launch zeros prior
+        to each series' first positive training observation (unless a series is all-zero
+        across the entire training window, in which case all training zeros are retained).
 
         Why it is needed
         ----------------
-        Allows Pandas `.groupby().transform("mean")` / `.transform("var")` and distribution
-        fitting (`_fit_distributions`) to operate on the full panel while strictly ignoring
-        test-period observations.
+        Allows Pandas `.groupby().transform(...)` and distribution fitting (`_fit_distributions`)
+        to operate on the full panel while strictly ignoring test-period observations and
+        pre-launch structural zeros.
         """
         tmp_col = f"tmp_{col_name}"
-        if self.test_start_period is not None:
-            self.df[tmp_col] = np.where(
-                self.df[self.period_col] >= self.test_start_period, np.nan, self.df[self.var_col]
+        is_train = (
+            (self.df[self.period_col] < self.test_start_period).to_numpy()
+            if self.test_start_period is not None
+            else np.ones(len(self.df), dtype=bool)
+        )
+        raw_vals = self.df[self.var_col].to_numpy(dtype=np.float64, copy=False)
+        if post_first_sale:
+            pos_train = (is_train & (raw_vals > 0.0)).astype(np.int64)
+            group_keys = [self.df[c] for c in self.ts_id_cols]
+            cum_pos = (
+                pd.Series(pos_train, index=self.df.index)
+                .groupby(group_keys, observed=True)
+                .cumsum()
+                .to_numpy()
             )
+            has_any_pos = (
+                pd.Series(pos_train, index=self.df.index)
+                .groupby(group_keys, observed=True)
+                .transform("max")
+                .to_numpy()
+                > 0
+            )
+            keep_mask = is_train & ((cum_pos > 0) | (~has_any_pos))
+            self.df[tmp_col] = np.where(keep_mask, raw_vals, np.nan)
         else:
-            self.df[tmp_col] = self.df[self.var_col].copy()
+            self.df[tmp_col] = np.where(is_train, raw_vals, np.nan)
         return tmp_col
 
     def _add_overdispersion_flag(self, grouped: DataFrameGroupBy):
         """
-        Computes per-series training-window dispersion and velocity/intermittency indicators:
-        - `overdispersion = 1` iff the training-window sample variance exceeds the
-          training-window sample mean (`var > mean`) across all training observations.
-        - `positive_overdispersion = 1` iff the sample variance exceeds the sample mean
-          strictly across positive training observations (`demand > 0`).
-        - `velocity_tier` (`0, 1, 2`): categorizes each series by its training nonzero
-          demand frequency `p_pos = N_+ / N_train`:
-          * `0` (Low / Intermittent velocity): `p_pos < 0.25` (`ADI > 4.0`)
-          * `1` (Medium velocity): `0.25 <= p_pos < 0.75` (`1.33 < ADI <= 4.0`)
-          * `2` (High / Smooth velocity): `p_pos >= 0.75` (`ADI <= 1.33`)
-        - `demand_regime` (`0, 1, 2, 3`): Syntetos-Boylan classification using
-          `ADI = N_train / N_+` (cutoff `1.32`) and `CV^2 = Var(Y|Y>0) / E[Y|Y>0]^2` (cutoff `0.49`):
-          * `0` (Smooth): `ADI < 1.32` and `CV^2 < 0.49`
-          * `1` (Erratic): `ADI < 1.32` and `CV^2 >= 0.49`
-          * `2` (Intermittent): `ADI >= 1.32` and `CV^2 < 0.49`
-          * `3` (Lumpy): `ADI >= 1.32` and `CV^2 >= 0.49`
-
-        Where it is used
-        ----------------
-        Used by `GLMForecaster.fit` to automatically route series to Poisson vs. Negative Binomial
-        GLMs (`overdispersion` / `positive_overdispersion`) and to optionally partition GLMs by
-        velocity / intermittency tier (`velocity_tiers=True` or `velocity_tiers="demand_regime"`).
+        Computes per-series post-first-sale training dispersion and Syntetos-Boylan-Croston
+        (SBC) demand classification indicators via :func:`classify_demand_regimes`.
         """
-        tmp_col = self._create_tmp_col_for_train(self.var_col)
-        mean = grouped[tmp_col].transform("mean")
-        var = grouped[tmp_col].transform("var")
-        n_train = grouped[tmp_col].transform("count")
-        self.df["overdispersion"] = (var > mean).astype(int)
-
-        pos_col = f"{tmp_col}_pos"
-        self.df[pos_col] = np.where(self.df[tmp_col] > 0, self.df[tmp_col], np.nan)
-        pos_mean = grouped[pos_col].transform("mean")
-        pos_var = grouped[pos_col].transform("var")
-        n_pos = grouped[pos_col].transform("count")
-        self.df["positive_overdispersion"] = (pos_var > pos_mean).fillna(False).astype(int)
-
-        p_pos = (n_pos / np.maximum(n_train, 1)).fillna(0.0).to_numpy(dtype=np.float64)
-        self.df["velocity_tier"] = np.where(p_pos >= 0.75, 2, np.where(p_pos >= 0.25, 1, 0)).astype(int)
-
-        pos_mean_arr = pos_mean.fillna(0.0).to_numpy(dtype=np.float64)
-        pos_var_arr = pos_var.fillna(0.0).to_numpy(dtype=np.float64)
-        cv2 = np.where(pos_mean_arr > 1e-12, pos_var_arr / np.maximum(pos_mean_arr * pos_mean_arr, 1e-12), 0.0)
-        is_intermittent = p_pos <= (1.0 / 1.32)  # ADI >= 1.32
-        is_erratic = cv2 >= 0.49
-        self.df["demand_regime"] = (is_intermittent.astype(int) * 2 + is_erratic.astype(int)).astype(int)
-
-        self.df.drop(columns=[tmp_col, pos_col], inplace=True)
+        train_slice = (
+            self.df[self.df[self.period_col] < self.test_start_period]
+            if self.test_start_period is not None
+            else self.df
+        )
+        sbc_df = classify_demand_regimes(
+            train_slice,
+            ts_id_cols=self.ts_id_cols,
+            period_col=self.period_col,
+            var_col=self.var_col,
+        )
+        attach_cols = [
+            "adi",
+            "cv2",
+            "zero_rate",
+            "overdispersion",
+            "positive_overdispersion",
+            "velocity_tier",
+            "demand_regime",
+            "demand_regime_name",
+        ]
+        drop_existing = [c for c in attach_cols if c in self.df.columns]
+        if drop_existing:
+            self.df.drop(columns=drop_existing, inplace=True)
+        self.df = pd.merge(
+            self.df,
+            sbc_df[self.ts_id_cols + attach_cols],
+            on=self.ts_id_cols,
+            how="left",
+        )
+        for int_col in ("overdispersion", "positive_overdispersion", "velocity_tier"):
+            self.df[int_col] = self.df[int_col].fillna(0).astype(int)
+        self.df["demand_regime"] = self.df["demand_regime"].fillna(2).astype(int)
+        self.df["demand_regime_name"] = (
+            self.df["demand_regime_name"].astype(str).replace({"nan": "intermittent", "None": "intermittent"}).astype("category")
+        )
 
     def _fit_distributions(
         self,

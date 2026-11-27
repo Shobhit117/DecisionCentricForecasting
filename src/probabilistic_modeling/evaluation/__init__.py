@@ -11,6 +11,7 @@ from probabilistic_modeling.evaluation.forecast_evaluation import (
     compute_pit_uniformity_metrics,
     evaluate_forecast_pit,
     evaluate_quantile_wmape,
+    evaluate_wspl,
     populate_model_quantiles,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "evaluate_ddlt_calibration",
     "evaluate_forecast_pit",
     "evaluate_quantile_wmape",
+    "evaluate_wspl",
     "populate_model_quantiles",
 ]
 

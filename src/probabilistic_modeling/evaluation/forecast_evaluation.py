@@ -46,6 +46,7 @@ import numpy as np
 import pandas as pd
 from numba import njit, prange
 
+from probabilistic_modeling._panel import DenseHistory
 from probabilistic_modeling.ddlt import (
     DEFAULT_SUPPORT_TOL,
     _count_pmf_truncated_numba,
@@ -873,13 +874,38 @@ def evaluate_forecast_pit(
         f"{t}_pi" in pred_df.columns and f"{t}_lambda" in pred_df.columns for t in target_list
     )
     has_glm_alpha = any(f"{t}_alpha" in pred_df.columns for t in target_list)
+    has_mu_cols = all(f"{t}_mu" in pred_df.columns for t in target_list)
     has_q_cols = all(
         quantile_col_name(t, float(q)) in pred_df.columns for t in target_list for q in q_arr
     )
 
     y_mat = np.column_stack([pred_df[t].to_numpy(dtype=np.float64) for t in target_list])
     y_flat = np.ascontiguousarray(y_mat.ravel(), dtype=np.float64)
+    n_total = n_rows * n_horizons
 
+    mean_f = np.full(n_total, np.nan, dtype=np.float64)
+    var_f = np.full(n_total, np.nan, dtype=np.float64)
+    crps_f = np.full(n_total, np.nan, dtype=np.float64)
+    sq_f = np.full(n_total, np.nan, dtype=np.float64)
+    um_f = np.full(n_total, np.nan, dtype=np.float64)
+    usq_f = np.full(n_total, np.nan, dtype=np.float64)
+    cov_f = np.full((n_total, n_lv), np.nan, dtype=np.float64)
+    pitcov_f = np.full((n_total, n_lv), np.nan, dtype=np.float64)
+    pit_f = np.full((n_total, n_bins), np.nan, dtype=np.float64)
+    assigned = np.zeros(n_total, dtype=bool)
+
+    alpha_flat = np.ascontiguousarray(
+        np.column_stack(
+            [
+                pred_df[f"{t}_alpha"].to_numpy(dtype=np.float64)
+                if f"{t}_alpha" in pred_df.columns
+                else np.full(n_rows, np.nan, dtype=np.float64)
+                for t in target_list
+            ]
+        ).ravel()
+    )
+
+    # 1. Zero-Hurdle GLM entries (supports both pure hurdle DataFrames and hybrid router DataFrames):
     if has_hurdle_cols:
         pi_flat = np.ascontiguousarray(
             np.column_stack([pred_df[f"{t}_pi"].to_numpy(dtype=np.float64) for t in target_list]).ravel()
@@ -887,45 +913,70 @@ def evaluate_forecast_pit(
         lam_flat = np.ascontiguousarray(
             np.column_stack([pred_df[f"{t}_lambda"].to_numpy(dtype=np.float64) for t in target_list]).ravel()
         )
-        alpha_flat = np.ascontiguousarray(
-            np.column_stack(
-                [
-                    pred_df[f"{t}_alpha"].to_numpy(dtype=np.float64)
-                    if f"{t}_alpha" in pred_df.columns
-                    else np.full(n_rows, np.nan, dtype=np.float64)
-                    for t in target_list
-                ]
-            ).ravel()
-        )
-        mean_f, var_f, crps_f, sq_f, um_f, usq_f, cov_f, pitcov_f, _, pit_f = _hurdle_glm_pit_kernel(
-            y_flat, pi_flat, lam_flat, alpha_flat, levels_arr, n_bins, float(tol)
-        )
-    elif has_glm_alpha or not has_q_cols:
-        mu_flat = np.ascontiguousarray(
-            np.column_stack([pred_df[f"{t}_mu"].to_numpy(dtype=np.float64) for t in target_list]).ravel()
-        )
-        alpha_flat = np.ascontiguousarray(
-            np.column_stack(
-                [
-                    pred_df[f"{t}_alpha"].to_numpy(dtype=np.float64)
-                    if f"{t}_alpha" in pred_df.columns
-                    else np.full(n_rows, np.nan, dtype=np.float64)
-                    for t in target_list
-                ]
-            ).ravel()
-        )
-        mean_f, var_f, crps_f, sq_f, um_f, usq_f, cov_f, pitcov_f, _, pit_f = _glm_pit_kernel(
-            y_flat, mu_flat, alpha_flat, levels_arr, n_bins, float(tol)
-        )
-    else:
+        h_mask = np.isfinite(pi_flat) & np.isfinite(lam_flat)
+        if np.any(h_mask):
+            idx_h = np.flatnonzero(h_mask)
+            m1, v1, c1, s1, um1, usq1, cv1, pcv1, _, pt1 = _hurdle_glm_pit_kernel(
+                np.ascontiguousarray(y_flat[idx_h]),
+                np.ascontiguousarray(pi_flat[idx_h]),
+                np.ascontiguousarray(lam_flat[idx_h]),
+                np.ascontiguousarray(alpha_flat[idx_h]),
+                levels_arr,
+                n_bins,
+                float(tol),
+            )
+            mean_f[idx_h], var_f[idx_h], crps_f[idx_h], sq_f[idx_h] = m1, v1, c1, s1
+            um_f[idx_h], usq_f[idx_h], cov_f[idx_h], pitcov_f[idx_h], pit_f[idx_h] = um1, usq1, cv1, pcv1, pt1
+            assigned[idx_h] = True
+
+    # 2. Quantile-grid entries (pure quantile models, or intermittent quantile branch in RegimeRouterForecaster):
+    is_router_intermittent = (
+        np.repeat((pred_df["model_route"].astype(str).to_numpy() == "intermittent"), n_horizons)
+        if "model_route" in pred_df.columns
+        else np.zeros(n_total, dtype=bool)
+    )
+    if has_q_cols and (not has_glm_alpha or np.any(~assigned & (is_router_intermittent | (not has_mu_cols)))):
         q_3d = np.empty((n_rows, n_horizons, len(q_arr)), dtype=np.float64)
         for h, t in enumerate(target_list):
             for k, q in enumerate(q_arr):
                 q_3d[:, h, k] = pred_df[quantile_col_name(t, float(q))].to_numpy(dtype=np.float64)
-        q_flat = np.ascontiguousarray(q_3d.reshape(n_rows * n_horizons, len(q_arr)), dtype=np.float64)
-        mean_f, var_f, crps_f, sq_f, um_f, usq_f, cov_f, pitcov_f, _, pit_f = _quantile_pit_kernel(
-            y_flat, q_flat, np.ascontiguousarray(q_arr, dtype=np.float64), levels_arr, n_bins, float(tol)
+        q_flat = q_3d.reshape(n_total, len(q_arr))
+        q_mask = (~assigned) & np.isfinite(q_flat[:, 0])
+        if has_glm_alpha and has_mu_cols:
+            q_mask = q_mask & (is_router_intermittent | (~np.isfinite(alpha_flat) & has_hurdle_cols))
+        if np.any(q_mask):
+            idx_q = np.flatnonzero(q_mask)
+            m2, v2, c2, s2, um2, usq2, cv2, pcv2, _, pt2 = _quantile_pit_kernel(
+                np.ascontiguousarray(y_flat[idx_q]),
+                np.ascontiguousarray(q_flat[idx_q]),
+                np.ascontiguousarray(q_arr, dtype=np.float64),
+                levels_arr,
+                n_bins,
+                float(tol),
+            )
+            mean_f[idx_q], var_f[idx_q], crps_f[idx_q], sq_f[idx_q] = m2, v2, c2, s2
+            um_f[idx_q], usq_f[idx_q], cov_f[idx_q], pitcov_f[idx_q], pit_f[idx_q] = um2, usq2, cv2, pcv2, pt2
+            assigned[idx_q] = True
+
+    # 3. Standard Poisson / NB2 GLM entries for any remaining rows:
+    if has_mu_cols and np.any(~assigned):
+        mu_flat = np.ascontiguousarray(
+            np.column_stack([pred_df[f"{t}_mu"].to_numpy(dtype=np.float64) for t in target_list]).ravel()
         )
+        g_mask = (~assigned) & np.isfinite(mu_flat)
+        if np.any(g_mask):
+            idx_g = np.flatnonzero(g_mask)
+            m3, v3, c3, s3, um3, usq3, cv3, pcv3, _, pt3 = _glm_pit_kernel(
+                np.ascontiguousarray(y_flat[idx_g]),
+                np.ascontiguousarray(mu_flat[idx_g]),
+                np.ascontiguousarray(alpha_flat[idx_g]),
+                levels_arr,
+                n_bins,
+                float(tol),
+            )
+            mean_f[idx_g], var_f[idx_g], crps_f[idx_g], sq_f[idx_g] = m3, v3, c3, s3
+            um_f[idx_g], usq_f[idx_g], cov_f[idx_g], pitcov_f[idx_g], pit_f[idx_g] = um3, usq3, cv3, pcv3, pt3
+            assigned[idx_g] = True
 
     # Reshape back to (n_rows, n_horizons, ...)
     mean_mat = mean_f.reshape(n_rows, n_horizons)
@@ -1076,3 +1127,362 @@ def evaluate_forecast_pit(
         pit_df=pd.DataFrame(pit_all),
         levels=tuple(float(x) for x in levels_arr),
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. Weighted Scaled Pinball Loss (WSPL / SPL) — M5 & Long et al. (2023)
+# ---------------------------------------------------------------------------
+
+
+@njit(parallel=True, cache=True)
+def _compute_insample_naive_scale_numba(
+    matrix: np.ndarray,
+    n_train_cols: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute per-series post-first-sale one-step-ahead naive MAE scale factor and active
+    training volume strictly over ``matrix[:, :n_train_cols]`` (Long et al., 2023, Sec. 4.3):
+
+        scale_i = (1 / (T - t_{i,0})) * sum_{t = t_{i,0} + 1}^{T} |y_{i,t} - y_{i,t-1}|
+
+    where ``t_{i,0}`` is the 0-based column index of the first non-zero sale in the training
+    window. Series with no training sales, fewer than 2 observations from ``t_{i,0}`` to ``T``,
+    or zero variation (e.g. identical sales on consecutive final timestamps) receive ``NaN``
+    and are omitted from WSPL aggregation per Long et al. (2023, p. 13).
+    """
+    n_series = matrix.shape[0]
+    scales = np.full(n_series, np.nan, dtype=np.float64)
+    volumes = np.zeros(n_series, dtype=np.float64)
+
+    for i in prange(n_series):
+        first_pos = -1
+        vol = 0.0
+        for t in range(n_train_cols):
+            val = matrix[i, t]
+            if val > 0.0:
+                vol += val
+                if first_pos < 0:
+                    first_pos = t
+        volumes[i] = vol
+        if first_pos < 0 or (n_train_cols - first_pos) < 2:
+            continue
+
+        diff_sum = 0.0
+        cnt = 0
+        for t in range(first_pos + 1, n_train_cols):
+            diff_sum += abs(matrix[i, t] - matrix[i, t - 1])
+            cnt += 1
+        if cnt > 0:
+            sc = diff_sum / cnt
+            if sc > 1e-12:
+                scales[i] = sc
+    return scales, volumes
+
+
+def evaluate_wspl(
+    pred_df: pd.DataFrame,
+    history: pd.DataFrame | object,
+    target_cols: Sequence[str],
+    quantiles: Sequence[float] = DEFAULT_QUANTILES,
+    ts_id_cols: Sequence[str] | None = None,
+    period_col: str = "day",
+    var_col: str = "demand",
+    train_end_period: float | int | None = None,
+    weights: str | dict | pd.DataFrame = "equal",
+    group_cols: Sequence[str] | None = None,
+    stratify_by_regime: bool = True,
+    include_by_horizon: bool = False,
+    tol: float = DEFAULT_SUPPORT_TOL,
+) -> pd.DataFrame:
+    """
+    Evaluate **Weighted Scaled Pinball Loss (WSPL)** and per-quantile **Scaled Pinball Loss (SPL)**
+    following the M5 Uncertainty competition and Long et al. (2023, Section 4.3, p. 13).
+
+    Why WSPL complements WMAPE
+    --------------------------
+    In unscaled or volume-weighted metrics (`WMAPE`), fast-moving `Smooth` and `Erratic` SKUs
+    dominate the total error sum while the 70%–95% of `Lumpy` and `Intermittent` SKUs have
+    minimal influence. WSPL normalizes each series' pinball loss by its own post-first-sale
+    in-sample 1-step naive MAE before aggregating across series, and by default (`stratify_by_regime=True`)
+    reports WSPL both overall and stratified by SBC demand class (`demand_regime_name`).
+
+    Parameters
+    ----------
+    pred_df : pd.DataFrame
+        Forecast DataFrame from any forecaster (`GLMForecaster`, `CatBoostQuantileForecaster`,
+        `EmpiricalQuantileForecaster`, or `RegimeRouterForecaster`). Missing `<target>_q<level>`
+        columns on parametric GLM outputs are populated automatically via :func:`populate_model_quantiles`.
+    history : DiscreteTimeSeries or pd.DataFrame
+        Training or full historical demand panel used to compute each series' post-first-sale
+        in-sample naive 1-step MAE denominator.
+    target_cols : sequence of str
+        Horizon target column names (`target_t_plus_0`, ...).
+    quantiles : sequence of float, default DEFAULT_QUANTILES
+        Quantile levels `u_1, ..., u_q` evaluated.
+    ts_id_cols : sequence of str, optional
+        Series identifier columns (inferred automatically if `history` is a `DiscreteTimeSeries`
+        or from shared `store_id`/`item_id` columns).
+    train_end_period : optional
+        Last inclusive training period `T`. If omitted, inferred from `history.test_start_period`
+        (strictly `< test_start_period`) or strictly `< pred_df[period_col].min()`.
+    weights : {"equal", "volume"} or dict or pd.DataFrame, default "equal"
+        Series weighting scheme `w_i`:
+        - `"equal"`: `w_i = 1 / n_valid` (Long et al., 2023, Section 4.3).
+        - `"volume"`: `w_i` proportional to each series' training unit volume.
+        - `dict` or `pd.DataFrame`: custom non-negative weight per series (`ts_id_cols` + `"weight"`).
+    group_cols : sequence of str, optional
+        Optional breakdown columns (e.g. `["cat_id"]`).
+    stratify_by_regime : bool, default True
+        If `True` and `"demand_regime_name"` is present (or derivable from `history`), automatically
+        includes per-demand-regime (`smooth`, `erratic`, `intermittent`, `lumpy`) WSPL breakdowns.
+    include_by_horizon : bool, default False
+        If `True`, also reports per-horizon SPL/WSPL rows in addition to `target="all_horizons"`.
+    """
+    from probabilistic_modeling.time_series import classify_demand_regimes
+
+    q_arr = validate_quantile_levels(quantiles)
+    target_list = [t for t in target_cols if t in pred_df.columns]
+    if not target_list:
+        raise ValueError(f"None of the target_cols {list(target_cols)} are present in 'pred_df'.")
+
+    # Extract raw history DataFrame and metadata from DiscreteTimeSeries if passed:
+    inferred_test_start = None
+    if hasattr(history, "ts_id_cols") and hasattr(history, "df"):
+        ts_obj = history
+        if ts_id_cols is None:
+            ts_id_cols = list(ts_obj.ts_id_cols)
+        period_col = ts_obj.period_col
+        var_col = ts_obj.var_col
+        inferred_test_start = ts_obj.test_start_period
+        hist_df = (
+            ts_obj.raw_df
+            if (hasattr(ts_obj, "raw_df") and isinstance(ts_obj.raw_df, pd.DataFrame) and not ts_obj.raw_df.empty)
+            else ts_obj.df
+        )
+    elif isinstance(history, pd.DataFrame):
+        hist_df = history
+    else:
+        raise TypeError("'history' must be a DiscreteTimeSeries or a pandas DataFrame.")
+
+    if ts_id_cols is None:
+        id_cols = [c for c in ("store_id", "item_id") if c in pred_df.columns and c in hist_df.columns]
+        if not id_cols:
+            id_cols = [c for c in ("id", "item_id") if c in pred_df.columns and c in hist_df.columns]
+        if not id_cols:
+            raise ValueError("Could not infer 'ts_id_cols'; please specify explicitly.")
+    else:
+        id_cols = list(ts_id_cols)
+
+    dense_hist = DenseHistory.from_frame(hist_df, id_cols, period_col, var_col)
+    periods_sorted = dense_hist.periods
+    if train_end_period is not None:
+        n_train_cols = int(np.searchsorted(periods_sorted, train_end_period, side="right"))
+    elif inferred_test_start is not None:
+        n_train_cols = int(np.searchsorted(periods_sorted, inferred_test_start, side="left"))
+    elif period_col in pred_df.columns and len(pred_df) > 0:
+        min_pred_p = pred_df[period_col].min()
+        n_train_cols = int(np.searchsorted(periods_sorted, min_pred_p, side="left"))
+    else:
+        n_train_cols = len(periods_sorted)
+
+    if n_train_cols < 2:
+        raise ValueError(
+            f"At least 2 training periods are required to compute WSPL naive scale (got {n_train_cols})."
+        )
+
+    scales_per_series, vol_per_series = _compute_insample_naive_scale_numba(dense_hist.matrix, n_train_cols)
+
+    df_q = populate_model_quantiles(pred_df, target_list, quantiles=q_arr, tol=tol, inplace=False)
+
+    # Attach demand_regime_name from training history if requested and not yet on df_q:
+    if stratify_by_regime and "demand_regime_name" not in df_q.columns:
+        max_train_p = periods_sorted[n_train_cols - 1]
+        sbc_df = classify_demand_regimes(
+            hist_df, ts_id_cols=id_cols, period_col=period_col, var_col=var_col, train_end_period=max_train_p
+        )
+        sbc_sub = sbc_df[id_cols + ["demand_regime", "demand_regime_name"]].copy()
+        for c in id_cols:
+            sbc_sub[c] = sbc_sub[c].astype(df_q[c].dtype)
+        df_q = pd.merge(df_q, sbc_sub, on=id_cols, how="left")
+
+    row_series_idx, _ = dense_hist.locate(df_q)
+    n_rows = len(df_q)
+    n_h = len(target_list)
+    n_q = len(q_arr)
+
+    y_mat = np.column_stack([df_q[t].to_numpy(dtype=np.float64) for t in target_list])  # (n_rows, n_h)
+    # Build pinball tensor of shape (n_rows, n_h, n_q):
+    pb_3d = np.full((n_rows, n_h, n_q), np.nan, dtype=np.float64)
+    for k, q in enumerate(q_arr):
+        tau = float(q)
+        q_mat = np.column_stack([df_q[quantile_col_name(t, tau)].to_numpy(dtype=np.float64) for t in target_list])
+        valid = np.isfinite(y_mat) & np.isfinite(q_mat)
+        diff = np.where(valid, y_mat - q_mat, 0.0)
+        pb = tau * np.maximum(diff, 0.0) + (1.0 - tau) * np.maximum(-diff, 0.0)
+        pb_3d[:, :, k] = np.where(valid, pb, np.nan)
+
+    # Resolve custom series weights if provided:
+    n_total_hist_series = len(scales_per_series)
+    if isinstance(weights, str):
+        w_mode = weights.strip().lower()
+        if w_mode == "equal":
+            raw_series_w = np.ones(n_total_hist_series, dtype=np.float64)
+        elif w_mode == "volume":
+            raw_series_w = np.maximum(vol_per_series, 0.0)
+        else:
+            raise ValueError(f"Unsupported weights='{weights}'. Use 'equal', 'volume', a dict, or a DataFrame.")
+    elif isinstance(weights, dict):
+        raw_series_w = np.array(
+            [float(weights.get(k, 0.0)) for k, _ in sorted(dense_hist.series_index.items(), key=lambda kv: kv[1])],
+            dtype=np.float64,
+        )
+    elif isinstance(weights, pd.DataFrame):
+        w_col = "weight" if "weight" in weights.columns else [c for c in weights.columns if c not in id_cols][0]
+        r_w, _ = dense_hist.locate(weights.assign(**{period_col: periods_sorted[0]}))
+        raw_series_w = np.zeros(n_total_hist_series, dtype=np.float64)
+        valid_rw = r_w >= 0
+        raw_series_w[r_w[valid_rw]] = weights.loc[valid_rw, w_col].to_numpy(dtype=np.float64)
+    else:
+        raise TypeError("'weights' must be 'equal', 'volume', a dict, or a DataFrame.")
+
+    def _eval_wspl_slice(row_mask: np.ndarray, group_label: str, group_dict: dict, target_label: str, h_idx: int | None) -> list[dict]:
+        sub_r = row_series_idx[row_mask]
+        known_mask = sub_r >= 0
+        sub_r = sub_r[known_mask]
+        uniq_s = np.unique(sub_r)
+        n_series_tot = int(len(uniq_s))
+        if n_series_tot == 0:
+            return []
+
+        if h_idx is None:
+            # Pool across all horizons on rows in row_mask: shape (n_masked_rows, n_h, n_q)
+            pb_sub = pb_3d[row_mask][known_mask]  # (M, n_h, n_q)
+            pb_sum_s = np.zeros((n_total_hist_series, n_q), dtype=np.float64)
+            pb_cnt_s = np.zeros((n_total_hist_series, n_q), dtype=np.int64)
+            valid_pb = np.isfinite(pb_sub)
+            pb_zero = np.where(valid_pb, pb_sub, 0.0)
+            np.add.at(pb_sum_s, sub_r, pb_zero.sum(axis=1))
+            np.add.at(pb_cnt_s, sub_r, valid_pb.sum(axis=1))
+        else:
+            pb_sub = pb_3d[row_mask, h_idx, :][known_mask]  # (M, n_q)
+            pb_sum_s = np.zeros((n_total_hist_series, n_q), dtype=np.float64)
+            pb_cnt_s = np.zeros((n_total_hist_series, n_q), dtype=np.int64)
+            valid_pb = np.isfinite(pb_sub)
+            pb_zero = np.where(valid_pb, pb_sub, 0.0)
+            np.add.at(pb_sum_s, sub_r, pb_zero)
+            np.add.at(pb_cnt_s, sub_r, valid_pb.astype(np.int64))
+
+        has_eval_obs = (pb_cnt_s[uniq_s] > 0).all(axis=1)
+        valid_scale = np.isfinite(scales_per_series[uniq_s]) & (scales_per_series[uniq_s] > 0.0)
+        keep = has_eval_obs & valid_scale
+        valid_s = uniq_s[keep]
+        n_valid = int(len(valid_s))
+        n_omitted = int(n_series_tot - n_valid)
+
+        if n_valid == 0:
+            out_empty = [
+                {
+                    "group": group_label,
+                    **group_dict,
+                    "target": target_label,
+                    "quantile": f"q{float(q):g}",
+                    "quantile_level": float(q),
+                    "n_series_total": n_series_tot,
+                    "n_series_valid": 0,
+                    "n_series_omitted": n_omitted,
+                    "mean_scale": np.nan,
+                    "wspl": np.nan,
+                }
+                for q in q_arr
+            ]
+            out_empty.append(
+                {
+                    "group": group_label,
+                    **group_dict,
+                    "target": target_label,
+                    "quantile": "wspl",
+                    "quantile_level": np.nan,
+                    "n_series_total": n_series_tot,
+                    "n_series_valid": 0,
+                    "n_series_omitted": n_omitted,
+                    "mean_scale": np.nan,
+                    "wspl": np.nan,
+                }
+            )
+            return out_empty
+
+        mean_pl = pb_sum_s[valid_s] / pb_cnt_s[valid_s]  # (n_valid, n_q)
+        spl_mat = mean_pl / scales_per_series[valid_s, None]  # (n_valid, n_q)
+
+        w_vec = raw_series_w[valid_s].copy()
+        w_sum = float(w_vec.sum())
+        if w_sum <= 0.0:
+            w_vec = np.full(n_valid, 1.0 / n_valid, dtype=np.float64)
+        else:
+            w_vec /= w_sum
+
+        wspl_per_q = w_vec @ spl_mat  # (n_q,)
+        mean_sc = float(np.dot(w_vec, scales_per_series[valid_s]))
+
+        rows_res: list[dict] = []
+        for k, q in enumerate(q_arr):
+            rows_res.append(
+                {
+                    "group": group_label,
+                    **group_dict,
+                    "target": target_label,
+                    "quantile": f"q{float(q):g}",
+                    "quantile_level": float(q),
+                    "n_series_total": n_series_tot,
+                    "n_series_valid": n_valid,
+                    "n_series_omitted": n_omitted,
+                    "mean_scale": mean_sc,
+                    "wspl": float(wspl_per_q[k]),
+                }
+            )
+        rows_res.append(
+            {
+                "group": group_label,
+                **group_dict,
+                "target": target_label,
+                "quantile": "wspl",
+                "quantile_level": np.nan,
+                "n_series_total": n_series_tot,
+                "n_series_valid": n_valid,
+                "n_series_omitted": n_omitted,
+                "mean_scale": mean_sc,
+                "wspl": float(np.mean(wspl_per_q)),
+            }
+        )
+        return rows_res
+
+    out_rows: list[dict] = []
+
+    def _run_for_mask(rmask: np.ndarray, glabel: str, gdict: dict) -> None:
+        out_rows.extend(_eval_wspl_slice(rmask, glabel, gdict, "all_horizons", None))
+        if include_by_horizon:
+            for h_i, t_name in enumerate(target_list):
+                out_rows.extend(_eval_wspl_slice(rmask, glabel, gdict, t_name, h_i))
+
+    _run_for_mask(np.ones(n_rows, dtype=bool), "overall", {})
+
+    effective_groups = [g for g in (group_cols or []) if g in df_q.columns]
+    if effective_groups:
+        row_pos = pd.Series(np.arange(n_rows), index=df_q.index)
+        for key, sub_idx in row_pos.groupby([df_q[g] for g in effective_groups], observed=True):
+            key_tuple = key if isinstance(key, tuple) else (key,)
+            kd = dict(zip(effective_groups, key_tuple))
+            label = "|".join(f"{k}={v}" for k, v in kd.items())
+            rmask = np.zeros(n_rows, dtype=bool)
+            rmask[sub_idx.to_numpy()] = True
+            _run_for_mask(rmask, label, kd)
+
+    if stratify_by_regime and "demand_regime_name" in df_q.columns and "demand_regime_name" not in effective_groups:
+        row_pos = pd.Series(np.arange(n_rows), index=df_q.index)
+        for reg_name, sub_idx in row_pos.groupby(df_q["demand_regime_name"], observed=True):
+            kd = {"demand_regime_name": str(reg_name)}
+            rmask = np.zeros(n_rows, dtype=bool)
+            rmask[sub_idx.to_numpy()] = True
+            _run_for_mask(rmask, f"demand_regime_name={reg_name}", kd)
+
+    return pd.DataFrame(out_rows)

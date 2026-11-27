@@ -44,11 +44,17 @@ _LAZY_EXPORTS: dict[str, str] = {
     "DiscreteTimeSeries": "time_series",
     "TimeSeriesFeatureSpec": "time_series",
     "compute_lead_time_demand": "time_series",
+    "classify_demand_regimes": "time_series",
+    "DEMAND_REGIME_NAMES": "time_series",
+    "DEMAND_REGIME_CODES": "time_series",
+    "SBC_ADI_THRESHOLD": "time_series",
+    "SBC_CV2_THRESHOLD": "time_series",
     # models
     "ProbabilisticForecaster": "models.forecasters",
     "GLMForecaster": "models.forecasters",
     "CatBoostQuantileForecaster": "models.forecasters",
     "EmpiricalQuantileForecaster": "models.baseline",
+    "RegimeRouterForecaster": "models.router",
     "load_forecaster": "models.forecasters",
     "compute_forecasting_metrics": "models.forecasters",
     "evaluate_quantile_forecasts": "models.forecasters",
@@ -59,6 +65,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "build_m5_sections": "evaluation.forecast_evaluation",
     "populate_model_quantiles": "evaluation.forecast_evaluation",
     "evaluate_quantile_wmape": "evaluation.forecast_evaluation",
+    "evaluate_wspl": "evaluation.forecast_evaluation",
     "ForecastPITResult": "evaluation.forecast_evaluation",
     "evaluate_forecast_pit": "evaluation.forecast_evaluation",
     "compute_pit_uniformity_metrics": "evaluation.forecast_evaluation",
@@ -69,6 +76,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "resolve_target_inventory": "inventory.simulation",
     "compute_kings_target_inventory": "inventory.simulation",
     "compute_simulation_kpis": "inventory.simulation",
+    "REGIME_ADAPTIVE_ROUNDING": "inventory.simulation",
     # utils
     "setup_logging": "logging_utils",
 }

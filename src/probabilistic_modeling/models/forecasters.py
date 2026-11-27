@@ -333,17 +333,23 @@ def _digamma_scalar(x: float) -> float:
 
 
 @njit(nogil=True, cache=True)
-def _logit_nll_and_grad_eta(y: np.ndarray, eta: np.ndarray) -> tuple[float, np.ndarray]:
+def _logit_nll_and_grad_eta(
+    y: np.ndarray, eta: np.ndarray, weights: np.ndarray
+) -> tuple[float, np.ndarray]:
     """
-    Analytical average negative log-likelihood and linear-predictor gradient for
+    Analytical weighted average negative log-likelihood and linear-predictor gradient for
     binary Logistic Regression (`Y in {0, 1}`, `pi = 1 / (1 + exp(-eta))`).
     """
     n = y.shape[0]
     grad_eta = np.empty(n, dtype=np.float64)
     nll = 0.0
-    inv_n = 1.0 / n
+    w_sum = 0.0
+    for i in range(n):
+        w_sum += weights[i]
+    inv_w = 1.0 / w_sum if w_sum > 0.0 else (1.0 / max(n, 1))
     for i in range(n):
         yi = y[i]
+        wi = weights[i]
         ei = eta[i]
         if ei < -30.0:
             ei = -30.0
@@ -358,23 +364,29 @@ def _logit_nll_and_grad_eta(y: np.ndarray, eta: np.ndarray) -> tuple[float, np.n
             pi = exp_pos / (1.0 + exp_pos)
             log1p_exp = math.log1p(exp_pos)
         ll_i = yi * ei - log1p_exp
-        nll -= ll_i
-        grad_eta[i] = (pi - yi) * inv_n
-    return nll * inv_n, grad_eta
+        nll -= wi * ll_i
+        grad_eta[i] = wi * (pi - yi) * inv_w
+    return nll * inv_w, grad_eta
 
 
 @njit(nogil=True, cache=True)
-def _poisson_nll_and_grad_eta(y: np.ndarray, eta: np.ndarray) -> tuple[float, np.ndarray]:
+def _poisson_nll_and_grad_eta(
+    y: np.ndarray, eta: np.ndarray, weights: np.ndarray
+) -> tuple[float, np.ndarray]:
     """
-    Analytical average negative log-likelihood and linear-predictor gradient for
+    Analytical weighted average negative log-likelihood and linear-predictor gradient for
     standard Poisson Regression (`Y >= 0`, `mu = exp(eta)`).
     """
     n = y.shape[0]
     grad_eta = np.empty(n, dtype=np.float64)
     nll = 0.0
-    inv_n = 1.0 / n
+    w_sum = 0.0
+    for i in range(n):
+        w_sum += weights[i]
+    inv_w = 1.0 / w_sum if w_sum > 0.0 else (1.0 / max(n, 1))
     for i in range(n):
         yi = y[i]
+        wi = weights[i]
         ei = eta[i]
         if ei < -30.0:
             ei = -30.0
@@ -382,17 +394,17 @@ def _poisson_nll_and_grad_eta(y: np.ndarray, eta: np.ndarray) -> tuple[float, np
             ei = 30.0
         mu = math.exp(ei)
         ll_i = yi * ei - mu - math.lgamma(yi + 1.0)
-        nll -= ll_i
-        grad_eta[i] = (mu - yi) * inv_n
-    return nll * inv_n, grad_eta
+        nll -= wi * ll_i
+        grad_eta[i] = wi * (mu - yi) * inv_w
+    return nll * inv_w, grad_eta
 
 
 @njit(nogil=True, cache=True)
 def _nb2_nll_and_grad_eta(
-    y: np.ndarray, eta: np.ndarray, log_alpha: float
+    y: np.ndarray, eta: np.ndarray, log_alpha: float, weights: np.ndarray
 ) -> tuple[float, np.ndarray, float]:
     """
-    Analytical average negative log-likelihood and gradients w.r.t. linear predictor `eta`
+    Analytical weighted average negative log-likelihood and gradients w.r.t. linear predictor `eta`
     and `log_alpha = ln(alpha)` for standard Negative Binomial NB2 (`Y >= 0`, `mu = exp(eta)`).
     """
     n = y.shape[0]
@@ -409,10 +421,14 @@ def _nb2_nll_and_grad_eta(
 
     nll = 0.0
     grad_tau = 0.0
-    inv_n = 1.0 / n
+    w_sum = 0.0
+    for i in range(n):
+        w_sum += weights[i]
+    inv_w = 1.0 / w_sum if w_sum > 0.0 else (1.0 / max(n, 1))
 
     for i in range(n):
         yi = y[i]
+        wi = weights[i]
         ei = eta[i]
         if ei < -30.0:
             ei = -30.0
@@ -431,8 +447,8 @@ def _nb2_nll_and_grad_eta(
             + yi * ei
             - (yi + r) * math.log(r + mu)
         )
-        nll -= ll_i
-        grad_eta[i] = ((mu - yi) / denom) * inv_n
+        nll -= wi * ll_i
+        grad_eta[i] = wi * ((mu - yi) / denom) * inv_w
 
         d_ll_dr = (
             _digamma_scalar(yi + r)
@@ -441,9 +457,9 @@ def _nb2_nll_and_grad_eta(
             + (mu - yi) / (r + mu)
         )
         # Since r = exp(-log_alpha), dr / d(log_alpha) = -r, so d(-ll_i)/d(log_alpha) = r * d_ll_dr
-        grad_tau += (r * d_ll_dr) * inv_n
+        grad_tau += wi * (r * d_ll_dr) * inv_w
 
-    return nll * inv_n, grad_eta, grad_tau
+    return nll * inv_w, grad_eta, grad_tau
 
 
 @njit(nogil=True, cache=True)
@@ -577,22 +593,35 @@ def _build_design_matrix(df: pd.DataFrame, feature_cols: list[str]) -> tuple[np.
     return X, active_features
 
 
+def _prepare_weights(n: int, sample_weight: np.ndarray | None) -> np.ndarray:
+    """Return a contiguous positive float64 weight vector of length `n`."""
+    if sample_weight is None:
+        return np.ones(n, dtype=np.float64)
+    w = np.ascontiguousarray(sample_weight, dtype=np.float64)
+    if len(w) != n:
+        raise ValueError(f"Expected sample_weight of length {n}, got {len(w)}.")
+    return np.maximum(w, 0.0)
+
+
 def _fit_logit_fast(
     y_bin: np.ndarray,
     X: np.ndarray,
     reg_alpha: float = 0.0,
     l1_wt: float = 0.0,
+    sample_weight: np.ndarray | None = None,
 ) -> np.ndarray | None:
-    """Fits binary Logistic Regression via L-BFGS-B using compiled Numba analytical gradients."""
+    """Fits (optionally weighted) binary Logistic Regression via L-BFGS-B using compiled Numba gradients."""
     k = X.shape[1]
-    p_bar = float(np.clip(y_bin.mean(), 1e-6, 1.0 - 1e-6))
+    w = _prepare_weights(len(y_bin), sample_weight)
+    w_sum = float(w.sum())
+    p_bar = float(np.clip(float(np.dot(w, y_bin)) / max(w_sum, 1e-12), 1e-6, 1.0 - 1e-6))
     beta0 = np.zeros(k, dtype=np.float64)
     beta0[0] = math.log(p_bar / (1.0 - p_bar))
     l2_pen = float(reg_alpha) * (1.0 - float(l1_wt)) if reg_alpha > 0.0 else 0.0
 
     def _obj(beta: np.ndarray) -> tuple[float, np.ndarray]:
         eta = X @ beta
-        nll, grad_eta = _logit_nll_and_grad_eta(y_bin, eta)
+        nll, grad_eta = _logit_nll_and_grad_eta(y_bin, eta, w)
         grad_beta = X.T @ grad_eta
         if l2_pen > 0.0:
             nll += 0.5 * l2_pen * float(np.dot(beta[1:], beta[1:]))
@@ -611,17 +640,20 @@ def _fit_poisson_fast(
     X: np.ndarray,
     reg_alpha: float = 0.0,
     l1_wt: float = 0.0,
+    sample_weight: np.ndarray | None = None,
 ) -> np.ndarray | None:
-    """Fits standard Poisson Regression via L-BFGS-B using compiled Numba analytical gradients."""
+    """Fits (optionally weighted) standard Poisson Regression via L-BFGS-B using compiled Numba gradients."""
     k = X.shape[1]
-    mu0 = max(float(y.mean()), 1e-4)
+    w = _prepare_weights(len(y), sample_weight)
+    w_sum = float(w.sum())
+    mu0 = max(float(np.dot(w, y)) / max(w_sum, 1e-12), 1e-4)
     beta0 = np.zeros(k, dtype=np.float64)
     beta0[0] = math.log(mu0)
     l2_pen = float(reg_alpha) * (1.0 - float(l1_wt)) if reg_alpha > 0.0 else 0.0
 
     def _obj(beta: np.ndarray) -> tuple[float, np.ndarray]:
         eta = X @ beta
-        nll, grad_eta = _poisson_nll_and_grad_eta(y, eta)
+        nll, grad_eta = _poisson_nll_and_grad_eta(y, eta, w)
         grad_beta = X.T @ grad_eta
         if l2_pen > 0.0:
             nll += 0.5 * l2_pen * float(np.dot(beta[1:], beta[1:]))
@@ -641,11 +673,14 @@ def _fit_nb2_fast(
     reg_alpha: float = 0.0,
     l1_wt: float = 0.0,
     init_beta: np.ndarray | None = None,
+    sample_weight: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, float | None]:
-    """Fits standard Negative Binomial (NB2) via L-BFGS-B using compiled Numba analytical gradients."""
+    """Fits (optionally weighted) standard Negative Binomial (NB2) via L-BFGS-B using compiled Numba gradients."""
     k = X.shape[1]
-    y_mean = float(y.mean())
-    y_var = float(y.var()) if len(y) > 1 else y_mean
+    w = _prepare_weights(len(y), sample_weight)
+    w_sum = max(float(w.sum()), 1e-12)
+    y_mean = float(np.dot(w, y)) / w_sum
+    y_var = float(np.dot(w, (y - y_mean) ** 2)) / w_sum if len(y) > 1 else y_mean
     alpha0 = max((y_var - y_mean) / max(y_mean * y_mean, 1e-2), 0.1)
     alpha0 = float(np.clip(alpha0, 1e-3, 50.0))
 
@@ -661,7 +696,7 @@ def _fit_nb2_fast(
         beta = theta[:k]
         log_alpha = float(theta[k])
         eta = X @ beta
-        nll, grad_eta, grad_tau = _nb2_nll_and_grad_eta(y, eta, log_alpha)
+        nll, grad_eta, grad_tau = _nb2_nll_and_grad_eta(y, eta, log_alpha, w)
         grad = np.empty(k + 1, dtype=np.float64)
         grad[:k] = X.T @ grad_eta
         grad[k] = grad_tau
@@ -690,8 +725,7 @@ def _fit_hurdle_binary_stage(
 ) -> tuple[dict[str, float], Any]:
     """
     Fits the binary hurdle stage `P(Y > 0 | X)` using compiled Numba analytical gradients + L-BFGS-B
-    (`_fit_logit_fast`), with fallback to `sm.Logit.fit_regularized` when L1 regularization is requested,
-    and graceful fallback when a group's target is all-zero, all-positive, or exhibits perfect separation.
+    (`_fit_logit_fast`), honoring `sample_weight` if present on `train_df` (e.g. from `downsample_zeros_frac`).
     """
     zero_coefs = {str(f): 0.0 for f in feature_cols}
     if len(train_df) == 0:
@@ -706,6 +740,11 @@ def _fit_hurdle_binary_stage(
     if n_pos == len(train_df):
         return {"Intercept": 30.0, **zero_coefs}, None
 
+    w = (
+        np.ascontiguousarray(train_df["sample_weight"].to_numpy(dtype=np.float64, copy=False))
+        if "sample_weight" in train_df.columns
+        else None
+    )
     X, active_features = _build_design_matrix(train_df, feature_cols)
     if n_pos <= len(active_features) + 1 or (len(train_df) - n_pos) <= len(active_features) + 1:
         X = np.ones((len(train_df), 1), dtype=np.float64)
@@ -714,7 +753,7 @@ def _fit_hurdle_binary_stage(
     reg_a = float(regularization_alpha) if regularization_alpha is not None and regularization_alpha > 0.0 else 0.0
 
     params_dict: dict[str, float] | None = None
-    if reg_a > 0.0 and float(l1_wt) > 0.0:
+    if reg_a > 0.0 and float(l1_wt) > 0.0 and w is None:
         try:
             logit_model = sm.Logit(y_bin, X)
             res = logit_model.fit_regularized(
@@ -730,12 +769,17 @@ def _fit_hurdle_binary_stage(
             params_dict = None
 
     if params_dict is None:
-        beta_hat = _fit_logit_fast(y_bin, X, reg_alpha=reg_a, l1_wt=l1_wt)
+        beta_hat = _fit_logit_fast(y_bin, X, reg_alpha=reg_a, l1_wt=l1_wt, sample_weight=w)
         if beta_hat is not None:
             params_dict = {col_names[i]: float(beta_hat[i]) for i in range(len(col_names))}
 
     if params_dict is None:
-        p_bar = float(np.clip(y_bin.mean(), 1e-6, 1.0 - 1e-6))
+        p_mean = (
+            float(np.dot(w, y_bin)) / max(float(w.sum()), 1e-12)
+            if w is not None
+            else float(y_bin.mean())
+        )
+        p_bar = float(np.clip(p_mean, 1e-6, 1.0 - 1e-6))
         return {"Intercept": float(np.log(p_bar / (1.0 - p_bar))), **zero_coefs}, None
 
     hurdle_params = {
@@ -918,9 +962,9 @@ def _fit_standard_count_stage(
     """
     Fits a standard (untruncated) Poisson (`model_type="poisson"`) or Negative Binomial NB2
     (`model_type="nbinom"`) GLM on all non-missing training rows (`y >= 0`) using compiled
-    Numba analytical gradients + L-BFGS-B (`_fit_nb2_fast` or `_fit_poisson_fast`), warm-starting
-    NB2 from the fast Poisson solution and falling back gracefully if L1 regularization is
-    requested or if a subgroup is degenerate.
+    Numba analytical gradients + L-BFGS-B (`_fit_nb2_fast` or `_fit_poisson_fast`), honoring
+    `sample_weight` if present on `train_df`, warm-starting NB2 from the fast Poisson solution,
+    and falling back gracefully if L1 regularization is requested or if a subgroup is degenerate.
     """
     zero_coefs = {str(f): 0.0 for f in feature_cols}
     if len(train_df) == 0:
@@ -929,6 +973,13 @@ def _fit_standard_count_stage(
     y_vec = np.ascontiguousarray(train_df[target_col].to_numpy(dtype=np.float64, copy=False))
     if float(y_vec.max()) <= 0.0:
         return {"Intercept": -20.0, **zero_coefs}, None, None
+
+    w = (
+        np.ascontiguousarray(train_df["sample_weight"].to_numpy(dtype=np.float64, copy=False))
+        if "sample_weight" in train_df.columns
+        else None
+    )
+    eff_n = float(w.sum()) if w is not None else float(len(train_df))
 
     n_pos = int((y_vec > 0.0).sum())
     X, active_features = _build_design_matrix(train_df, feature_cols)
@@ -939,7 +990,7 @@ def _fit_standard_count_stage(
     reg_a = float(regularization_alpha) if regularization_alpha is not None and regularization_alpha > 0.0 else 0.0
 
     # If L1 penalty is requested, use statsmodels fit_regularized on (y_vec, X)
-    if reg_a > 0.0 and float(l1_wt) > 0.0:
+    if reg_a > 0.0 and float(l1_wt) > 0.0 and w is None:
         try:
             mod = sm.NegativeBinomial(y_vec, X) if model_type == "nbinom" else sm.Poisson(y_vec, X)
             res = mod.fit_regularized(alpha=reg_a, L1_wt=float(l1_wt), maxiter=100, disp=False)
@@ -959,7 +1010,7 @@ def _fit_standard_count_stage(
         except Exception:
             pass
 
-    pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt)
+    pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt, sample_weight=w)
     # Guard against collinearity / quasi-separation slope explosion on sparse count subsets
     # (e.g. log1p(rolling_mean_w) vs. zero_freq_w when positive counts are rare {0, 1} events):
     if reg_a == 0.0 and len(active_features) > 0:
@@ -969,30 +1020,30 @@ def _fit_standard_count_stage(
             or n_pos < 20 * len(active_features)
         )
         if needs_ridge:
-            reg_a = max(1e-3, 1.0 / max(len(train_df), 1))
-            pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=0.0)
+            reg_a = max(1e-3, 1.0 / max(eff_n, 1.0))
+            pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=0.0, sample_weight=w)
 
     beta_hat: np.ndarray | None = None
     alpha_val: float | None = None
 
     if model_type == "nbinom":
         beta_hat, alpha_val = _fit_nb2_fast(
-            y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt, init_beta=pois_beta
+            y_vec, X, reg_alpha=reg_a, l1_wt=l1_wt, init_beta=pois_beta, sample_weight=w
         )
         if (
             reg_a == 0.0
             and len(active_features) > 0
             and (beta_hat is None or float(np.max(np.abs(beta_hat[1:]))) > 5.0)
         ):
-            reg_a = max(1e-3, 1.0 / max(len(train_df), 1))
+            reg_a = max(1e-3, 1.0 / max(eff_n, 1.0))
             if pois_beta is None or float(np.max(np.abs(pois_beta[1:]))) > 5.0:
-                pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=0.0)
+                pois_beta = _fit_poisson_fast(y_vec, X, reg_alpha=reg_a, l1_wt=0.0, sample_weight=w)
             beta_hat, alpha_val = _fit_nb2_fast(
-                y_vec, X, reg_alpha=reg_a, l1_wt=0.0, init_beta=pois_beta
+                y_vec, X, reg_alpha=reg_a, l1_wt=0.0, init_beta=pois_beta, sample_weight=w
             )
         if beta_hat is None and active_features:
             X_int = np.ones((len(train_df), 1), dtype=np.float64)
-            b_int, a_int = _fit_nb2_fast(y_vec, X_int, reg_alpha=reg_a, l1_wt=l1_wt)
+            b_int, a_int = _fit_nb2_fast(y_vec, X_int, reg_alpha=reg_a, l1_wt=l1_wt, sample_weight=w)
             if b_int is not None:
                 return {"Intercept": float(b_int[0]), **zero_coefs}, a_int, None
 
@@ -1001,12 +1052,13 @@ def _fit_standard_count_stage(
         alpha_val = None
         if beta_hat is None and active_features:
             X_int = np.ones((len(train_df), 1), dtype=np.float64)
-            b_int = _fit_poisson_fast(y_vec, X_int, reg_alpha=reg_a, l1_wt=l1_wt)
+            b_int = _fit_poisson_fast(y_vec, X_int, reg_alpha=reg_a, l1_wt=l1_wt, sample_weight=w)
             if b_int is not None:
                 return {"Intercept": float(b_int[0]), **zero_coefs}, None, None
 
     if beta_hat is None:
-        mu_bar = max(float(y_vec.mean()), 1e-6)
+        mu_mean = float(np.dot(w, y_vec)) / max(eff_n, 1e-12) if w is not None else float(y_vec.mean())
+        mu_bar = max(mu_mean, 1e-6)
         return {"Intercept": float(np.log(mu_bar)), **zero_coefs}, None, None
 
     raw_params = {col_names[i]: float(beta_hat[i]) for i in range(len(col_names))}
@@ -1381,9 +1433,18 @@ class ProbabilisticForecaster(ABC):
                 for k in join_keys:
                     meta_sub[k] = meta_sub[k].astype(test_data[k].dtype)
                 test_data = pd.merge(test_data, meta_sub, on=join_keys, how="left")
-                for int_col in ("overdispersion", "positive_overdispersion", "velocity_tier", "demand_regime"):
+                for int_col in ("overdispersion", "positive_overdispersion", "velocity_tier"):
                     if int_col in missing_meta_cols and int_col in test_data.columns:
                         test_data[int_col] = test_data[int_col].fillna(0).astype(int)
+                if "demand_regime" in missing_meta_cols and "demand_regime" in test_data.columns:
+                    test_data["demand_regime"] = test_data["demand_regime"].fillna(2).astype(int)
+                if "demand_regime_name" in missing_meta_cols and "demand_regime_name" in test_data.columns:
+                    test_data["demand_regime_name"] = (
+                        test_data["demand_regime_name"]
+                        .astype(str)
+                        .replace({"nan": "intermittent", "None": "intermittent"})
+                        .astype("category")
+                    )
 
         return test_data, target_cols, feature_cols, period_col
 
@@ -1579,37 +1640,37 @@ class GLMForecaster(ProbabilisticForecaster):
         return "velocity_tier"
 
     def _ensure_tier_and_dispersion_columns(self, ts: "DiscreteTimeSeries", needed_cols: list[str]) -> None:
-        """Computes any missing `positive_overdispersion`, `velocity_tier`, or `demand_regime` columns on `ts.df`."""
+        """Computes any missing `positive_overdispersion`, `velocity_tier`, or `demand_regime` columns on `ts.df` using post-first-sale history."""
         missing = [c for c in needed_cols if c not in ts.df.columns]
-        if not missing or ts.var_col not in ts.df.columns or not ts.ts_id_cols:
+        if not missing or not ts.ts_id_cols:
             return
-        is_train = (ts.df["is_test"] == 0) if "is_test" in ts.df.columns else np.ones(len(ts.df), dtype=bool)
-        train_vals = np.where(is_train, ts.df[ts.var_col], np.nan)
-        pos_vals = np.where(is_train & (ts.df[ts.var_col] > 0), ts.df[ts.var_col], np.nan)
-        keys = [ts.df[c] for c in ts.ts_id_cols]
-        train_s = pd.Series(train_vals, index=ts.df.index)
-        pos_s = pd.Series(pos_vals, index=ts.df.index)
-        grp_train = train_s.groupby(keys, observed=True)
-        grp_pos = pos_s.groupby(keys, observed=True)
+        from probabilistic_modeling.time_series import classify_demand_regimes
 
-        pos_mean = grp_pos.transform("mean")
-        pos_var = grp_pos.transform("var")
-        if "positive_overdispersion" in missing:
-            ts.df["positive_overdispersion"] = (pos_var > pos_mean).fillna(False).astype(int)
+        src_df = (
+            ts.raw_df
+            if (hasattr(ts, "raw_df") and isinstance(ts.raw_df, pd.DataFrame) and not ts.raw_df.empty)
+            else ts.df
+        )
+        if ts.var_col not in src_df.columns:
+            return
+        if ts.test_start_period is not None:
+            train_slice = src_df[src_df[ts.period_col] < ts.test_start_period]
+        elif "is_test" in src_df.columns:
+            train_slice = src_df[src_df["is_test"] == 0]
+        else:
+            train_slice = src_df
 
-        if "velocity_tier" in missing or "demand_regime" in missing:
-            n_train = grp_train.transform("count")
-            n_pos = grp_pos.transform("count")
-            p_pos = (n_pos / np.maximum(n_train, 1)).fillna(0.0).to_numpy(dtype=np.float64)
-            if "velocity_tier" in missing:
-                ts.df["velocity_tier"] = np.where(p_pos >= 0.75, 2, np.where(p_pos >= 0.25, 1, 0)).astype(int)
-            if "demand_regime" in missing:
-                pos_mean_arr = pos_mean.fillna(0.0).to_numpy(dtype=np.float64)
-                pos_var_arr = pos_var.fillna(0.0).to_numpy(dtype=np.float64)
-                cv2 = np.where(pos_mean_arr > 1e-12, pos_var_arr / np.maximum(pos_mean_arr * pos_mean_arr, 1e-12), 0.0)
-                is_intermittent = p_pos <= (1.0 / 1.32)
-                is_erratic = cv2 >= 0.49
-                ts.df["demand_regime"] = (is_intermittent.astype(int) * 2 + is_erratic.astype(int)).astype(int)
+        sbc_df = classify_demand_regimes(
+            train_slice, ts_id_cols=ts.ts_id_cols, period_col=ts.period_col, var_col=ts.var_col
+        )
+        add_cols = [c for c in missing if c in sbc_df.columns]
+        if add_cols:
+            ts.df = pd.merge(ts.df, sbc_df[list(ts.ts_id_cols) + add_cols], on=list(ts.ts_id_cols), how="left")
+            for int_col in ("overdispersion", "positive_overdispersion", "velocity_tier"):
+                if int_col in add_cols:
+                    ts.df[int_col] = ts.df[int_col].fillna(0).astype(int)
+            if "demand_regime" in add_cols:
+                ts.df["demand_regime"] = ts.df["demand_regime"].fillna(2).astype(int)
 
         if self.series_metadata_ is not None:
             new_meta_cols = [c for c in missing if c in ts.df.columns and c not in self.series_metadata_.columns]
@@ -2105,12 +2166,13 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         self,
         quantiles: tuple[float, ...] | list[float] = DEFAULT_QUANTILES,
         train_groups: tuple[str, ...] | list[str] | None = None,
-        extra_cat_cols: tuple[str, ...] = ("item_id", "dept_id", "cat_id"),
+        extra_cat_cols: tuple[str, ...] = ("item_id", "dept_id", "cat_id", "demand_regime_name"),
         num_valid_days: int = 28,
         max_train_days: int | None = None,
         catboost_params: dict[str, Any] | None = None,
         tol: float = 1e-4,
         restrict_future_leads: bool = False,
+        velocity_tiers: bool | str = False,
     ):
         super().__init__()
         self.quantiles = tuple(float(q) for q in validate_quantile_levels(quantiles))
@@ -2121,7 +2183,27 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         self.catboost_params = catboost_params
         self.tol = tol
         self.restrict_future_leads = restrict_future_leads
+        self.velocity_tiers = velocity_tiers
         self.model: "CatBoostQuantileModel | None" = None
+
+    def _resolve_velocity_col(self) -> str | None:
+        if not self.velocity_tiers:
+            return None
+        if isinstance(self.velocity_tiers, str):
+            val = self.velocity_tiers.strip().lower()
+            if val in ("demand_regime", "sbc", "syntetos_boylan"):
+                return "demand_regime"
+            if val in ("demand_regime_name",):
+                return "demand_regime_name"
+            if val in ("velocity_tier", "velocity", "true"):
+                return "velocity_tier"
+            if val in ("false", "none", ""):
+                return None
+            raise ValueError(
+                f"Unsupported velocity_tiers='{self.velocity_tiers}'. "
+                "Use False, True, 'velocity_tier', 'demand_regime', or 'demand_regime_name'."
+            )
+        return "velocity_tier"
 
     def fit(self, ts: "DiscreteTimeSeries") -> "CatBoostQuantileModel":
         """
@@ -2146,8 +2228,15 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         t0 = time.perf_counter()
         self._bind_training_context(ts)
         partition_cols = list(self.train_groups)
+        vel_col = self._resolve_velocity_col()
+        if vel_col is not None and vel_col not in partition_cols and vel_col in ts.df.columns:
+            partition_cols.append(vel_col)
+        # Exclude redundant demand_regime_name from cat features if already partitioned by demand_regime:
+        redundant_cats = {"demand_regime_name"} if "demand_regime" in partition_cols else set()
         available_extra_cats = [
-            c for c in self.extra_cat_cols if c in ts.df.columns and c not in partition_cols
+            c
+            for c in self.extra_cat_cols
+            if c in ts.df.columns and c not in partition_cols and c not in redundant_cats
         ]
         cat_cols = list(dict.fromkeys(list(ts.categorical_feature_cols) + available_extra_cats))
         feature_cols = [c for c in ts.feature_cols if c not in cat_cols]
@@ -2262,6 +2351,22 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
             fallback_feature_cols=cb_container.feature_cols,
         )
         levels = np.asarray(cb_container.quantiles, dtype=np.float64)
+        for tier_col in ("velocity_tier", "demand_regime"):
+            if tier_col in cb_container.train_groups and tier_col not in test_data.columns:
+                test_data[tier_col] = 2 if tier_col == "demand_regime" else 0
+        if (
+            "demand_regime_name" in cb_container.train_groups or "demand_regime_name" in cb_container.cat_feature_cols
+        ) and "demand_regime_name" not in test_data.columns:
+            from probabilistic_modeling.time_series import DEMAND_REGIME_NAMES
+
+            if "demand_regime" in test_data.columns:
+                test_data["demand_regime_name"] = (
+                    test_data["demand_regime"].map(DEMAND_REGIME_NAMES).fillna("intermittent").astype("category")
+                )
+            else:
+                test_data["demand_regime_name"] = pd.Series(
+                    ["intermittent"] * len(test_data), index=test_data.index, dtype="category"
+                )
         logger.info(
             "Generating CatBoost quantile predictions for %d rows across %d horizons (%d quantiles)...",
             len(test_data),
@@ -2278,6 +2383,21 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         for group_values, idx in groups.items():
             key = cb_container.group_key(group_values) if cb_container.train_groups else ()
             group_models = cb_container.models.get(key)
+            if group_models is None and cb_container.train_groups:
+                # Fallback if an inference demand_regime / velocity_tier was unseen in training:
+                tier_indices = [
+                    i
+                    for i, c in enumerate(cb_container.train_groups)
+                    if c in ("velocity_tier", "demand_regime", "demand_regime_name")
+                ]
+                if tier_indices:
+                    t_idx = tier_indices[-1]
+                    for cand in ("1", "0", "2", "3", "intermittent", "lumpy", "erratic", "smooth"):
+                        cand_key = list(key)
+                        cand_key[t_idx] = cand
+                        group_models = cb_container.models.get(tuple(cand_key))
+                        if group_models is not None:
+                            break
             if group_models is None:
                 logger.warning("No CatBoost model available for group %s; skipping %d rows", key, len(idx))
                 continue
@@ -2368,6 +2488,7 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
                 "catboost_params": self.catboost_params,
                 "tol": self.tol,
                 "restrict_future_leads": self.restrict_future_leads,
+                "velocity_tiers": self.velocity_tiers,
                 "prefix": prefix,
             },
         )
@@ -2384,15 +2505,30 @@ class CatBoostQuantileForecaster(ProbabilisticForecaster):
         meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
         saved_prefix = meta.get("prefix", prefix)
         cb_model = CatBoostQuantileModel.load(out_path, prefix=saved_prefix)
+        inferred_vel: bool | str = False
+        if "demand_regime" in cb_model.train_groups:
+            inferred_vel = "demand_regime"
+        elif "demand_regime_name" in cb_model.train_groups:
+            inferred_vel = "demand_regime_name"
+        elif "velocity_tier" in cb_model.train_groups:
+            inferred_vel = True
         forecaster = cls(
             quantiles=cb_model.quantiles,
-            train_groups=cb_model.train_groups,
-            extra_cat_cols=tuple(meta.get("extra_cat_cols", ("item_id", "dept_id", "cat_id"))),
+            train_groups=meta.get(
+                "train_groups",
+                [
+                    c
+                    for c in cb_model.train_groups
+                    if c not in ("velocity_tier", "demand_regime", "demand_regime_name")
+                ],
+            ),
+            extra_cat_cols=tuple(meta.get("extra_cat_cols", ("item_id", "dept_id", "cat_id", "demand_regime_name"))),
             num_valid_days=int(meta.get("num_valid_days", 28)),
             max_train_days=meta.get("max_train_days"),
             catboost_params=meta.get("catboost_params"),
             tol=float(meta.get("tol", 1e-4)),
             restrict_future_leads=bool(meta.get("restrict_future_leads", False)),
+            velocity_tiers=meta.get("velocity_tiers", inferred_vel),
         )
         forecaster.model = cb_model
         if meta:
@@ -2432,6 +2568,10 @@ def load_forecaster(out_dir: Path | str) -> ProbabilisticForecaster:
             from probabilistic_modeling.models.baseline import EmpiricalQuantileForecaster
 
             return EmpiricalQuantileForecaster.load(out_path)
+        if f_type == "regime_router":
+            from probabilistic_modeling.models.router import RegimeRouterForecaster
+
+            return RegimeRouterForecaster.load(out_path)
         if f_type == "glm":
             return GLMForecaster.load(out_path)
         if f_type == "catboost":

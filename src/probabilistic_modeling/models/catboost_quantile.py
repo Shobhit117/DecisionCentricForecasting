@@ -79,12 +79,16 @@ def train_catboost_quantile(
     quantiles: list[float] | tuple[float, ...],
     eval_df: pd.DataFrame | None = None,
     params: dict[str, Any] | None = None,
+    weight_col: str | None = "sample_weight",
 ):
     """
     Fit a single ``CatBoostRegressor`` with ``MultiQuantile`` loss for one forecast horizon ``target_col``.
 
     If a temporal validation split ``eval_df`` is provided, enables early stopping and keeps
     the iteration with the lowest validation ``MultiQuantile`` loss (`use_best_model=True`).
+    When ``weight_col`` is present on ``train_df`` (e.g. reciprocal importance weights from
+    ``downsample_zeros_frac``), passes observation weights into ``catboost.Pool`` so predicted
+    quantiles remain unbiased on the true population scale.
 
     Where it is used
     ----------------
@@ -97,10 +101,30 @@ def train_catboost_quantile(
     if eval_df is None or eval_df.empty:
         model_params.pop("early_stopping_rounds", None)
 
-    train_pool = Pool(prepare_features(train_df, feature_cols, cat_feature_cols), label=train_df[target_col].to_numpy(dtype=float), cat_features=cat_feature_cols)
+    train_weights = (
+        train_df[weight_col].to_numpy(dtype=float)
+        if (weight_col is not None and weight_col in train_df.columns)
+        else None
+    )
+    train_pool = Pool(
+        prepare_features(train_df, feature_cols, cat_feature_cols),
+        label=train_df[target_col].to_numpy(dtype=float),
+        cat_features=cat_feature_cols,
+        weight=train_weights,
+    )
     eval_pool = None
     if eval_df is not None and not eval_df.empty:
-        eval_pool = Pool(prepare_features(eval_df, feature_cols, cat_feature_cols), label=eval_df[target_col].to_numpy(dtype=float), cat_features=cat_feature_cols)
+        eval_weights = (
+            eval_df[weight_col].to_numpy(dtype=float)
+            if (weight_col is not None and weight_col in eval_df.columns)
+            else None
+        )
+        eval_pool = Pool(
+            prepare_features(eval_df, feature_cols, cat_feature_cols),
+            label=eval_df[target_col].to_numpy(dtype=float),
+            cat_features=cat_feature_cols,
+            weight=eval_weights,
+        )
 
     model = CatBoostRegressor(**model_params)
     model.fit(train_pool, eval_set=eval_pool, use_best_model=eval_pool is not None)

@@ -71,6 +71,8 @@ def fit_binom(data: np.ndarray) -> tuple[int, float, int]:
     loc = np.min(data)
     high = np.max(data)
     n = int(high - loc)
+    if n == 0:
+        return (1, 0.0, loc)
     mu = np.mean(data - loc)
     p = mu / n
     return (n, p, loc)
